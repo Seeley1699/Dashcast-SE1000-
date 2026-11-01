@@ -105,6 +105,10 @@ static int          g_px_w, g_px_h, g_px_stride;
 /* H.264 档（argv[12]）：0=BGRA+LZ4（默认），2=H.264 over RTP */
 extern int  h264_enc_open(int tcp_fd, int dw, int dh, int kbps, int fps);
 extern int  h264_enc_feed(const uint8_t *bgra, int sw, int sh);
+/* 带裁剪的版本：只取画布上 (cx,cy,cw,ch) 那块喂给编码器。
+ * H.264 档必须用它 —— 传整块画布会让编码器错位取样，未覆盖区域留旧像素 → 重影。 */
+extern int  h264_enc_feed_crop(const uint8_t *bgra, int sw, int sh,
+                               int cx, int cy, int cw, int ch);
 extern void h264_enc_drain(void);
 extern void h264_enc_stats(long *frames, long *bytes);
 extern void h264_enc_close(void);
@@ -264,6 +268,28 @@ static int layer_mask_reload(int canvas_w, int canvas_h)
     cfg.canvas_w = canvas_w;
     cfg.canvas_h = canvas_h;
 
+    /*
+     * **H.264 档强制矩形遮罩**（方案 A）。
+     *
+     * H.264 是 4:2:0 YUV，**物理上没有 alpha 通道**。CP 端解码出来每个像素
+     * 都是不透明的（h264rx.c: row = 0xFF000000 | rgb）。
+     * 所以圆角/梯形/椭圆的"透明区域"到了仪表上就是黑色 —— 用户看到的就是黑边。
+     *
+     * BGRA 档有 alpha，形状遮罩能正常挖洞；H.264 档只能按矩形。
+     * 这是格式限制，不是实现缺陷。
+     *
+     * 用户选 H.264 是为了带宽（45KB/s vs BGRA 的 2543KB/s，快 56 倍），
+     * 用直角换流畅，这个取舍是值得的。
+     */
+    if (g_codec == DASHCAST_CODEC_H264 && cfg.shape != LAYER_SHAPE_RECT) {
+        LOGI("H.264 档不支持形状遮罩（无 alpha 通道），强制按矩形处理（原 shape=%d）",
+             cfg.shape);
+        cfg.shape = LAYER_SHAPE_RECT;
+        cfg.r_tl = cfg.r_tr = cfg.r_bl = cfg.r_br = 0;
+        cfg.trap_top = cfg.trap_bot = 0;
+        cfg.feather = 0;
+    }
+
     if (dc_layer_build(&g_mask, &cfg) != 0) {
         LOGE("遮罩生成失败（内存不足？）");
         g_mask_ready = 0;
@@ -402,6 +428,18 @@ static int codec_poll(void)
     }
 
     g_codec = want;
+
+    /*
+     * 切档后必须重建遮罩：H.264 档要强制矩形（无 alpha），
+     * BGRA 档要恢复用户设的形状（圆角/梯形/椭圆）。
+     * 不重建的话，切回 BGRA 时形状还是被压成矩形的那个遮罩。
+     */
+    {
+        int ccw = g_mask.cfg.canvas_w > 0 ? g_mask.cfg.canvas_w : g_outW;
+        int cch = g_mask.cfg.canvas_h > 0 ? g_mask.cfg.canvas_h : g_outH;
+        layer_mask_reload(ccw, cch);
+    }
+
     recompute_enc_size(g_outW, g_outH);
     return 1;   /* 让主循环断开重连，用新档位重新握手 */
 }
@@ -1669,7 +1707,26 @@ int main(int argc, char **argv)
                 }
             }
             if (g_h264_ready) {
-                h264_enc_feed(canvas, outW, outH);
+                /*
+                 * **必须用带裁剪的版本**。
+                 *
+                 * 原来传整块画布 (outW, outH) = 1920×532，而编码尺寸是遮罩
+                 * 尺寸（比如 672×400）。bgra_to_yuv 里用整数除法算缩放比：
+                 *   1920/672 = 2  （真值 2.857）
+                 *    532/400 = 1  （真值 1.33）
+                 * 横向少采 576 像素、纵向少采 132 行 —— 画面错位，没被覆盖的
+                 * 区域留着上一帧的旧像素，就是仪表上的重影。
+                 *
+                 * 改成只取遮罩矩形那块，等比缩放后正好铺满编码帧。
+                 * 无遮罩时回落到整块（cw/ch <= 0 走旧路径）。
+                 */
+                if (g_mask_ready && g_mask.cfg.w > 0 && g_mask.cfg.h > 0) {
+                    h264_enc_feed_crop(canvas, outW, outH,
+                                       g_mask.cfg.x, g_mask.cfg.y,
+                                       g_mask.cfg.w, g_mask.cfg.h);
+                } else {
+                    h264_enc_feed(canvas, outW, outH);
+                }
                 h264_enc_drain();
                 frames++;
             }

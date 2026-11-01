@@ -66,9 +66,22 @@ static long g_sent = 0, g_sfail = 0, g_pkts = 0;
 static long g_stat_frames = 0, g_stat_bytes = 0;
 static struct timespec g_t_last;
 
-/* ---------- BGRA -> YUV（box 平均下采样） ---------- */
-static void bgra_to_yuv(const uint8_t *src, int sw, int sh,
-                        uint8_t *dst, int dw, int dh) {
+/*
+ * BGRA → YUV，从源画布上裁一块再缩放到编码尺寸。
+ *
+ * **这是重影的根因修复**：原来只传整块画布 (sw,sh)，用整数除法算缩放比：
+ *     bw = sw/dw,  bh = sh/dh
+ * 遮罩 672×404、画布 1920×532 时得到 bw=2(应为2.857) bh=1(应为1.33)，
+ * 于是横向只采到 1344/1920 像素、纵向只采了 400/532 行 ——
+ * 画面错位，剩下没被覆盖的区域留着上一帧的旧像素，就是重影。
+ *
+ * 现在改成：
+ *   ① 只取 crop 指定的那块（遮罩矩形）
+ *   ② 用浮点比例映射，源坐标按 (i * cw / dw) 计算，不丢像素
+ */
+static void bgra_to_yuv_crop(const uint8_t *src, int sw, int sh,
+                             int cx, int cy, int cw, int ch,
+                             uint8_t *dst, int dw, int dh) {
     uint8_t *yp = dst;
     uint8_t *up, *vp;
     size_t ysz = (size_t) g_stride * g_slice;
@@ -81,10 +94,12 @@ static void bgra_to_yuv(const uint8_t *src, int sw, int sh,
         vp = up + 1;
     }
 
-    int bw = sw / dw;                  /* 源/目的 宽比，这里是 2 */
-    int bh = sh / dh;
-    if (bw < 1) bw = 1;
-    if (bh < 1) bh = 1;
+    if (cw < 1) cw = 1;
+    if (ch < 1) ch = 1;
+
+    /* 浮点比例：源每走一个目的像素，前进 cw/dw 个像素 */
+    const double stepX = (double) cw / dw;
+    const double stepY = (double) ch / dh;
 
     for (int j = 0; j < dh; j++) {
         uint8_t *yrow = yp + (size_t) j * g_stride;
@@ -93,18 +108,17 @@ static void bgra_to_yuv(const uint8_t *src, int sw, int sh,
         uint8_t *vrow = g_planar ? (vp + (size_t) (j >> 1) * (g_stride / 2))
                                  : (vp + (size_t) (j >> 1) * g_stride);
 
-        const uint8_t *srow0 = src + (size_t) (j * bh) * sw * 4;
         for (int i = 0; i < dw; i++) {
-            const uint8_t *p = srow0 + (size_t) (i * bw) * 4;
-            int r = 0, g = 0, b = 0, cnt = 0;
-            for (int dy = 0; dy < bh; dy++) {
-                const uint8_t *q = p + (size_t) dy * sw * 4;
-                for (int dx = 0; dx < bw; dx++) {
-                    const uint8_t *c = q + (size_t) dx * 4;
-                    b += c[0]; g += c[1]; r += c[2]; cnt++;
-                }
-            }
-            r /= cnt; g /= cnt; b /= cnt;
+            /* 目的像素 (i,j) → 源像素（取最近的，先保证覆盖完整） */
+            int sx = cx + (int) (i * stepX);
+            int sy = cy + (int) (j * stepY);
+            if (sx >= sw) sx = sw - 1;
+            if (sy >= sh) sy = sh - 1;
+            if (sx < 0) sx = 0;
+            if (sy < 0) sy = 0;
+
+            const uint8_t *c = src + ((size_t) sy * sw + sx) * 4;
+            int b = c[0], g = c[1], r = c[2];
 
             /* BT.601 limited range */
             int Y = ( 77 * r + 150 * g +  29 * b + 128) >> 8;
@@ -130,6 +144,14 @@ static void bgra_to_yuv(const uint8_t *src, int sw, int sh,
         }
     }
 }
+
+/* 旧路径：整块画布等比缩放（无遮罩时用） */
+static void bgra_to_yuv(const uint8_t *src, int sw, int sh,
+                        uint8_t *dst, int dw, int dh) {
+    bgra_to_yuv_crop(src, sw, sh, 0, 0, sw, sh, dst, dw, dh);
+}
+
+
 
 /* 全量写：TCP 是流，短写必须续 */
 /*
@@ -332,8 +354,19 @@ int h264_enc_open(int tcp_fd, int dw, int dh, int kbps, int fps) {
     return 0;
 }
 
-/* 喂一帧 BGRA（源尺寸是编码尺寸的 bw×bh 倍） */
-int h264_enc_feed(const uint8_t *bgra, int sw, int sh) {
+/*
+ * 喂一帧 BGRA。
+ *
+ * 原来只有 (sw,sh)：传整块画布，内部用整数除法 (sw/dw) 算缩放比 ——
+ * 遮罩 672×404 时 1920/672=2（真值 2.857）、532/400=1（真值 1.33），
+ * 横向少采 576 像素、纵向少采 132 行，画面错位，未覆盖区域留旧像素 →
+ * **重影**。
+ *
+ * 现在带 crop：直接取遮罩矩形那块，再等比缩放到编码尺寸。
+ * cx/cy/cw/ch 为 0 时等价于旧的整块行为。
+ */
+int h264_enc_feed_crop(const uint8_t *bgra, int sw, int sh,
+                       int cx, int cy, int cw, int ch) {
     if (!g_enc) return -1;
 
     ssize_t idx = AMediaCodec_dequeueInputBuffer(g_enc, 2000);
@@ -345,7 +378,11 @@ int h264_enc_feed(const uint8_t *bgra, int sw, int sh) {
     const size_t need = (size_t) g_stride * g_slice * 3 / 2;
     if (cap < need) { LOGE("输入缓冲太小 %zu < %zu", cap, need); return -1; }
 
-    bgra_to_yuv(bgra, sw, sh, buf, g_w, g_h);
+    if (cw <= 0 || ch <= 0) {
+        bgra_to_yuv(bgra, sw, sh, buf, g_w, g_h);
+    } else {
+        bgra_to_yuv_crop(bgra, sw, sh, cx, cy, cw, ch, buf, g_w, g_h);
+    }
 
     g_pts += 1000000ULL / (uint64_t) g_fps;
     if (AMediaCodec_queueInputBuffer(g_enc, idx, 0, need, g_pts, 0) != AMEDIA_OK) {
@@ -354,6 +391,11 @@ int h264_enc_feed(const uint8_t *bgra, int sw, int sh) {
     }
     g_fed++;
     return 0;
+}
+
+/* 兼容旧签名：整块画布 */
+int h264_enc_feed(const uint8_t *bgra, int sw, int sh) {
+    return h264_enc_feed_crop(bgra, sw, sh, 0, 0, 0, 0);
 }
 
 /* 把编码器里已经好了的帧全部取出来发走 */
