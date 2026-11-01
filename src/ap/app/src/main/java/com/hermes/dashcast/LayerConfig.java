@@ -140,11 +140,23 @@ public final class LayerConfig {
                 return;
             }
             try {
-                if (snapshot.enabled && snapshot.w > 0 && snapshot.h > 0) {
-                    sCp.setLayerRect(snapshot.x, snapshot.y, snapshot.w, snapshot.h);
-                } else {
-                    sCp.setLayerRect(0, 0, snapshot.canvasW, snapshot.canvasH);
-                }
+                /*
+                 * **destination 必须按编码档算，不能直接用遮罩矩形**。
+                 *
+                 * 原来两个分支都是 setLayerRect(遮罩 x/y/w/h)，结果是：
+                 * AP 端把画面画在画布的遮罩坐标上，CP 端又把整块
+                 * 1920×532 画布压缩到同一块矩形 → 仪表上"正常画面 +
+                 * 缩小副本"叠加 = 重影。用户反馈"保存遮罩后必现"就是这个。
+                 *
+                 * BGRA 有 alpha → destination = 整屏，靠画布透明挖洞
+                 * H.264 无 alpha → destination = 遮罩矩形，图层本身缩进那块
+                 */
+                int[] dest = (snapshot.enabled && snapshot.w > 0 && snapshot.h > 0)
+                        ? LayerGeometry.destinationFor(MirrorController.getCodec(),
+                              new int[]{snapshot.x, snapshot.y, snapshot.w, snapshot.h},
+                              snapshot.canvasW, snapshot.canvasH)
+                        : new int[]{0, 0, snapshot.canvasW, snapshot.canvasH};
+                sCp.setLayerRect(dest[0], dest[1], dest[2], dest[3]);
             } catch (Throwable t) {
                 Log.w(TAG, "同步图层矩形失败: " + t);
             }

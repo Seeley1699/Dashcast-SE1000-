@@ -984,7 +984,27 @@ public class MainActivity extends Activity {
             boolean casting = MirrorController.isMirroring();
             if (casting) {
                 try {
-                    cpManager.setLayerRect(maskCfg.x, maskCfg.y, maskCfg.w, maskCfg.h);
+                    /*
+                     * **不能直接用遮罩矩形当 CP 的 destination region**。
+                     *
+                     * 这一行原来是：
+                     *   cpManager.setLayerRect(maskCfg.x, maskCfg.y, maskCfg.w, maskCfg.h);
+                     *
+                     * 于是"保存遮罩"必然触发重影 —— 这正是用户反馈的
+                     * 「LZ4 保存遮罩后基本都会出现重影」：
+                     *   · AP 端 dcapd2 把画面画在**画布的遮罩坐标**上（比如 928,192）
+                     *   · CP 端把**整块 1920×532 画布压缩**到同样那个矩形里
+                     *   → 正常画面被压成一小块 + 缩小副本 → 两个画面叠加
+                     *
+                     * 正确做法按编码档走（见 LayerGeometry 的详细注释）：
+                     *   BGRA 有 alpha：destination = 整屏，靠画布透明挖洞
+                     *   H.264 无 alpha：destination = 遮罩矩形，图层本身缩进那块
+                     */
+                    int[] dest = LayerGeometry.destinationFor(
+                            MirrorController.getCodec(),
+                            new int[]{maskCfg.x, maskCfg.y, maskCfg.w, maskCfg.h},
+                            1920, 532);
+                    cpManager.setLayerRect(dest[0], dest[1], dest[2], dest[3]);
                 } catch (Throwable ignored) {}
             }
 
