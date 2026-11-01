@@ -459,6 +459,14 @@ public class MirrorController {
                 /* ⑧ dcapd2 不在就拉起来 */
                 if (bgMode) {
                     if (!daemonAlive() && lastRect != null) {
+                        /* 第一次运行、或刷过 APK 后 dcapd2 的 MD5 变了：
+                         * 这里必须先确保二进制在位并把新的推上去，
+                         * 否则 launchDaemon 会一直起不来（文件不存在）。 */
+                        if (!ensureBinary()) {
+                            state("抓帧进程部署失败（检查 assets/dcapd2.b64）", false);
+                            sleep(2000);
+                            continue;
+                        }
                         if (launchDaemon(lastRect)) {
                             if (gen.get() != myGen) return;
                             failCount = 0;
@@ -472,6 +480,11 @@ public class MirrorController {
                     int[] r = windowRect(pkg);
                     if (r != null) {
                         lastRect = r;
+                        if (!ensureBinary()) {
+                            state("抓帧进程部署失败（检查 assets/dcapd2.b64）", false);
+                            sleep(2000);
+                            continue;
+                        }
                         if (launchDaemon(r)) {
                             if (gen.get() != myGen) return;   // launchDaemon 里等了好几秒
                             clearPause();
@@ -981,13 +994,6 @@ public class MirrorController {
     private void clearPause() {
         try {
             AdbShell.exec("rm -f " + PAUSE, CHUNK);
-        } catch (Throwable ignored) {
-        }
-    }
-
-    private void killDaemon() {
-        try {
-            AdbShell.exec("rm -f " + PAUSE + "; pkill -x dcapd2", 4000);
         } catch (Throwable ignored) {
         }
     }

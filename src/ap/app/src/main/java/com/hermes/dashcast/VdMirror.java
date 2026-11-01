@@ -221,7 +221,30 @@ public class VdMirror {
     private void teardownDisplay() {
         if (reader != null) { try { reader.close(); } catch (Throwable ignored) {} reader = null; }
         if (vd != null)     { try { vd.release(); } catch (Throwable ignored) {} vd = null; }
-        if (cbThread != null) { cbThread.quitSafely(); cbThread = null; }
+
+        /*
+         * HandlerThread 要 quitSafely **并且 join**。
+         *
+         * 只 quit 不 join 的话，looper 里还没跑完的那个 onImageAvailable 会继续
+         * 拿着已经 close 掉的 ImageReader / 已经 release 掉的 VirtualDisplay 干活 ——
+         * acquireLatestImage 抛 IllegalStateException，被 catch 吞掉，
+         * 但每次投屏开始/结束都会白扔一次异常；更糟的是它可能在 setFeedFrames(false)
+         * 之后还按旧 socket 写一帧，让 CP 收到错位帧。
+         *
+         * join 有 2 秒上限：万一回调卡住，宁可留个僵尸线程也不能让 UI 线程挂死
+         * （本方法由 stop() 的后台线程调用，所以其实是后台等，但别无限）。
+         */
+        if (cbThread != null) {
+            HandlerThread t = cbThread;
+            cbThread = null;
+            cbHandler = null;
+            t.quitSafely();
+            try {
+                t.join(2000);
+            } catch (InterruptedException ignored) {
+                Thread.currentThread().interrupt();
+            }
+        }
         displayId = -1;
     }
 
