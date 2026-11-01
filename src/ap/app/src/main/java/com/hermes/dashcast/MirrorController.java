@@ -81,10 +81,20 @@ public class MirrorController {
     private volatile boolean running;
     private volatile boolean bgMode;
     private long lastCpLog;
-    private int[] lastRect;
-    private Thread worker;
-    private Listener listener;
-    private boolean mapMode = false;
+    /*
+     * 这几个字段是**跨线程**读写的，必须 volatile：
+     *   lastRect  —— loop() 写（windowRect 结果）、UI 线程经 setFps() 读
+     *   listener  —— UI 线程 setListener、loop 线程 state() 读
+     *   mapMode   —— UI 线程 setMapMode、loop 线程 applyMapCrop 读
+     *   worker    —— start/stop 在主线程、onDestroy 也会碰
+     * 少了 volatile 就没有 happens-before，JIT 可以把读提到循环外，
+     * 表现为"改了设置但不生效"或"停止后状态还在刷"。
+     * （running / bgMode / pkg / component 原本就是 volatile，这几个漏了。）
+     */
+    private volatile int[] lastRect;
+    private volatile Thread worker;
+    private volatile Listener listener;
+    private volatile boolean mapMode = false;
 
     public interface Listener {
         /** 状态行文字；ok=true 表示正常 */
@@ -190,7 +200,7 @@ public class MirrorController {
      * 看上去"没反应"，于是再点一次。
      */
     public void stop() {
-        gen.incrementAndGet();   // 立刻作废旧代次，旧循环下次判断就 return
+        final int myGen = gen.incrementAndGet();   // 立刻作废旧代次，旧循环下次判断就 return
         setCastingFlag(false);
         LayerConfig.setCasting(false);
         if (sActive == this) sActive = null;
@@ -212,23 +222,52 @@ public class MirrorController {
                 } catch (InterruptedException ignored) {
                 }
             }
+            /*
+             * **清理前必须复核代次**。
+             *
+             * start() 顶部就是无条件的 stop()。如果在这 2 秒 join 期间用户
+             * 切了目标（或用持久化恢复又 start 了一次），新的 loop 已经
+             * launchDaemon 起来了 —— 旧清理线程一路跑下去 pkill -9 dcapd2，
+             * 就把**新会话**的抓帧进程杀掉：dashcastd 收 EOF 自己退出、
+             * layer 99 被拆，仪表黑屏/回原厂。
+             *
+             * 判据：gen 还是我们那次递增的值 = 期间没人再 start/stop。
+             */
+            if (gen.get() != myGen) {
+                Log.i(TAG, "停止流程已被新会话取代（gen " + myGen + " → "
+                        + gen.get() + "），跳过清理");
+                return;
+            }
             try {
                 vd.stop(true);
             } catch (Throwable ignored) {
             }
             VdMirror.setFeedFrames(false);
-            forceCleanup();
+            forceCleanup(myGen);
         }, "mirror-stop").start();
     }
 
-    /** 强制清理：摘后台标志 + 杀 dcapd2，每一步都验证结果，不行就重试。 */
-    private void forceCleanup() {
+    /**
+     * 强制清理：摘后台标志 + 杀 dcapd2，每一步都验证结果，不行就重试。
+     *
+     * @param myGen 发起清理时的那一代。每轮 pkill 前后都要复核 ——
+     *              若期间有新会话 start 了，立刻收手，不能再杀。
+     */
+    private void forceCleanup(int myGen) {
         Thread t = new Thread(() -> {
             synchronized (cleanupLock) {
+                if (gen.get() != myGen) {
+                    Log.i(TAG, "清理开始时代次已变，放弃");
+                    return;
+                }
                 boolean hadDaemon = daemonAlive();
                 int logLines = (hadDaemon && cp != null) ? cp.dashcastdLogLines() : -1;
 
                 for (int i = 0; i < 4; i++) {
+                    if (gen.get() != myGen) {
+                        Log.i(TAG, "清理中途代次变化，停止 pkill（新会话已在跑）");
+                        return;
+                    }
                     try {
                         String out = AdbShell.exec(
                                 "rm -f /data/local/tmp/dcapd2.bg /data/local/tmp/dcapd2.pause; "
@@ -293,7 +332,31 @@ public class MirrorController {
         VdMirror.setProxyWanted(true);   /* 挂控制通道（按 HOME 停抓用） */
         VdMirror.setFeedFrames(true);    /* 虚拟屏模式：允许喂帧 */
 
-        if (!vd.start(comp, srcW, srcH, mainDpi, this::state)) {
+        /*
+         * vd.start() 里是 am display move-stack / am start --display，
+         * 单次 6~8 秒。这期间用户完全可能点「停止投屏」：
+         * stop() 已经 vd.stop(true) 拆了屏、setFeedFrames(false) 断了帧源，
+         * 而我们这里还在把目标 App 往一块没人喂帧的虚拟屏上搬 ——
+         * 结果就是中控上 App 直接消失、仪表停在最后一帧。
+         * 所以搬完必须复核，代次变了立刻把刚搬出去的收回来。
+         */
+        boolean started = vd.start(comp, srcW, srcH, mainDpi, this::state);
+
+        if (gen.get() != myGen) {
+            Log.i(TAG, "enterBg 期间代次变化（已停止），收回虚拟屏");
+            try {
+                vd.stop(true);
+            } catch (Throwable ignored) {
+            }
+            VdMirror.setFeedFrames(false);
+            try {
+                AdbShell.exec("rm -f /data/local/tmp/dcapd2.bg", CHUNK);
+            } catch (Throwable ignored) {
+            }
+            return;
+        }
+
+        if (!started) {
             setPause();                 // 先冻住，再断帧源，中间不漏桌面
             vd.stop(false);
             try {
@@ -339,6 +402,19 @@ public class MirrorController {
                 stop();
             } catch (Throwable t) {
                 Log.w(TAG, "结束会话时清理异常", t);
+            }
+            /*
+             * **必须停 KeepAliveService**。
+             *
+             * 它只在「开始投屏」时启动（前台服务 + 通知 + START_STICKY）。
+             * 目标 App 自己退出时走的是 endSession 这条路，而不是界面上的
+             * 「停止投屏」按钮 —— 原来只 stop() 镜像，前台服务和那条常驻
+             * 通知永远留着，而且进程被系统杀掉后 START_STICKY 还会再拉起来，
+             * 在用户看来就是"已经没在投屏了，通知却还在，App 也杀不干净"。
+             */
+            try {
+                KeepAliveService.stop(ctx);
+            } catch (Throwable ignored) {
             }
             if (l != null) {
                 try {

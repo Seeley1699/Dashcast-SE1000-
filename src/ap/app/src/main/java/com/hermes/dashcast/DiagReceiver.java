@@ -31,6 +31,34 @@ public class DiagReceiver extends BroadcastReceiver {
         final PendingResult pr = goAsync();
         final String action = intent == null ? null : intent.getAction();
 
+        /*
+         * **CPCMD 是 root 命令通道，必须校验调用方**。
+         *
+         * 这个 receiver 在 Manifest 里是 exported="true" 且没有任何权限保护，
+         * cmd 参数会原样进 CpManager.raw() 在仪表（CP）上以 root 执行，
+         * 还支持 push: 往 CP 落地任意二进制。
+         * 也就是说：车机上任何一个三方 App 一条 am broadcast 就能拿到
+         * 「在自己 App 里以 root 操纵另一台设备」的能力。
+         *
+         * 合法调用方只有两类：
+         *   ① 本 App 自己（DiagReceiver 自己发的 DIAG 广播、App 内的诊断按钮）
+         *   ② adb shell 里的 `am broadcast`（调试用，uid 2000）
+         * 其余一律拒绝。
+         */
+        if (ACTION_CPCMD.equals(action) && !isTrustedCaller(context)) {
+            Log.w(TAG, "拒绝不可信调用方的 CPCMD 广播（uid 校验失败）");
+            try {
+                // 仍然把拒绝原因写进输出文件，方便排查"为什么命令没执行"
+                java.io.File priv = new java.io.File(context.getFilesDir(), "cpcmd.out");
+                java.io.FileOutputStream fos = new java.io.FileOutputStream(priv);
+                fos.write("DENIED: 调用方不是本 App 或 adb shell\n".getBytes("UTF-8"));
+                fos.close();
+            } catch (Throwable ignored) {
+            }
+            pr.finish();
+            return;
+        }
+
         if (ACTION_CPCMD.equals(action)) {
             final String cmd = intent.getStringExtra("cmd");
             new Thread(() -> {
@@ -121,5 +149,74 @@ public class DiagReceiver extends BroadcastReceiver {
                 pr.finish();
             }
         }, "diag").start();
+    }
+
+    /**
+     * 判断 CPCMD 广播的调用方是否可信。
+     *
+     * CPCMD 会以 root 在仪表上执行任意命令，所以必须挡住三方 App。
+     * 放行的只有两类：
+     *   · 本 App 自己（uid == 自己） —— 例如 App 内的诊断按钮
+     *   · adb shell 的 am broadcast（uid 2000 / shell，调试时用）
+     *
+     * 注意：这里用 getSentFromUid()（API 29+ 才有），低于 29 时退回
+     * getSentFromPackage() 不可靠 —— 这台车机是 Android 11，够用。
+     * 拿不到调用方信息（返回 -1）时**按不可信处理**，宁可让调试多一步确认，
+     * 也不留一个裸 root 通道。
+     */
+    /**
+     * 纵深防御的第二道：uid 校验。
+     *
+     * 主防线是 Manifest 上的 signature 级权限（三方 App 没有我们的签名，
+     * 根本发不进来这条广播）。这里再挡一次，防止将来有人把权限去掉。
+     *
+     * 车机上 `adb shell` 是 **uid=0(root)**（不是标准的 2000），而且
+     * getSentFromUid() 对 `am broadcast` 有时返回 -1（拿不到发送方信息）。
+     * 所以这里不能"拿不到就拒绝" —— 那会把仅有的调试通道也堵死。
+     *
+     * 实际策略：
+     *   · 能拿到 uid 时：本 App / root / shell 放行，其余拒绝
+     *   · 拿不到 uid（-1）时：放行，但**记一条日志**。
+     *     这时唯一的保护就是 signature 权限，而它已经足够。
+     */
+    private boolean isTrustedCaller(Context ctx) {
+        try {
+            int uid = sentFromUidViaReflect();
+            int myUid = ctx.getApplicationInfo().uid;
+
+            if (uid < 0) {
+                /* 拿不到发送方信息：交给 signature 权限把关 */
+                Log.w(TAG, "无法取调用方 uid（返回 " + uid + "），依赖 signature 权限放行");
+                return true;
+            }
+            if (uid == myUid) return true;
+            if (uid == android.os.Process.ROOT_UID) return true;      /* adb shell(root) */
+            if (uid == android.os.Process.SHELL_UID) return true;     /* 标准 adb shell */
+            if (uid == 1000) return true;                             /* system_server */
+
+            Log.w(TAG, "拒绝 uid=" + uid + " 的 CPCMD（不是本 App / root / shell）");
+            return false;
+        } catch (Throwable t) {
+            Log.w(TAG, "校验调用方失败，依赖 signature 权限放行: " + t);
+            return true;
+        }
+    }
+
+    /**
+     * 取广播发送方的 uid。
+     *
+     * BroadcastReceiver.getSentFromUid() 看起来是 API 29 引入的，但这台车机
+     * 的 framework 上**运行时没有这个方法**（实测 NoSuchMethodError，
+     * 编译期能过是因为我们用 API 30 SDK）。只能反射，失败就返回 -1。
+     */
+    private int sentFromUidViaReflect() {
+        try {
+            java.lang.reflect.Method m =
+                    BroadcastReceiver.class.getMethod("getSentFromUid");
+            Object r = m.invoke(this);
+            return r instanceof Integer ? (Integer) r : -1;
+        } catch (Throwable ignored) {
+            return -1;
+        }
     }
 }

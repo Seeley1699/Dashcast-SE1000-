@@ -82,7 +82,22 @@
             android:launchMode="singleInstance" />
 
         <!-- 联调用：adb shell am broadcast -a com.hermes.dashcast.DIAG
-             把 CP（仪表）和 AP（中控）两边的状态一次性打到 logcat -->
+             把 CP（仪表）和 AP（中控）两边的状态一次性打到 logcat。
+
+             **CPCMD 在 CP 上以 root 执行任意命令**（还能 push 落地二进制）。
+             加固方式与取舍（2026-11-01）：
+               ① 试过 signature 级自定义权限 —— 三方 App 确实挡得住，
+                  但**把 adb shell 调试也一起挡死了**（adb 没我们的签名，
+                  am 的 receiver-permission 参数在这台车机上也无效）。
+                  车机上唯一的调试通道就是 adb，堵死它得不偿失。
+               ② 最终方案：保持 exported=true，在 DiagReceiver.onReceive 里
+                  按发送方 uid 校验（本 App / root / shell / system 放行）。
+                  拿不到 uid 时放行并记日志 —— 这台车机的 framework 上
+                  getSentFromUid() 运行时会 NoSuchMethodError，实际总是拿不到，
+                  所以第一道防线在 uid 上不可靠，**主要靠"广播 action 名字
+                  不公开、且只有 root/adb 才知道用法"这一层模糊防护**。
+               ③ 真要收紧：把 exported 改成 false，然后在 MainActivity 里
+                  加一个诊断按钮走进程内调用（不再依赖广播）。 -->
         <receiver
             android:name=".DiagReceiver"
             android:exported="true">

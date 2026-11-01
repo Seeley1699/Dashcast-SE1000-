@@ -40,24 +40,46 @@ public final class LocalStore {
      *   ① 直接建 /sdcard/Download/Dashcast（有权限时最快）
      *   ② 用 su 建并 chmod（本 App 有 root 通道）
      *   ③ 退回 App 私有目录（保证功能可用）
+     *
+     * **结果必须缓存**：这台 ROM 上 ① 永远失败、② 是一次 adbd 往返
+     * （超时 8000ms）。appendLog() 是从 setStatus() 的 mainHandler.post 里
+     * 调进来的（主线程），每次状态更新都重跑一遍三级兜底 = 主线程被 root
+     * shell 拖死，冷启动连发几个状态就直接 ANR。目录一旦确定不会再变，
+     * 缓存到进程结束即可。
      */
+    private static volatile File sDir;
+
     public static File dir(Context ctx) {
-        File pub = new File(Environment.getExternalStoragePublicDirectory(
-                Environment.DIRECTORY_DOWNLOADS), DIR_NAME);
+        File cached = sDir;
+        if (cached != null && cached.exists()) return cached;
 
-        if (pub.exists() || pub.mkdirs()) return pub;
+        synchronized (LocalStore.class) {
+            if (sDir != null && sDir.exists()) return sDir;
 
-        /* ② 走 root 建目录（adb/su 通道） */
-        try {
-            AdbShell.exec("mkdir -p " + pub.getAbsolutePath()
-                    + " && chmod 777 " + pub.getAbsolutePath(), 8000);
-        } catch (Throwable ignored) {
+            File pub = new File(Environment.getExternalStoragePublicDirectory(
+                    Environment.DIRECTORY_DOWNLOADS), DIR_NAME);
+            if (pub.exists() || pub.mkdirs()) {
+                sDir = pub;
+                return pub;
+            }
+
+            /* ② 走 root 建目录（adb/su 通道）—— 只在首次失败时走一次 */
+            try {
+                AdbShell.exec("mkdir -p " + pub.getAbsolutePath()
+                        + " && chmod 777 " + pub.getAbsolutePath(), 8000);
+                if (pub.exists()) {
+                    sDir = pub;
+                    return pub;
+                }
+            } catch (Throwable ignored) {
+            }
+
+            /* ③ 私有目录兜底 */
+            File prv = new File(ctx.getApplicationContext().getFilesDir(), DIR_NAME);
+            if (!prv.exists()) prv.mkdirs();
+            sDir = prv;
+            return prv;
         }
-
-        /* ③ 私有目录兜底 */
-        File prv = new File(ctx.getFilesDir(), DIR_NAME);
-        if (!prv.exists()) prv.mkdirs();
-        return prv;
     }
 
     public static File logFile(Context ctx) {
@@ -68,9 +90,33 @@ public final class LocalStore {
         return new File(dir(ctx), PRESET_FILE);
     }
 
-    /** 追加一行日志（带时间戳）。失败静默 —— 日志写不进去不该影响主流程。 */
-    public static void log(Context ctx, String msg) {
+    /**
+     * 追加一行日志（带时间戳）。失败静默 —— 日志写不进去不该影响主流程。
+     *
+     * **必须在后台写**：本方法由 appendLog() 主线程调用链进来，
+     * 而 FileWriter 打开文件 + rotateIfNeeded 的 renameTo 都是磁盘 IO，
+     * 车机的 eMMC 抖动时一次能吃掉几十到几百毫秒。
+     * 用一条常驻线程 + 无界队列，主线程只做一个 offer。
+     */
+    private static final java.util.concurrent.ExecutorService LOG_EXEC =
+            java.util.concurrent.Executors.newSingleThreadExecutor(r -> {
+                Thread t = new Thread(r, "local-log");
+                t.setDaemon(true);
+                return t;
+            });
+
+    public static void log(Context ctx, final String msg) {
         if (msg == null) return;
+        final Context app = ctx.getApplicationContext();
+        try {
+            LOG_EXEC.execute(() -> writeNow(app, msg));
+        } catch (Throwable t) {
+            /* 队列满了/已关闭：宁可丢这条日志，也绝不阻塞调用方 */
+        }
+    }
+
+    /** 同步写盘。只被后台线程调用（readLog/测试需要时也可直接调）。 */
+    private static void writeNow(Context ctx, String msg) {
         try {
             File f = logFile(ctx);
             rotateIfNeeded(f);

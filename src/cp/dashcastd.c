@@ -59,6 +59,18 @@ extern int h264_rx_run(int ctl_fd, uint8_t *dst, int w, int h,
 #define MAX_TILES_PER_FRAME  8192
 #define MAX_FRAME_BYTES      (16u * 1024u * 1024u)
 
+/*
+ * 握手尺寸的硬上限。
+ *
+ * 仪表屏物理就是 1920×532；这里放宽到 4096×2160（4K）给未来换屏留余地，
+ * 但**必须有个上限** —— 握手包是 TCP 上来的，不校验就等于让对端指定
+ * 我们分配多少内存（见 run_session 里的校验注释）。
+ */
+#define MAX_DIM_W            4096
+#define MAX_DIM_H            2160
+/* shm pool 总上限（int32 offset 与 /dev/shm 都是硬约束） */
+#define MAX_POOL_BYTES       (64u * 1024u * 1024u)
+
 /* ===== 全局状态 ===== */
 static int running = 1;
 static struct wl_display *display = NULL;
@@ -95,10 +107,24 @@ static pthread_mutex_t wl_mutex = PTHREAD_MUTEX_INITIALIZER;
 typedef struct {
     struct wl_buffer *wl_buffer;
     uint8_t *data;          /* mmap 的共享内存 */
+    /*
+     * **必须记录这块映射有多大**。
+     *
+     * 原来只存指针，所有写入都用全局 frame_size —— 而 frame_size 会在
+     * 下一轮握手时被改大，此时 buffers[i].data 还指向上一轮（更小）的映射。
+     * 于是 memset(b->data, 0, 新frame_size) 会写穿到邻居映射/空洞 → SIGSEGV。
+     * （触发路径：分辨率变大 + init_buffers 的 ftruncate/mmap 失败）
+     */
+    size_t data_size;
     int busy;               /* 1 = 已提交待 release */
 } buffer_t;
 
 static buffer_t buffers[NUM_BUFFERS];
+
+/* 当前 shm 映射的基址/长度。保留它是为了在下一轮 init_buffers() 和进程退出时
+ * munmap —— 不记录就只能泄漏（wl_shm_pool_destroy 不会卸载客户端映射）。 */
+static void  *g_shm_base = NULL;
+static size_t g_shm_len  = 0;
 
 /* 提交/丢帧计数（排查"画面卡住"时看这两个数：提交涨=在动，丢帧涨=合成器跟不上） */
 static int g_commit_total = 0;
@@ -196,16 +222,41 @@ static int init_buffers(void) {
     /* 先清掉可能残留的同名 shm 对象（上次崩溃遗留），避免大小不匹配 */
     shm_unlink(SHM_NAME);
 
+    /*
+     * **先把上一轮的 mmap 卸掉**。
+     *
+     * wl_shm_pool_destroy() 只是发请求，不会卸载客户端自己的映射；
+     * 上一轮 shm_unlink 之后那层映射仍然钉着 tmpfs 页 ——
+     * 每轮会话泄漏 frame_size × NUM_BUFFERS（1920×532 档约 16 MB，
+     * H.264 档约 4 MB）。车上反复投屏/断连 20 次就吃掉 300+ MB，
+     * /dev/shm 满了之后 ftruncate 失败，进而引爆后面 buffer 尺寸不匹配的写穿。
+     */
+    if (g_shm_base && g_shm_len) {
+        munmap(g_shm_base, g_shm_len);
+    }
+    g_shm_base = NULL;
+    g_shm_len = 0;
+
     /* 建一个大的 shm pool，放 NUM_BUFFERS 个帧 */
     size_t pool_size = frame_size * NUM_BUFFERS;
     int fd = shm_open(SHM_NAME, O_RDWR | O_CREAT | O_TRUNC, 0600);
     if (fd < 0) { LOG("shm_open 失败: %s", strerror(errno)); return -1; }
     if (ftruncate(fd, pool_size) < 0) {
-        LOG("ftruncate 失败: %s", strerror(errno)); close(fd); return -1;
+        LOG("ftruncate 失败: %s", strerror(errno));
+        close(fd);
+        shm_unlink(SHM_NAME);       /* 别留一个半截的对象在 /dev/shm */
+        return -1;
     }
 
     uint8_t *base = mmap(NULL, pool_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-    if (base == MAP_FAILED) { LOG("mmap 失败: %s", strerror(errno)); close(fd); return -1; }
+    if (base == MAP_FAILED) {
+        LOG("mmap 失败: %s", strerror(errno));
+        close(fd);
+        shm_unlink(SHM_NAME);
+        return -1;
+    }
+    g_shm_base = base;
+    g_shm_len = pool_size;
 
     /*
      * **shm 内存必须先清零**。
@@ -221,9 +272,16 @@ static int init_buffers(void) {
 
     for (int i = 0; i < NUM_BUFFERS; i++) {
         buffers[i].data = base + (size_t)i * frame_size;
+        buffers[i].data_size = frame_size;      /* 记下这块映射多大，写入只按它 */
         buffers[i].busy = 0;
         buffers[i].wl_buffer = wl_shm_pool_create_buffer(pool,
                 i * frame_size, frame_w, frame_h, stride, WL_SHM_FORMAT_ARGB8888);
+        if (!buffers[i].wl_buffer) {
+            LOG("wl_shm_pool_create_buffer 失败（index %d）", i);
+            buffers[i].data = NULL;
+            buffers[i].data_size = 0;
+            return -1;
+        }
         wl_buffer_add_listener(buffers[i].wl_buffer, &buffer_listener, &buffers[i]);
     }
 
@@ -318,7 +376,11 @@ static void commit_frame(void) {
     }
 
     pthread_mutex_lock(&fb_mutex);
-    memcpy(b->data, frame_buffer, frame_size);
+    /* 按这块映射的真实大小拷，不用全局 frame_size —— 后者可能已经被
+     * 下一轮握手改大，而 b->data 还指向旧的小映射（会写穿）。 */
+    size_t copy = b->data_size;
+    if (copy > frame_size) copy = frame_size;
+    memcpy(b->data, frame_buffer, copy);
     pthread_mutex_unlock(&fb_mutex);
 
     wl_surface_attach(surface, b->wl_buffer, 0, 0);
@@ -359,6 +421,16 @@ static int read_full(int fd, void *buf, size_t len) {
     size_t got = 0;
     while (got < len) {
         ssize_t n = recv(fd, p + got, len - got, 0);
+        /*
+         * **EINTR 不是错误**。
+         *
+         * signal() 默认没有 SA_RESTART，本进程又会 fork/exec 一堆
+         * LayerManagerControl（每次 system() 都产生 SIGCHLD），以及
+         * SIGINT/SIGTERM —— 这些都可能打断 recv。
+         * 原来把 EINTR 当成 -1 处理，等于「清理图层时正好在收帧 → 会话被误断」。
+         * h264rx.c 里的 read_full 一直是对的，这里不一致。
+         */
+        if (n < 0 && errno == EINTR) continue;
         if (n <= 0) return -1;
         got += (size_t)n;
     }
@@ -368,8 +440,20 @@ static int read_full(int fd, void *buf, size_t len) {
 /* 跑一个完整会话：accept → 握手 → 收帧 → 断连。
  * 返回 0 表示会话正常结束（可以继续等下一个），-1 表示监听口坏了。 */
 static int run_session(int server_fd) {
-    int client = accept(server_fd, NULL, NULL);
-    if (client < 0) { LOG("accept 失败: %s", strerror(errno)); return -1; }
+    /*
+     * accept 也要处理 EINTR：signal() 没有 SA_RESTART，任何 SIGCHLD/SIGINT
+     * 都能把它打断。原来 -1 直接 return -1 → network_thread 永久退出，
+     * 进程还在、但再也不会收帧，只能靠 App 重新 deploy。
+     */
+    int client;
+    for (;;) {
+        if (!running) return -1;
+        client = accept(server_fd, NULL, NULL);
+        if (client >= 0) break;
+        if (errno == EINTR) continue;
+        LOG("accept 失败: %s", strerror(errno));
+        return -1;
+    }
     LOG("AP 已连接");
 
     uint8_t *tile_buf = NULL;
@@ -394,11 +478,66 @@ static int run_session(int server_fd) {
         enc_w = (int)hs.width; enc_h = (int)hs.height;
     }
 
+    /*
+     * **握手参数必须先校验再分配**。
+     *
+     * hs.width/height 是 TCP 上来的 uint32_t，原来直接强转 int 参与
+     * frame_size 计算，没有任何范围检查。后果：
+     *   · width=0x80000000 → frame_w 溢出成 INT_MIN，frame_size 接近 2^64
+     *   · width=5000000   → 要 26GB
+     * calloc 必然失败 → goto out → cleanup_layer() → blank_frame()
+     * → memset(buffers[0].data=NULL, 0, 巨大值) → 直接 SIGSEGV。
+     *
+     * 也就是**一个 28 字节的握手包就能打死仪表守护进程**，
+     * 之后 /run/dashcast-shm、layer 99 全靠运气。
+     *
+     * 另外 stride 是 int，frame_w*4 也必须装得下；pool offset 是 int32，
+     * frame_size 乘 NUM_BUFFERS 同样要装得下，否则 Wayland protocol error
+     * 会把整条 wl_display 连接判死，进程活着但永远不上屏。
+     */
+    if (hs.codec != DASHCAST_CODEC_BGRA
+            && hs.codec != DASHCAST_CODEC_RLE
+            && hs.codec != DASHCAST_CODEC_H264) {
+        LOG("握手参数字段非法：codec=%u", (unsigned)hs.codec);
+        goto out;
+    }
+    if (hs.width == 0 || hs.height == 0
+            || hs.width > MAX_DIM_W || hs.height > MAX_DIM_H) {
+        LOG("握手尺寸非法：%ux%u（上限 %d/%d）",
+            (unsigned)hs.width, (unsigned)hs.height, MAX_DIM_W, MAX_DIM_H);
+        goto out;
+    }
+
     pthread_mutex_lock(&fb_mutex);
     frame_w = h264 ? enc_w : (int)hs.width;
     frame_h = h264 ? enc_h : (int)hs.height;
+    pthread_mutex_unlock(&fb_mutex);
+
+    /* 编码尺寸同样要限幅，而且必须是偶数（4:2:0 色度抽样要求） */
+    if (frame_w <= 0 || frame_h <= 0
+            || frame_w > MAX_DIM_W || frame_h > MAX_DIM_H) {
+        LOG("图层尺寸非法：%dx%d", frame_w, frame_h);
+        goto out;
+    }
+    if (h264 && ((frame_w & 1) || (frame_h & 1))) {
+        LOG("H.264 编码尺寸必须是偶数：%dx%d", frame_w, frame_h);
+        goto out;
+    }
+    /* stride(int) 与 pool offset(int32) 都要装得下 */
+    if ((size_t)frame_w > (size_t)INT32_MAX / 4) {
+        LOG("图层宽度过大（stride 溢出）：%d", frame_w);
+        goto out;
+    }
+
+    pthread_mutex_lock(&fb_mutex);
     stride = frame_w * 4;
     frame_size = (size_t)frame_w * frame_h * 4;
+    if (frame_size > (size_t)MAX_POOL_BYTES / NUM_BUFFERS) {
+        pthread_mutex_unlock(&fb_mutex);
+        LOG("帧尺寸过大：%zu（单池上限 %zu）", frame_size,
+            (size_t)MAX_POOL_BYTES / NUM_BUFFERS);
+        goto out;
+    }
     free(frame_buffer);
     /*
      * **必须 calloc，不能 malloc**。
@@ -878,6 +1017,19 @@ static void blank_frame(void)
 {
     if (!surface) return;
 
+    /*
+     * **必须确认缓冲池真的建好了**。
+     *
+     * 握手参数非法 / calloc 失败时，会话会 goto out → cleanup_layer()
+     * → blank_frame()，而这时 init_buffers() 根本没跑过，buffers[] 全是
+     * static 零值（wl_buffer=NULL, data=NULL）。直接 memset(NULL, 0, size)
+     * 就是 SIGSEGV —— 一个畸形握手包打死守护进程的最后一环。
+     */
+    if (!buffers[0].wl_buffer || !buffers[0].data || buffers[0].data_size == 0) {
+        LOG("缓冲池未就绪，跳过硬刷透明帧");
+        return;
+    }
+
     /* 全程独占 wl_display：取 buffer 要 pump 出 buffer release 事件，
      * roundtrip 也要自己读写 socket —— 都必须在锁内，避免与其它线程竞争。 */
     pthread_mutex_lock(&wl_mutex);
@@ -888,7 +1040,7 @@ static void blank_frame(void)
         LOG("清屏帧拿不到空闲 buffer，跳过");
         return;
     }
-    memset(b->data, 0, frame_size);
+    memset(b->data, 0, b->data_size);   /* 只清这块映射的真实大小 */
     wl_surface_attach(surface, b->wl_buffer, 0, 0);
     wl_surface_damage(surface, 0, 0, frame_w, frame_h);
     wl_surface_commit(surface);
@@ -1104,6 +1256,17 @@ int main(int argc, char **argv) {
     int port = DEFAULT_PORT;
     if (argc > 1) port = atoi(argv[1]);
 
+    /*
+     * **必须忽略 SIGPIPE**。
+     *
+     * 默认动作是「终止进程」。本项目有两条必经的写信道：
+     *   ① 回握手 ACK 的 send(client, ...)  —— AP 超时/用户点停止会同时 close，
+     *      命中 EPIPE 直接被信号杀死，layer 99 来不及清理，留在 render order 里。
+     *   ② commit_frame() 的 wl_display_flush() —— Weston 重启时同样会自杀。
+     * 这两种场景在车上都会真实发生。dashcmd.c 早就忽略了，这里一直漏着。
+     */
+    signal(SIGPIPE, SIG_IGN);
+
     signal(SIGINT, on_signal);
     signal(SIGTERM, on_signal);
 
@@ -1164,10 +1327,24 @@ int main(int argc, char **argv) {
     /* 释放 buffer */
     for (int i = 0; i < NUM_BUFFERS; i++) {
         if (buffers[i].wl_buffer) wl_buffer_destroy(buffers[i].wl_buffer);
+        buffers[i].wl_buffer = NULL;
+        buffers[i].data = NULL;
+        buffers[i].data_size = 0;
     }
-    if (pool) wl_shm_pool_destroy(pool);
-    if (surface) wl_surface_destroy(surface);
-    if (ivi_surface) ivi_surface_destroy(ivi_surface);
+    if (pool) { wl_shm_pool_destroy(pool); pool = NULL; }
+
+    /* 卸载 shm 映射并删掉对象：不 munmap 会把 tmpfs 页钉住，不 unlink 会留垃圾 */
+    if (g_shm_base && g_shm_len) {
+        munmap(g_shm_base, g_shm_len);
+        g_shm_base = NULL;
+        g_shm_len = 0;
+    }
+    shm_unlink(SHM_NAME);
+
+    /* 顺序：ivi_surface 先于它承载的 wl_surface */
+    if (ivi_surface) { ivi_surface_destroy(ivi_surface); ivi_surface = NULL; }
+    if (surface) { wl_surface_destroy(surface); surface = NULL; }
+    if (display) { wl_display_flush(display); wl_display_disconnect(display); display = NULL; }
 
     LOG("资源已释放");
     return 0;

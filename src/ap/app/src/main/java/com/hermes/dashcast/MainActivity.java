@@ -399,10 +399,20 @@ public class MainActivity extends Activity {
         loadTargetPref();
         updateTargetHint();
 
-        new Thread(() -> {
-            MirrorController.loadCodec(this);
-            refreshCodecButtons();
-        }).start();
+        /*
+         * **loadCodec 必须在这个线程之前同步跑完**。
+         *
+         * buildMaskPanel()（378 行）里的 maskFps = MirrorController.getFps()
+         * 是拿"当前帧率"当作编辑器的初始值；如果 loadCodec 还在后台没跑完，
+         * 此时 fps 还是类默认值 30，用户的真实设置（比如 60）就读不到。
+         * 后果：用户点「保存并应用」遮罩时，saveMask 拿 30 和"30"比对
+         * （见 saveMask 里的 setFps 逻辑），于是**把帧率从 60 打回 30** ——
+         * 用户完全没碰帧率，设置却自己变了。
+         *
+         * loadCodec 只读 SharedPreferences，是微秒级操作，同步跑没有代价。
+         */
+        MirrorController.loadCodec(this);
+        refreshCodecButtons();
 
         if (MirrorController.isMirroring()) {
             running = true;
@@ -429,6 +439,48 @@ public class MainActivity extends Activity {
         updateMapModeBtn();
         updateTargetHint();
         refreshCodecButtons();
+    }
+
+    /**
+     * 界面销毁时把挂在静态/长生命周期对象上的引用全部摘掉。
+     *
+     * 三个 Listener（DashcastSenderService 的 display/stats、MirrorController 的
+     * listener）都是**静态或全局对象持有的 lambda**，隐式捕获 this（Activity）。
+     * 不摘的话每次旋转/重进都会泄漏一整个 Activity + 它的整棵 View 树，
+     * 而 mirror 是跨 Activity 复用的（getActive 拿旧的），旧 listener 还指着
+     * 已销毁的 View，状态回写会抛 BadTokenException。
+     */
+    @Override
+    protected void onDestroy() {
+        try {
+            DashcastSenderService.setDisplayReadyListener(null);
+        } catch (Throwable ignored) {
+        }
+        try {
+            DashcastSenderService.setStatsListener(null);
+        } catch (Throwable ignored) {
+        }
+        try {
+            if (mirror != null && !sandboxKeepListenerOnDestroy()) {
+                mirror.setListener(null);
+            }
+        } catch (Throwable ignored) {
+        }
+        try {
+            mainHandler.removeCallbacksAndMessages(null);
+        } catch (Throwable ignored) {
+        }
+        super.onDestroy();
+    }
+
+    /**
+     * mirror 跨 Activity 存活（singleTask + getActive），如果这里直接把 listener
+     * 置空，用户在投屏中旋转/重进界面后就再也不刷新状态了。
+     * onNewIntent/onCreate 会重新 setListener，所以照理没事；但为了绝对安全，
+     * 投屏未结束时保守保留 —— 反正 next onCreate 会覆盖成新实例。
+     */
+    private boolean sandboxKeepListenerOnDestroy() {
+        return running;
     }
 
     /** 镜像状态/统计回调。绑定到当前 Activity 实例 —— 界面重建后要重新挂 */

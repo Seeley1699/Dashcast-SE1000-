@@ -45,6 +45,8 @@ static long g_rv[8];                   /* h264_decode 返回值分布 */
 static int  g_hist[32];                /* NAL 类型直方图 */
 static int  g_dumped = 0;
 static int g_restart_flag = 0;   /* 1 = 解码尺寸与画布不符，请断开让 AP 重连 */
+/** 连续分辨率不符的帧数：够多就置 restart_flag，别让画面永久冻住还不吭声 */
+static int g_mismatch = 0;
 
 static void yuv_to_argb(uint8_t *dst, const uint8_t *yp, const uint8_t *up, const uint8_t *vp,
                         int w, int h, int sy, int suv) {
@@ -149,12 +151,28 @@ static void feed_nal(void *dec, const uint8_t *nal, int len,
 
     int r = h264_decode(dec, g_in, len + 4, &py, &pu, &pv, &sy, &suv, &dw, &dh);
     g_feed++;
-    if (r >= 0 && r < 8) g_rv[r]++;
+    if (r < 0) g_rv[7]++;                 /* 负值单独记，别和"没出帧"混在一起 */
+    else if (r < 7) g_rv[r]++;
     if (r != 1) return;
+    if (!py || !pu || !pv) return;        /* 解码器报了出帧但没有有效平面 */
     if (dw != w || dh != h) {
-        /* 分辨率变了（AP 改档）：这一帧丢掉，等下次握手重建 */
+        /*
+         * 分辨率变了（AP 改了编码尺寸）：这一帧丢掉，等下次握手重建。
+         *
+         * **必须上报，不能静默吞**。原来这里只 return —— 不计数、不打印、
+         * 不触发重连。结果 SPS 改了分辨率后 CP 把每一帧都丢掉，仪表停在
+         * 最后一帧，日志里连一条提示都没有，只能靠猜。
+         * 连续丢够一帧的量就置 restart flag，让上层断开重连重新协商。
+         */
+        g_mismatch++;
+        if (g_mismatch == 1) {
+            log_line("h264rx: 分辨率不符（码流 %dx%d vs 图层 %dx%d），"
+                     "丢弃并请求重连", dw, dh, w, h);
+        }
+        if (g_mismatch >= 30) g_restart_flag = 1;
         return;
     }
+    g_mismatch = 0;
     yuv_to_argb(dst, py, pu, pv, w, h, sy, suv);
     g_frames++;
     maybe_dump(dst, w, h);
@@ -206,22 +224,29 @@ int h264_rx_run(int fd, uint8_t *dst, int w, int h,
         g_bytes += len;
         if (g_dumped < 3) {
             g_dumped++;
+            /* len 可能只有 1~3 字节（合法的短 NAL），直接读 g_nal[1..3] 会越界。
+             * 先 pad 到 4 再打。 */
+            uint8_t hdr[4] = {0, 0, 0, 0};
+            memcpy(hdr, g_nal, len < 4 ? (size_t) len : 4);
             log_line("h264rx: 首个 NAL len=%u 头=%02x %02x %02x %02x",
-                     len, g_nal[0], g_nal[1], g_nal[2], g_nal[3]);
+                     len, hdr[0], hdr[1], hdr[2], hdr[3]);
         }
         feed_nal(dec, g_nal, (int) len, dst, w, h, commit);
 
         time_t now = time(NULL);
-        if (now - last_report >= 5) {
+        double dt = (double)(now - last_report);
+        if (dt > 0 && now - last_report >= 5) {
             char hist[256];
             int hp = 0;
             for (int t = 0; t < 32; t++) {
                 if (g_hist[t])
                     hp += snprintf(hist + hp, sizeof(hist) - hp, "%d:%d ", t, g_hist[t]);
             }
-            log_line("h264rx: 帧=%ld NAL=%ld 喂=%ld %.0f KB/s | rv0=%ld rv1=%ld rv2=%ld rv3=%ld | NAL[%s]",
-                     g_frames, g_nals, g_feed, (double) g_bytes / 1024.0,
-                     g_rv[0], g_rv[1], g_rv[2], g_rv[3], hist);
+            /* 按真实时长换算 —— 原来直接除以 1024 打的是「KB/5秒」，
+             * 标签却写 KB/s，数字被放大 5 倍，会误导"要不要开 H.264"的判断。 */
+            log_line("h264rx: 帧=%ld NAL=%ld 喂=%ld %.0f KB/s | rv0=%ld rv1=%ld rv2=%ld rv3=%ld rv7=%ld | NAL[%s]",
+                     g_frames, g_nals, g_feed, (double) g_bytes / 1024.0 / dt,
+                     g_rv[0], g_rv[1], g_rv[2], g_rv[3], g_rv[7], hist);
             g_bytes = 0;
             last_report = now;
         }
@@ -233,7 +258,28 @@ int h264_rx_run(int fd, uint8_t *dst, int w, int h,
         rc = -2;
         g_restart_flag = 0;
     }
+
+    /*
+     * **free 之后必须把 cap 一起清零**。
+     *
+     * 原来只 free(g_nal) 不清 g_nal_cap：第 2 个 H.264 会话进来时，
+     * cap 还是上一轮的最大 NAL 长度（几 MB），于是
+     *     if (len > cap) { realloc }
+     * 判 false、跳过 realloc，直接拿已经 NULL 的 g_nal 去 read_full：
+     *     recv(fd, NULL, len, 0) → EFAULT → 返回 -1 → rc=0 → 会话立刻退出
+     *
+     * 表现就是「第一次 H.264 投屏正常，之后每次再投都黑屏，
+     * 必须 killall dashcastd 重来」。
+     */
     free(g_nal);
+    g_nal = NULL;
+    g_nal_cap = 0;
+
+    /* g_in 同理：不释放是泄漏，释放了不清 cap 就是下一条死路 */
+    free(g_in);
+    g_in = NULL;
+    g_in_cap = 0;
+
     log_line("h264rx: 退出，共 %ld 个 NAL / %ld 帧", g_nals, g_frames);
     return rc;
 }

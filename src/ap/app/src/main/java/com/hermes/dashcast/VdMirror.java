@@ -464,7 +464,6 @@ public class VdMirror {
     private boolean ensureConnected() {
         if (!sProxyWanted) return false;   /* 主屏模式：不碰 8450 */
         if (out != null) return true;
-        if (out != null) return true;
         /*
          * **失败退避**（2026-10-31 修复刷屏）：
          *
