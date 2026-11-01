@@ -815,6 +815,34 @@ public class MirrorController {
             return win;   /* 无遮罩或遮罩是整屏 → 不裁 */
         }
 
+        /*
+         * 优先用**显式指定的抓取源区域**（layer_src_x / _y / _h）。
+         *
+         * 为什么需要：下面那套"按遮罩比例居中适配"只能居中，
+         * 没法指定纵向起点。实测遮罩 1440×400 时居中算出抓 y=364–1075，
+         * 本车箭头（窗口 y≈1030）落在 94% 位置 —— 几乎贴底，前方全看不到。
+         * 显式给 srcY=900 后本车落在 33%，才是开车该有的构图。
+         *
+         * 宽度按遮罩比例反推，保证编码时零缩放：
+         *   srcW = srcH * (遮罩宽/遮罩高)
+         */
+        if (lc.srcH > 0) {
+            double maskAspect0 = (double) lc.w / lc.h;
+            int sh = lc.srcH;
+            int sw = (int) Math.round(sh * maskAspect0);
+            /* 16 对齐（H.264 硬编要求） */
+            sw = ((sw + 15) / 16) * 16;
+            sh = ((sh + 15) / 16) * 16;
+            int sx = lc.srcX;
+            int sy = lc.srcY;
+            /* 夹住，别出窗口 */
+            if (sx + sw > win[0] + win[2]) sx = win[0] + win[2] - sw;
+            if (sy + sh > win[1] + win[3]) sy = win[1] + win[3] - sh;
+            if (sx < win[0]) sx = win[0];
+            if (sy < win[1]) sy = win[1];
+            return new int[]{sx, sy, sw, sh};
+        }
+
         double px0 = (double) lc.x / OUT_W;
         double py0 = (double) lc.y / OUT_H;
         double px1 = (double) (lc.x + lc.w) / OUT_W;

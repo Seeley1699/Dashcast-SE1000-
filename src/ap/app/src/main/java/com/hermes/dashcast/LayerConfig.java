@@ -49,6 +49,23 @@ public final class LayerConfig {
     public int feather = 0;        /* 羽化宽度 px */
     public int fit = 0;    /* 0=铺满遮罩(默认,不留黑边) 1=等比居中 */
 
+    /*
+     * ===== 地图模式的抓取源区域（窗口坐标，仅 mapMode 生效）=====
+     *
+     * 为什么需要它：
+     *   applyMapCrop() 原本按"遮罩比例适配窗口 + 居中"算抓取区，
+     *   只能水平/垂直居中，**没法指定纵向起点**。
+     *   实测遮罩 1440×400 时居中算出抓 y=364–1075，
+     *   本车箭头（窗口 y≈1030）落在画面 94% 位置 —— 几乎在最底下，
+     *   前方路线几乎看不到。
+     *
+     * 改成显式指定：源 560,900 1440×400 → 本车落在 33% 位置，
+     * 上方留出足够的前方视野。这才是开车时该有的构图。
+     *
+     * srcH 为 0 表示"按老逻辑自动算"（向后兼容）。
+     */
+    public int srcX = 0, srcY = 0, srcH = 0;
+
     /* ============================ 持久化 ============================ */
 
     /** 生成 key=value 文本（格式必须与 dcapd2 的 dc_layer_parse 对齐） */
@@ -216,6 +233,9 @@ public final class LayerConfig {
         e.putInt("layer_trap_bot", trapBot);
         e.putInt("layer_feather", feather);
         e.putInt("layer_fit", fit);
+        e.putInt("layer_src_x", srcX);
+        e.putInt("layer_src_y", srcY);
+        e.putInt("layer_src_h", srcH);
         e.apply();
     }
 
@@ -246,6 +266,9 @@ public final class LayerConfig {
         c.trapBot    = p.getInt("layer_trap_bot", 0);
         c.feather    = p.getInt("layer_feather", 0);
         c.fit        = p.getInt("layer_fit", 0);
+        c.srcX       = p.getInt("layer_src_x", 0);
+        c.srcY       = p.getInt("layer_src_y", 0);
+        c.srcH       = p.getInt("layer_src_h", 0);
 
         c.sanitize();
         return c;
