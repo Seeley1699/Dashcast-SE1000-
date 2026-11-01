@@ -1314,6 +1314,25 @@ int main(int argc, char **argv)
          dispW, dispH, capW, capH, srcX, srcY, srcW, srcH, outW, outH, maxFps);
 
     /*
+     * **清掉上一轮残留的状态文件**。
+     *
+     * /data/local/tmp/dcapd2.bg 是"我现在在后台跟随模式（抓虚拟屏）"的标记。
+     * 主循环靠 access(BG_FILE) 判断走哪条路：
+     *     有 bg 文件 → 只处理 VD 帧，**完全不抓主屏**
+     *
+     * 问题是 App 端如果没能清干净（停止流程被抢占、forceCleanup 失败、
+     * 进程被 kill -9 来不及清），这个文件就会残留。下次启动时
+     * bg_mode=true、可虚拟屏根本没建 → 主屏不抓、VD 也没帧 →
+     *     STAT fps=0 capture=0 tiles=0 totalKB=0
+     * 看起来就是"投屏启动了但仪表一动不动"，实测踩过（2026-11-01）。
+     *
+     * 新进程一定是主屏模式起步（后台跟随要等 App 收到 DCBG 才切），
+     * 所以这里无条件清掉是对的。
+     */
+    unlink(BG_FILE);
+    unlink(PAUSE_FILE);
+
+    /*
      * 源矩形在抓帧缓冲里的坐标 —— 现在**恒为整块**（0,0,capW,capH）。
      *
      * 因为 crop 已经把 srcW×srcH 那块渲染成 capW×capH 了，
@@ -1529,15 +1548,29 @@ int main(int argc, char **argv)
                         LOGE("GraphicBuffer lock 失败: %d", err);
                         usleep(100 * 1000);
                     } else {
-                        /* 自动裁掉内容自带的左右黑边（抖音车机版窗口里常见）。
-                         * 不裁的话那些黑边会跟着画面一起缩放投上仪表，
-                         * 看着就是"投屏区里有一条黑边"。 */
+                        /*
+                         * 自动裁掉内容自带的左右黑边（抖音车机版窗口里常见）。
+                         *
+                         * **但只在没有遮罩时才做**（2026-11-01 重影修复）。
+                         *
+                         * 有遮罩的时候，用户已经在编辑器里精确框出了想要的区域，
+                         * 再叠一层"每帧现算的自动裁剪"就是两套规则打架：
+                         *   · 这个检测没有时间平滑，每帧结果都会变 ——
+                         *     实测同一画面连续几帧报 29/29、54/12、150/12、129/12…
+                         *   · 于是 blit 的源矩形每帧都在变宽/变窄，
+                         *     画面在遮罩里"呼吸"式伸缩，前后两帧错位叠加 →
+                         *     用户看到的就是重影 + 抖动。
+                         *
+                         * 有遮罩时直接用 sx/sy/sw/sh，画面绝对稳定。
+                         */
                         int cropL = 0, cropR = 0;
-                        detect_crop_columns((const uint8_t *) pixels, gb->getStride(),
-                                            sx, sy, sw, sh, &cropL, &cropR);
+                        if (!g_mask_ready) {
+                            detect_crop_columns((const uint8_t *) pixels, gb->getStride(),
+                                                sx, sy, sw, sh, &cropL, &cropR);
+                        }
                         int bsx = sx + cropL, bsw = sw - cropL - cropR;
                         if (bsw < 4) { bsx = sx; bsw = sw; }
-                        if (cropL || cropR) {
+                        if (!g_mask_ready && (cropL || cropR)) {
                             static long s_lastcrop = -1;
                             if (s_lastcrop != (long)(cropL * 1000 + cropR)) {
                                 s_lastcrop = cropL * 1000 + cropR;

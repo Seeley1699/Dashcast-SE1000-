@@ -908,6 +908,70 @@ static int order_contains(int layer_id, int *ids, int max) {
     return 0;
 }
 
+/**
+ * 把我们的 surface 从**所有**图层上摘掉（除了正在用的 LAYER_ID 之外也一并处理）。
+ *
+ * 为什么需要：ivi-shell 里一个 surface 可以同时属于多个 layer。
+ * `destroy layer 99` 不会清理它挂过的 surface —— surface 会掉回之前所属的图层。
+ * 实测事故（2026-11-01）：
+ *     layer 10（原厂）surface render order: 4711, 9001
+ *     layer 99（投屏）surface render order: 9001
+ * 同一个 surface 9001 同时出现在两层 → 仪表上两份画面 → 用户报"重影"。
+ *
+ * 实现：直接 popen 读 `get scene` 的 listing，用 strstr 扫出所有
+ * `layer <id> (0x` 形式的 id，再逐个 `remove surface`。
+ * 不用 shell 的 sed/管道 —— 这台 CP 的 busybox 正则行为不一致
+ * 实测按 layer 关键字提取 id 的写法输出为空，所以改在 C 里解析。
+ */
+
+static void detach_surface_from_all_layers(void)
+{
+    char line[512];
+    char cmd[256];
+    int removed = 0;
+    FILE *fp = popen("LayerManagerControl get scene 2>/dev/null", "r");
+    if (!fp) {
+        /* 兜底：至少把最常见的那两层摘一遍（原厂 10 和 我们自己的 99） */
+        snprintf(cmd, sizeof(cmd),
+                 "LayerManagerControl remove surface %d from layer 10 2>/dev/null; "
+                 "LayerManagerControl remove surface %d from layer %d 2>/dev/null",
+                 SURFACE_ID, SURFACE_ID, LAYER_ID);
+        system(cmd);
+        return;
+    }
+
+    while (fgets(line, sizeof(line), fp)) {
+        /* 只认 "    layer 10 (0xa)" 这种行；surface 行里没有 "layer <数字> (0x" 前缀 */
+        const char *p = line;
+        while ((p = strstr(p, "layer ")) != NULL) {
+            p += 6;                                   /* 跳过 "layer " */
+            if (*p < '0' || *p > '9') { p++; continue; }
+
+            int id = 0;
+            const char *q = p;
+            while (*q >= '0' && *q <= '9') { id = id * 10 + (*q - '0'); q++; }
+            /* 后面必须紧跟 " (0x"，才算合法的 layer 头行 */
+            while (*q == ' ') q++;
+            if (*q != '(' || q[1] != '0' || (q[2] != 'x' && q[2] != 'X')) { p++; continue; }
+
+            if (id == LAYER_ID) { p++; continue; }    /* 自己的层留着 */
+
+            snprintf(cmd, sizeof(cmd),
+                     "LayerManagerControl remove surface %d from layer %d 2>/dev/null",
+                     SURFACE_ID, id);
+            system(cmd);
+            LOG("已从 layer %d 上摘掉 surface %d（防重复挂载 → 重影）", id, SURFACE_ID);
+            removed++;
+            p = q;
+        }
+    }
+    pclose(fp);
+
+    if (removed == 0) {
+        LOG("surface %d 未挂在其他图层上（干净）", SURFACE_ID);
+    }
+}
+
 static void setup_layer(void) {
     char cmd[512];
     char order[512];
@@ -930,7 +994,28 @@ static void setup_layer(void) {
         LOG("读不到现有 render order，按 [10] 兜底（退出时仍会还原成这个）");
     }
 
-    /* ② 清残留 + 建层 */
+    /*
+     * ② 清残留 + 建层。
+     *
+     * **关键：先把我们的 surface 从所有其他图层上摘掉**。
+     *
+     * ivi-shell 的语义是一个 surface 可以同时属于多个 layer，而且
+     * `destroy layer 99` 并不会把它挂过的 surface 一并清干净 ——
+     * surface 会"掉回"到它之前所属的那个 layer。
+     *
+     * 实测踩到（2026-11-01，仪表重影排查）：
+     *   layer 10（原厂图层）surface render order: 4711, 9001
+     *   layer 99（投屏图层）surface render order: 9001
+     * 同一个 surface 9001 同时挂在两层上 → 仪表上出现两份画面，
+     * 其中一份被原厂图层的 dest region 拉伸，看起来就是"重影"。
+     *
+     * 所以顺序必须是：摘干净 → 建新层 → 再挂回去。
+     *
+     * 实现上不用 shell 里的 sed/管道（这台 CP 的 busybox 上正则行为不一致，
+     * 实测按 layer 关键字提取 id 的写法输出为空）——
+     */
+    detach_surface_from_all_layers();
+
     snprintf(cmd, sizeof(cmd),
              "LayerManagerControl destroy layer %d 2>/dev/null", LAYER_ID);
     system(cmd);
@@ -1080,6 +1165,16 @@ static void cleanup_layer(void) {
      * 再摘 render order、再 destroy。反过来如果 destroy 失败，摘表也兜得住。 */
     blank_frame();
     for (int i = 0; i < 3; i++) {
+        /*
+         * **先把 surface 从所有图层上摘掉，再 destroy**。
+         *
+         * 只 destroy layer 99 的话，ivi-shell 会把 surface 9001 掉回它
+         * 之前所属的图层（实测掉回了 layer 10 = 原厂图层），
+         * 于是下一轮会话再 add surface 到 99 时，它同时挂在两层上 →
+         * 仪表出现两份画面（用户看到的就是"重影"）。
+         */
+        detach_surface_from_all_layers();
+
         snprintf(cmd, sizeof(cmd),
                  "LayerManagerControl set screen 0 render order %s 2>/dev/null", order);
         system(cmd);
