@@ -108,10 +108,9 @@ public class MainActivity extends Activity {
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
 
-        /* 沉浸式：Flyme Auto 的系统导航栏默认浅色，我们的界面是深色底，
-         * 那条白栏很扎眼。themes.xml 里的 navigationBarColor 对它无效
-         * （车机用了自己的导航栏窗口），只能整条藏起来。 */
-        applyImmersive();
+        /* 沉浸式的调用点在 setContentView 之后（见下方），
+         * 因为 onCreate 一进来 DecorView 还没建，getInsetsController() 会是 null ——
+         * 在那种地方调直接 NPE 闪退。 */
 
         /* 成员初始化（原样保留，不能在 UI 重构时丢掉） */
         cpManager = new CpManager(this);
@@ -379,6 +378,14 @@ public class MainActivity extends Activity {
         buildMaskPanel(right);
 
         setContentView(page);
+
+        /* 沉浸式：Flyme Auto 的系统导航栏默认浅色，我们的界面是深色底，
+         * 那条白栏很扎眼。themes.xml 里的 navigationBarColor 对它无效
+         * （车机用了自己的导航栏窗口），只能整条藏起来。
+         *
+         * **必须放在 setContentView 之后**：onCreate 一进来 DecorView 还没建，
+         * getWindowInsetsController() 会返回 null，在那里调直接 NPE 闪退。 */
+        applyImmersive();
 
         setDotColor(R.color.content_secondary);
         refreshCodecButtons();
@@ -1837,32 +1844,47 @@ public class MainActivity extends Activity {
      * 用户不会因为找不到返回键而卡住。
      */
     private void applyImmersive() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-            Window w = getWindow();
-            if (w != null) {
-                w.setDecorFitsSystemWindows(false);
-                WindowInsetsController ctl = w.getInsetsController();
-                if (ctl != null) {
-                    ctl.hide(WindowInsets.Type.navigationBars());
-                    ctl.setSystemBarsBehavior(
-                            WindowInsetsController.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE);
-                }
-            }
-            return;
-        }
-        /* API 30 以下的老路径（这台车机是 Android 11，所以这条其实不会走，
-         * 留着是为了以后换机型不用改） */
         try {
             Window w = getWindow();
-            if (w != null) {
-                w.getDecorView().setSystemUiVisibility(
-                        View.SYSTEM_UI_FLAG_HIDE_NAVIGATION
-                        | View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY
-                        | View.SYSTEM_UI_FLAG_LAYOUT_STABLE
-                        | View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION);
+            if (w == null) return;
+            View decor = w.getDecorView();
+            if (decor == null) return;
+
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                w.setDecorFitsSystemWindows(false);
+                /* 立刻试一次；如果 DecorView 还没 attach 就排到消息队列尾部再试。 */
+                if (decor.isAttachedToWindow()) {
+                    hideNavBars(w);
+                } else {
+                    decor.post(() -> {
+                        try {
+                            hideNavBars(w);
+                        } catch (Throwable t) {
+                            Log.w(TAG, "applyImmersive(post) 失败（忽略）: " + t);
+                        }
+                    });
+                }
+                return;
             }
-        } catch (Throwable ignored) {
+
+            decor.setSystemUiVisibility(
+                    View.SYSTEM_UI_FLAG_HIDE_NAVIGATION
+                    | View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY
+                    | View.SYSTEM_UI_FLAG_LAYOUT_STABLE
+                    | View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION);
+        } catch (Throwable t) {
+            /* 任何机型差异都不该让 App 起不来 —— 藏导航栏只是锦上添花 */
+            Log.w(TAG, "applyImmersive 失败（忽略）: " + t);
         }
+    }
+
+    /** 真正执行隐藏导航栏。调用前必须确认 DecorView 已 attach。 */
+    private void hideNavBars(Window w) {
+        WindowInsetsController ctl = w.getInsetsController();
+        if (ctl == null) return;
+        ctl.hide(WindowInsets.Type.navigationBars());
+        ctl.setSystemBarsBehavior(
+                WindowInsetsController.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE);
     }
 
     private void appendLog(String raw) {
