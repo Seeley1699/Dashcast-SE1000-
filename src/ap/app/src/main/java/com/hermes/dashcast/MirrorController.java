@@ -723,7 +723,19 @@ public class MirrorController {
         new Thread(() -> {
             boolean done = false;
             try {
-                int[] r = currentMaskRect();
+                /*
+                 * **关键：destination region 不能无脑用遮罩矩形**。
+                 *
+                 * 之前这里直接 currentMaskRect() → setLayerRect(遮罩 x/y/w/h)，
+                 * 结果合成器把**整块 1920×532 画布压缩**到遮罩矩形里 ——
+                 * 而 AP 端已经把画面画在画布的遮罩坐标上了，
+                 * 于是仪表上出现"正常画面 + 缩小副本"叠在一起 = 重影。
+                 *
+                 * 正确的换算按编码档走（详见 LayerGeometry 的注释）：
+                 *   BGRA：画布遮罩外已透明 → destination = 整屏，1:1 零缩放
+                 *   H.264：无 alpha → destination = 遮罩矩形，图层本身缩进那块
+                 */
+                int[] r = LayerGeometry.destinationFor(codec, currentMaskRect(), OUT_W, OUT_H);
 
                 /* 保活每 8 秒一次，矩形没变就不必每次打两条日志。
                  * 原来每轮都打（Mirror 一条 + CpManager 一条），
