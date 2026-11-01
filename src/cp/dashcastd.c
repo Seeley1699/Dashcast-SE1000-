@@ -207,6 +207,16 @@ static int init_buffers(void) {
     uint8_t *base = mmap(NULL, pool_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
     if (base == MAP_FAILED) { LOG("mmap 失败: %s", strerror(errno)); close(fd); return -1; }
 
+    /*
+     * **shm 内存必须先清零**。
+     *
+     * shm_open(O_CREAT|O_TRUNC) + ftruncate 之后，内核只保证大小，不保证
+     * 内容是 0 —— 可能是同一块共享内存被上一个进程用剩的像素。
+     * 这些 buffer 第一次 attach 时如果没被完整写过，残留内容会直接上屏，
+     * 看起来就是"一开投屏就有花花绿绿的重影块"。
+     */
+    memset(base, 0, pool_size);
+
     pool = wl_shm_create_pool(shm, fd, pool_size);
 
     for (int i = 0; i < NUM_BUFFERS; i++) {
@@ -390,7 +400,15 @@ static int run_session(int server_fd) {
     stride = frame_w * 4;
     frame_size = (size_t)frame_w * frame_h * 4;
     free(frame_buffer);
-    frame_buffer = malloc(frame_size);
+    /*
+     * **必须 calloc，不能 malloc**。
+     *
+     * BGRA 档走图块增量：每帧只覆盖"与上一帧不同"的块，其余区域保留
+     * frame_buffer 里的旧内容。malloc 出来的是上次释放的堆块残留（随机像素），
+     * 那些从没被任何图块覆盖过的角落就会一直显示这堆垃圾 ——
+     * 表现为重影/花屏/黑块。
+     */
+    frame_buffer = calloc(1, frame_size);
     pthread_mutex_unlock(&fb_mutex);
 
     if (!frame_buffer) { LOG("malloc 帧缓冲失败"); goto out; }
