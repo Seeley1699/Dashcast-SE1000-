@@ -33,9 +33,22 @@
         android:theme="@style/Theme.Dashcast"
         android:allowBackup="false">
 
+        <!--
+            主界面。
+
+            **必须 singleTask**：默认 standard 模式下每一次 am start 都会新建一个
+            Activity 实例，每个实例都挂一个 fillxfill 的全屏窗口。实测从 launcher
+            点几次、adb 再 start 几次，同一个进程里就堆出 3 个
+            com.hermes.dashcast/MainActivity 窗口（token 各不同），
+            结果仪表上看到「几份相同画面叠在一起」—— 被误判成投屏重影。
+
+            singleTask 保证栈里只有一个实例，再次启动只是把它 bringToFront。
+        -->
         <activity
             android:name=".MainActivity"
-            android:exported="true">
+            android:exported="true"
+            android:launchMode="singleTask"
+            android:configChanges="orientation|screenSize|screenLayout|keyboardHidden|density">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
@@ -53,10 +66,12 @@
             android:foregroundServiceType="dataSync"
             android:exported="false" />
 
-        <!-- 可视化图层布局编辑器：圆角/梯形/羽化形状遮罩，参数即时下发到 dcapd2 -->
+        <!-- 可视化图层布局编辑器：圆角/梯形/羽化形状遮罩，参数即时下发到 dcapd2。
+             同样要 singleTask —— 反复进编辑器不该堆多个实例。 -->
         <activity
             android:name=".LayerEditorActivity"
             android:exported="false"
+            android:launchMode="singleTask"
             android:label="图层布局" />
 
         <!-- 联调用：一块确定会动的 60fps 内容源，没有 launcher 入口。

@@ -413,6 +413,24 @@ public class MainActivity extends Activity {
         }
     }
 
+    /**
+     * singleTask 复用入口。
+     *
+     * 从 launcher 再点一次、或 adb am start 再来一次，都走这里而不是新建实例。
+     * 必须把状态回调和界面刷新重新挂到当前实例上 —— 否则原来那个 listener
+     * 还指着旧实例的 View，状态栏就不刷新了。
+     */
+    @Override
+    protected void onNewIntent(Intent intent) {
+        super.onNewIntent(intent);
+        setIntent(intent);
+        if (mirror != null) mirror.setListener(makeMirrorListener());
+        applyImmersive();
+        updateMapModeBtn();
+        updateTargetHint();
+        refreshCodecButtons();
+    }
+
     /** 镜像状态/统计回调。绑定到当前 Activity 实例 —— 界面重建后要重新挂 */
     private MirrorController.Listener makeMirrorListener() {
         return new MirrorController.Listener() {
