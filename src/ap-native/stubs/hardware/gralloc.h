@@ -1,0 +1,28 @@
+// 最小 stub：hardware/gralloc.h
+// 只提供 GRALLOC_USAGE_* 常量和 buffer_handle_t（我的代码只用到这些）
+#pragma once
+
+#include <stdint.h>
+#include <cutils/native_handle.h>
+
+// GRALLOC_USAGE_* 常量（与 AOSP hardware/libhardware/include/hardware/gralloc.h 一致）
+#define GRALLOC_USAGE_SW_READ_NEVER        0x00000000ULL
+#define GRALLOC_USAGE_SW_READ_RARELY       0x00000002ULL
+#define GRALLOC_USAGE_SW_READ_OFTEN        0x00000003ULL
+#define GRALLOC_USAGE_SW_WRITE_NEVER       0x00000000ULL
+#define GRALLOC_USAGE_SW_WRITE_RARELY      0x00000020ULL
+#define GRALLOC_USAGE_SW_WRITE_OFTEN       0x00000030ULL
+#define GRALLOC_USAGE_HW_TEXTURE           0x00000100ULL
+#define GRALLOC_USAGE_HW_RENDER            0x00000200ULL
+#define GRALLOC_USAGE_HW_2D                0x00000400ULL
+#define GRALLOC_USAGE_HW_COMPOSER          0x00000800ULL
+#define GRALLOC_USAGE_HW_VIDEO_ENCODER     0x00010000ULL
+#define GRALLOC_USAGE_HW_CAMERA_WRITE      0x00020000ULL
+#define GRALLOC_USAGE_HW_CAMERA_READ       0x00040000ULL
+
+// mask 常量（与 AOSP 一致）
+#define GRALLOC_USAGE_SW_READ_MASK         0x0000000fULL
+#define GRALLOC_USAGE_SW_WRITE_MASK        0x000000f0ULL
+#define GRALLOC_USAGE_HW_MASK              0x00071f00ULL
+#define GRALLOC_USAGE_PROTECTED            0x00004000ULL
+#define GRALLOC_USAGE_CURSOR               0x00000040ULL

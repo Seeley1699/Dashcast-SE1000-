@@ -1,0 +1,80 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="com.hermes.dashcast">
+
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION" />
+
+    <!-- 本地存储：预设配置和运行日志落盘到 Download/Dashcast/ -->
+    <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE"
+        android:maxSdkVersion="28" />
+    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" />
+    <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE" />
+    <!-- 建 PUBLIC 虚拟屏的系统权限（signature|privileged，普通安装拿不到，
+         留作 priv-app 部署用；拿不到时走 MediaProjection token 那条路） -->
+    <uses-permission android:name="android.permission.CAPTURE_VIDEO_OUTPUT" />
+    <!-- Android 11+ 包可见性：允许查询设备上所有已安装 App（选择投屏目标需要） -->
+    <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES" />
+    <!-- 投放当前前台 App：moveTaskToDisplay 需要（signature|privileged，工程固件可装） -->
+    <uses-permission android:name="android.permission.MANAGE_ACTIVITY_TASKS" />
+
+    <queries>
+        <intent>
+            <action android:name="android.intent.action.MAIN" />
+            <category android:name="android.intent.category.LAUNCHER" />
+        </intent>
+    </queries>
+
+    <application
+        android:label="Dashcast"
+        android:icon="@mipmap/ic_launcher"
+        android:theme="@style/Theme.Dashcast"
+        android:allowBackup="false">
+
+        <activity
+            android:name=".MainActivity"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <service
+            android:name=".DashcastSenderService"
+            android:foregroundServiceType="mediaProjection|dataSync"
+            android:exported="false" />
+
+        <!-- 镜像模式：只用来把进程钉在前台，逻辑在 Activity 进程里 -->
+        <service
+            android:name=".KeepAliveService"
+            android:foregroundServiceType="dataSync"
+            android:exported="false" />
+
+        <!-- 可视化图层布局编辑器：圆角/梯形/羽化形状遮罩，参数即时下发到 dcapd2 -->
+        <activity
+            android:name=".LayerEditorActivity"
+            android:exported="false"
+            android:label="图层布局" />
+
+        <!-- 联调用：一块确定会动的 60fps 内容源，没有 launcher 入口。
+             用法：am start 时用 display 参数指定虚拟屏 id -->
+        <activity
+            android:name=".TestPatternActivity"
+            android:exported="true"
+            android:launchMode="singleInstance" />
+
+        <!-- 联调用：adb shell am broadcast -a com.hermes.dashcast.DIAG
+             把 CP（仪表）和 AP（中控）两边的状态一次性打到 logcat -->
+        <receiver
+            android:name=".DiagReceiver"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="com.hermes.dashcast.DIAG" />
+                <action android:name="com.hermes.dashcast.CPCMD" />
+            </intent-filter>
+        </receiver>
+    </application>
+</manifest>

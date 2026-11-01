@@ -1,0 +1,3 @@
+97430eddabb5cb531aaccb020da7eb40 *Dashcast-v2.9-debug.apk
+5e63551e7975cfbef97e5b341adaf497 *dashcastd
+3e9c810339480a17142e3ea7d6e5199c *dcapd2

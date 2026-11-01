@@ -1,0 +1,19 @@
+﻿# 构建产物
+src/ap/.gradle/
+src/ap/app/build/
+src/ap/build/
+src/ap/.idea/
+src/ap/local.properties
+
+# 二进制产物（体积大，改动频繁，靠 artifacts/MD5SUMS.txt 记录）
+artifacts/*.apk
+artifacts/dashcastd
+artifacts/dcapd2
+
+# 工具与临时
+jadx/
+decompiled/
+*.zip
+*.log
+*.class
+*.dex

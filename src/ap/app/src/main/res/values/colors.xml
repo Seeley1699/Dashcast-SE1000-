@@ -1,0 +1,63 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<!--
+  全局色板 v3（2026-10-31 深度美化）
+
+  设计思路：
+    · 背景用带蓝调的中性深灰（#0D1117），不是纯黑 —— 纯黑在大屏上会让
+      文字边缘"晕开"，蓝调能稳住对比
+    · 卡片三级抬升（#161B22 → #1C2128 → #22282F），每级差 ~6% 亮度，
+      肉眼刚好能分辨但不刺眼
+    · 主色用「冷青蓝」#58A6FF（GitHub Dark 同款），中性、专业、不抢眼
+    · 语义色降低饱和（成功 #3FB950 / 警告 #D29922 / 危险 #F85149），
+      避免警示色在深色背景上"发光"
+-->
+<resources>
+
+    <!-- ── 背景：三级抬升 ── -->
+    <color name="surface_root">#FF0D1117</color>        <!-- 页面底 -->
+    <color name="surface_card">#FF161B22</color>        <!-- 卡片 -->
+    <color name="surface_raised">#FF1C2128</color>      <!-- 次级按钮 -->
+    <color name="surface_raised_press">#FF22282F</color><!-- 按下 -->
+    <color name="surface_border">#FF30363D</color>      <!-- 描边 -->
+    <color name="surface_muted">#FF161B22</color>       <!-- 禁用底 -->
+    <color name="surface_deep">#FF010409</color>        <!-- 预览区最深 -->
+
+    <!-- ── 文字：四级对比 ── -->
+    <color name="content_primary">#FFE6EDF3</color>     <!-- 主文字 -->
+    <color name="content_secondary">#FF8B949E</color>   <!-- 次文字 -->
+    <color name="content_tertiary">#FF6E7681</color>    <!-- 弱文字 -->
+    <color name="content_accent">#FF58A6FF</color>      <!-- 强调文字 -->
+
+    <!-- ── 主色：冷青蓝 ── -->
+    <color name="accent">#FF58A6FF</color>
+    <color name="accent_press">#FF388BFD</color>
+    <color name="accent_on">#FF0D1117</color>
+    <color name="accent_soft">#FF79C0FF</color>
+    <color name="accent_tint">#1F58A6FF</color>
+
+    <!-- ── 语义状态 ── -->
+    <color name="state_ok">#FF3FB950</color>
+    <color name="state_ok_tint">#1F3FB950</color>
+    <color name="state_warn">#FFD29922</color>
+    <color name="state_warn_tint">#1FD29922</color>
+    <color name="state_error">#FFF85149</color>
+    <color name="state_error_press">#FFDA3633</color>
+    <color name="state_error_tint">#1FF85149</color>
+    <color name="state_idle">#FF8B949E</color>
+    <color name="state_idle_tint">#12FFFFFF</color>
+
+    <!-- ── 兼容别名 ── -->
+    <color name="bg">@color/surface_root</color>
+    <color name="card_bg">@color/surface_card</color>
+    <color name="card_border">@color/surface_border</color>
+    <color name="btn_surface">@color/surface_raised</color>
+    <color name="btn_surface_press">@color/surface_raised_press</color>
+    <color name="accent_dim">@color/accent_press</color>
+    <color name="warn">@color/state_warn</color>
+    <color name="danger">@color/state_error</color>
+    <color name="text_main">@color/content_primary</color>
+    <color name="text_sub">@color/content_secondary</color>
+    <color name="btn_disabled">@color/surface_muted</color>
+    <color name="text_disabled">@color/content_tertiary</color>
+
+</resources>
