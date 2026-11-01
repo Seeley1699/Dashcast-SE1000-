@@ -1,3 +1,3 @@
-f35bc00b20ee12c0d0acfb67be6022ce *Dashcast-v2.9-debug.apk
-ed352f8220b298c79b0b1bdffe11666e *dashcastd
+cff658528ed34fd0d0d234791d5fefa8 *Dashcast-v2.9-debug.apk
+baee35605cac09355591d85c4c5dcb82 *dashcastd
 f37aaf262d6c7c844bde39de3a02657e *dcapd2
