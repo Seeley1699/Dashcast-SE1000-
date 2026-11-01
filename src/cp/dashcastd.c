@@ -130,6 +130,18 @@ static size_t g_shm_len  = 0;
 static int g_commit_total = 0;
 static int g_drop_total = 0;
 
+/* 运行期巡检计数：每 N 帧查一次"本 surface 有没有被挂到别的图层"（重影根治） */
+static int g_detach_tick = 0;
+
+/* 是否正处在一次投屏会话中（有 AP 连接且图层已建）。
+ * 巡检线程只在会话中动手，没投屏时不碰仪表，避免干扰原厂界面。 */
+static volatile int g_session_active = 0;
+
+/* commit_frame() 位置靠前就要调用它，先前置声明。
+ * verbose=1 打印收集/摘除细节（setup_layer 阶段）；
+ * verbose=0 静默（巡检模式，只有真的摘掉时才打一行）。 */
+static void detach_surface_from_all_layers(int verbose);
+
 /* ===== 日志 ===== */
 #define LOG(fmt, ...) fprintf(stderr, "[dashcastd] " fmt "\n", ##__VA_ARGS__)
 
@@ -394,6 +406,29 @@ static void commit_frame(void) {
     {
         static struct timespec t_last;
         static int n_since = 0;
+
+        /*
+         * **周期性摘除其他图层上的本 surface（重影根治，2026-11-02）**。
+         *
+         * 实测：setup_layer() 里 detach 成功（自检日志确认 layer10 只剩 4711），
+         * 但投屏开始后约 15 秒，9001 又出现在 layer 10 上 → 仪表两份画面。
+         *
+         * 已用隔离实验逐一排除，确认**不是**这些动作导致的：
+         *   · wl_surface_commit（30fps 跑 3 秒 / 90+ 次，layer10 保持干净）
+         *   · set layer 99 visibility 1
+         *   · set screen 0 render order 10,99
+         *   · add surface 9001 to layer 99
+         *   · destroy/create layer 99
+         * 杀掉 dashcastd 后 9001 消失 → 确认是本进程持有的 surface 被挂回去。
+         *
+         * 剩下最可能的是 ivi-shell 在某个内部时机（比如第一次收到 damage/buffer
+         * release，或 layer 属性变更后重排）把 surface 回填到默认层。
+         * 这个时机由合成器决定，客户端无法精确规避。
+         *
+         * 所以采取**运行期巡检**：由独立的 layer_watchdog_thread 每秒复查一次
+         * （不能挂在这里 —— 画面静止时 AP 不发图块，这里根本不会被调用，
+         *   而双挂载恰恰在画面静止时才稳定存在，形成逻辑死锁）。
+         */
         if (t_last.tv_sec == 0) { clock_gettime(CLOCK_MONOTONIC, &t_last); }
         g_commit_total++;
         if (++n_since >= 30) {
@@ -566,7 +601,6 @@ static int run_session(int server_fd) {
     }
 
     /* 尝试读 AP 紧随 ACK 发来的「图层矩形」（20 字节）。
-    /*
      * 图层矩形不再从 TCP 上读。
      *
      * 曾经尝试在握手后读 20 字节矩形，但**无法与帧头区分**：
@@ -782,6 +816,38 @@ static void *network_thread(void *arg) {
     return NULL;
 }
 
+/*
+ * 图层巡检线程（重影根治，2026-11-02）。
+ *
+ * 为什么不放在 commit_frame() 里：
+ *   实测发现 **画面静止时 AP 不发任何图块**（BGRA 增量编码只发变化的块），
+ *   CP 侧就没有 commit_frame() 调用 ——
+ *   于是挂在提交路径上的巡检**永远不会运行**，
+ *   而双挂载恰恰在画面静止时才稳定存在（用户看到"不动的时候有两份叠着"）。
+ *
+ *   这是一个逻辑死锁：需要巡检的场景 = 巡检不运行的场景。
+ *
+ * 所以改成独立线程，1 秒一次，与画面是否变化无关。
+ */
+static void *layer_watchdog_thread(void *arg) {
+    (void) arg;
+    int ticks = 0;
+    while (running) {
+        /* 1 秒一次；sleep 拆小片，便于退出时快速响应 */
+        for (int i = 0; i < 10 && running; i++) usleep(100 * 1000);
+        if (!running) break;
+
+        /* 只在投屏会话中巡检（没连接时不动仪表，避免干扰原厂） */
+        if (!g_session_active) continue;
+
+        detach_surface_from_all_layers(0);
+        if (++ticks % 60 == 0) {
+            LOG("图层巡检已运行 %d 秒（每秒查一次双挂载）", ticks);
+        }
+    }
+    return NULL;
+}
+
 /* ===== 初始化 Wayland + ivi ===== */
 
 static int init_wayland(void) {
@@ -951,14 +1017,47 @@ static int order_contains(int layer_id, int *ids, int max) {
  * 实测按 layer 关键字提取 id 的写法输出为空，所以改在 C 里解析。
  */
 
-static void detach_surface_from_all_layers(void)
+/*
+ * 把我们的 surface 从**所有**图层上摘掉（LAYER_ID 自己除外）。
+ *
+ * ══════════════════════════════════════════════════════════════
+ * 为什么要做这个（2026-11-01 重影根因）
+ * ══════════════════════════════════════════════════════════════
+ * ivi-shell 里一个 surface **可以同时属于多个 layer**，而且
+ * `add surface to layer` 是**追加**、不是迁移。
+ *
+ * 时序问题：
+ *   init_wayland() 里 ivi_application_surface_create(9001) + commit
+ *   → ivi-shell 自动把 surface 挂到**默认层**（这台机器是 layer 10 = 原厂）
+ *   之后 setup_layer() 如果只做 add 到 99、不摘 10，
+ *   就变成 layer 10 和 layer 99 各挂一份 → 仪表上两份画面叠在一起。
+ *
+ * ══════════════════════════════════════════════════════════════
+ * 为什么必须先读完再执行（这一版的关键修复）
+ * ══════════════════════════════════════════════════════════════
+ * 上一版是在 popen 的 fgets 循环里直接 system() 执行 remove。
+ * popen 会 fork 一个 `sh -c` 子进程并保持 pipe 打开，
+ * 在循环内再 system()（又一次 fork+exec）时，本进程同时持有
+ * 两个子 shell —— 在这台 CP 的 uClibc/weston 环境下，
+ * system() 会静默失败（`2>/dev/null` 又吞掉了错误输出）。
+ *
+ * 表现就是：日志明明白白打出「已从 layer 10 上摘掉 surface 9001」，
+ * 但 `get layer 10` 里 9001 还在 —— 日志在 system() 之后无条件打印，
+ * 所以看起来"做了却没生效"，排查时极具迷惑性。
+ *
+ * 修法：先把所有 layer id 收集到数组里，**pclose 关掉 pipe**，
+ * 再逐个 system() 执行 remove。
+ */
+static void detach_surface_from_all_layers(int verbose)
 {
     char line[512];
     char cmd[256];
-    int removed = 0;
+    int  ids[32];
+    int  n = 0;
+
     FILE *fp = popen("LayerManagerControl get scene 2>/dev/null", "r");
     if (!fp) {
-        /* 兜底：至少把最常见的那两层摘一遍（原厂 10 和 我们自己的 99） */
+        /* 兜底：至少把最常见的那两层摘一遍（原厂 10 和 我们自己的 99 之外） */
         snprintf(cmd, sizeof(cmd),
                  "LayerManagerControl remove surface %d from layer 10 2>/dev/null; "
                  "LayerManagerControl remove surface %d from layer %d 2>/dev/null",
@@ -967,8 +1066,8 @@ static void detach_surface_from_all_layers(void)
         return;
     }
 
-    while (fgets(line, sizeof(line), fp)) {
-        /* 只认 "    layer 10 (0xa)" 这种行；surface 行里没有 "layer <数字> (0x" 前缀 */
+    /* ① 只读：把 layer id 全部收集起来，读完立刻关 pipe */
+    while (fgets(line, sizeof(line), fp) && n < (int)(sizeof(ids) / sizeof(ids[0]))) {
         const char *p = line;
         while ((p = strstr(p, "layer ")) != NULL) {
             p += 6;                                   /* 跳过 "layer " */
@@ -977,24 +1076,47 @@ static void detach_surface_from_all_layers(void)
             int id = 0;
             const char *q = p;
             while (*q >= '0' && *q <= '9') { id = id * 10 + (*q - '0'); q++; }
-            /* 后面必须紧跟 " (0x"，才算合法的 layer 头行 */
             while (*q == ' ') q++;
-            if (*q != '(' || q[1] != '0' || (q[2] != 'x' && q[2] != 'X')) { p++; continue; }
+            /* 后面必须紧跟 " (0x"，才算合法的 layer 头行 */
+            if (*q != '(' || q[1] != '0' || (q[2] != 'x' && q[2] != 'X')) {
+                if (verbose) LOG("[detach] 跳过非 layer 头行: %.60s", line);
+                p++;
+                continue;
+            }
 
-            if (id == LAYER_ID) { p++; continue; }    /* 自己的层留着 */
-
-            snprintf(cmd, sizeof(cmd),
-                     "LayerManagerControl remove surface %d from layer %d 2>/dev/null",
-                     SURFACE_ID, id);
-            system(cmd);
-            LOG("已从 layer %d 上摘掉 surface %d（防重复挂载 → 重影）", id, SURFACE_ID);
-            removed++;
+            if (id == LAYER_ID) { p = q; continue; }    /* 自己的层留着 */
+            ids[n++] = id;
+            if (verbose) LOG("[detach] 收集到 layer id=%d", id);
             p = q;
         }
     }
-    pclose(fp);
+    pclose(fp);                                       /* ★ 必须先关，再 system() */
 
-    if (removed == 0) {
+    if (verbose && n > 0) LOG("[detach] 共收集 %d 个待摘图层", n);
+
+    /* ② 再逐个执行 remove */
+    int removed = 0;
+    for (int i = 0; i < n; i++) {
+        snprintf(cmd, sizeof(cmd),
+                 "LayerManagerControl remove surface %d from layer %d 2>/dev/null",
+                 SURFACE_ID, ids[i]);
+        int rc = system(cmd);
+        /*
+         * 巡检模式下只在**真的又出现了**时打日志（repair 场景）——
+         * 正常运行时每帧都摘一次、没有可摘的，保持完全静默，
+         * 否则每秒一条会把真信息淹掉。
+         */
+        if (verbose) {
+            LOG("已从 layer %d 上摘掉 surface %d（rc=%d，防重复挂载 → 重影）",
+                ids[i], SURFACE_ID, rc);
+        } else {
+            LOG("巡检：发现 surface %d 又在 layer %d 上，已摘掉（rc=%d）",
+                SURFACE_ID, ids[i], rc);
+        }
+        removed++;
+    }
+
+    if (verbose && removed == 0) {
         LOG("surface %d 未挂在其他图层上（干净）", SURFACE_ID);
     }
 }
@@ -1057,7 +1179,7 @@ static void setup_layer(void) {
     system(cmd);
 
     /* 挂到 99 之后，再把 10（以及其他任何层）上的登记摘掉 */
-    detach_surface_from_all_layers();
+    detach_surface_from_all_layers(1);
 
     /* 立刻回读验证：如果这里还有 9001，说明是 detach 本身没生效；
      * 如果这里干净、几秒后又有，那就是后面某个操作把它挂回去了。 */
@@ -1107,6 +1229,9 @@ static void setup_layer(void) {
      */
     LOG("图层就绪：layer %d（%dx%d）render order: %s  set_rc=%d（首帧后再复核）",
         LAYER_ID, frame_w, frame_h, order, rc);
+
+    /* 会话建立完毕，可以开始图层巡检（独立线程每秒查一次双挂载） */
+    g_session_active = 1;
 }
 
 /* 首帧提交之后核一次：此时图层已经有内容，listing 里应该能看到它 */
@@ -1188,6 +1313,9 @@ static void cleanup_layer(void) {
     char order[256];
     order[0] = '\0';
 
+    /* 会话结束，先停巡检 —— 否则它会在还原过程中又把 surface 挂回去 */
+    g_session_active = 0;
+
     /* 存档里万一混进了 99（上一次清理失败留下的），剥掉再还原 ——
      * 否则每次"还原"都忠实地把 99 写回去，仪表就永远停在最后一帧。
      *
@@ -1220,7 +1348,7 @@ static void cleanup_layer(void) {
          * 于是下一轮会话再 add surface 到 99 时，它同时挂在两层上 →
          * 仪表出现两份画面（用户看到的就是"重影"）。
          */
-        detach_surface_from_all_layers();
+        detach_surface_from_all_layers(0);
 
         snprintf(cmd, sizeof(cmd),
                  "LayerManagerControl set screen 0 render order %s 2>/dev/null", order);
@@ -1446,6 +1574,16 @@ int main(int argc, char **argv) {
     pthread_t th;
     pthread_create(&th, NULL, network_thread, &server_fd);
     pthread_detach(th);
+
+    /*
+     * 图层巡检线程：独立于画面变化，每秒查一次 surface 有没有被挂到别的图层。
+     *
+     * 不能挂在 commit_frame 里 —— 画面静止时 AP 不发图块，commit_frame
+     * 根本不会被调用，而双挂载恰恰在静止画面下才稳定存在（逻辑死锁）。
+     */
+    pthread_t wth;
+    pthread_create(&wth, NULL, layer_watchdog_thread, NULL);
+    pthread_detach(wth);
 
     /* 主循环：**不参与 wayland 事件读取**，只维持进程存活与退出信号。
      *
