@@ -2,6 +2,7 @@ package com.hermes.dashcast;
 
 import android.content.Context;
 import android.graphics.Canvas;
+import android.graphics.DashPathEffect;
 import android.graphics.Paint;
 import android.graphics.Path;
 import android.graphics.RectF;
@@ -31,10 +32,17 @@ public class LayerPreviewView extends View {
     private final Paint pEdge   = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Paint pHandle = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Paint pGrid   = new Paint();
+    /** 地图模式的"实际抓取区"参考框 */
+    private final Paint pMap    = new Paint(Paint.ANTI_ALIAS_FLAG);
 
     private final LayerConfig cfg;
     private final Context ctx;
     private OnGeometryChanged listener;
+
+    /** 地图模式：画一块虚线参考框，显示这块遮罩会抓到目标窗口的哪一片 */
+    private boolean mapMode;
+    /** 目标 App 窗口像素尺寸（默认主屏 2560×1600，enterBg 时会更准） */
+    private int winW = 2560, winH = 1600;
 
     private boolean zoomed;
     private float scale = 1f, ox, oy;
@@ -62,6 +70,22 @@ public class LayerPreviewView extends View {
 
     public void setOnGeometryChanged(OnGeometryChanged l) {
         this.listener = l;
+    }
+
+    /**
+     * 地图模式参考框开关。
+     *
+     * 开启后在预览上叠加一块暖色虚线框，表示"这块遮罩实际会抓目标窗口的
+     * 哪一片"。换算规则和 MirrorController.applyMapCrop 完全一致 ——
+     * 用户拖遮罩时能直接看到抓取区跟着动，不用反复投屏试。
+     *
+     * @param winWindowW 目标 App 窗口像素宽（一般 dumpsys window 拿到）
+     */
+    public void setMapMode(boolean on, int winWindowW, int winWindowH) {
+        this.mapMode = on;
+        if (winWindowW > 0) this.winW = winWindowW;
+        if (winWindowH > 0) this.winH = winWindowH;
+        invalidate();
     }
 
     public void setZoomed(boolean z) {
@@ -128,8 +152,80 @@ public class LayerPreviewView extends View {
         pEdge.setStrokeWidth(2f);
         c.drawPath(path, pEdge);
 
+        /* 地图模式：实际抓取区参考框 */
+        if (mapMode) drawMapCropHint(c);
+
         /* 右下角拖拽柄 */
         c.drawCircle(r.right, r.bottom, dp(9), pHandle);
+    }
+
+    /**
+     * 画"实际抓取区"参考框。
+     *
+     * 逻辑必须和 MirrorController.applyMapCrop 一致，否则预览和实际不符 ——
+     * 那边是：
+     *   ① 遮罩转成画布百分比区间
+     *   ② 遮罩按原比例放进窗口（居中）
+     *   ③ 按百分比切出那一段
+     *
+     * 这里反过来：把窗口坐标系里的抓取区，按等比映射回画布坐标系，
+     * 再叠加在遮罩上。用户看到的就是"这块遮罩会抓到窗口的哪一片"。
+     */
+    private void drawMapCropHint(Canvas c) {
+        if (cfg.w >= cfg.canvasW && cfg.h >= cfg.canvasH) return;   // 整屏不用提示
+
+        float px0 = (float) cfg.x / cfg.canvasW;
+        float py0 = (float) cfg.y / cfg.canvasH;
+        float px1 = (float) (cfg.x + cfg.w) / cfg.canvasW;
+        float py1 = (float) (cfg.y + cfg.h) / cfg.canvasH;
+
+        float maskAspect = (float) cfg.w / cfg.h;
+        float winAspect = (float) winW / winH;
+
+        float mw, mh, mx, my;
+        if (winAspect >= maskAspect) {
+            mh = winH;
+            mw = mh * maskAspect;
+            mx = (winW - mw) / 2f;
+            my = 0f;
+        } else {
+            mw = winW;
+            mh = mw / maskAspect;
+            mx = 0f;
+            my = (winH - mh) / 2f;
+        }
+
+        /* 抓取区（窗口坐标） */
+        float gx = mx + mw * px0;
+        float gy = my + mh * py0;
+        float gw = mw * (px1 - px0);
+        float gh = mh * (py1 - py0);
+
+        /* 窗口 → 画布：等比放进画布，居中 */
+        float k = (winAspect >= (float) cfg.canvasW / cfg.canvasH)
+                ? (float) cfg.canvasH / winH
+                : (float) cfg.canvasW / winW;
+
+        float spanX = winW * k;
+        float spanY = winH * k;
+        float baseX = (cfg.canvasW - spanX) / 2f;
+        float baseY = (cfg.canvasH - spanY) / 2f;
+
+        float rx = ox + (baseX + gx * k) * scale;
+        float ry = oy + (baseY + gy * k) * scale;
+        float rw = gw * k * scale;
+        float rh = gh * k * scale;
+
+        pMap.setColor(0xFFFFB454);
+        pMap.setStyle(Paint.Style.STROKE);
+        pMap.setStrokeWidth(2f);
+        pMap.setPathEffect(new DashPathEffect(new float[]{ dp(9), dp(5) }, 0));
+        c.drawRect(rx, ry, rx + rw, ry + rh, pMap);
+
+        pMap.setPathEffect(null);
+        pMap.setStyle(Paint.Style.FILL);
+        pMap.setTextSize(dp(11));
+        c.drawText("抓 " + (int) gw + "×" + (int) gh, rx + dp(4), ry - dp(4), pMap);
     }
 
     /** 按形状类型构造路径（与 C 侧 shape_distance 视觉一致） */

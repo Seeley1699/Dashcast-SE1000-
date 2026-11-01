@@ -29,6 +29,9 @@ import android.content.pm.ResolveInfo;
 import android.graphics.Typeface;
 import android.media.projection.MediaProjectionManager;
 import android.os.Build;
+import android.view.Window;
+import android.view.WindowInsets;
+import android.view.WindowInsetsController;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
@@ -104,6 +107,11 @@ public class MainActivity extends Activity {
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
+
+        /* 沉浸式：Flyme Auto 的系统导航栏默认浅色，我们的界面是深色底，
+         * 那条白栏很扎眼。themes.xml 里的 navigationBarColor 对它无效
+         * （车机用了自己的导航栏窗口），只能整条藏起来。 */
+        applyImmersive();
 
         /* 成员初始化（原样保留，不能在 UI 重构时丢掉） */
         cpManager = new CpManager(this);
@@ -522,6 +530,8 @@ public class MainActivity extends Activity {
 
         maskPreview = new LayerPreviewView(this, maskCfg);
         maskPreview.setOnGeometryChanged(c -> refreshMaskInfo());
+        /* 地图模式开的时候，预览上叠一块"实际抓取区"虚线框 */
+        maskPreview.setMapMode(mirror.isMapMode(), 2560, 1600);
         pvBox.addView(maskPreview, new FrameLayout.LayoutParams(
                 FrameLayout.LayoutParams.MATCH_PARENT,
                 FrameLayout.LayoutParams.MATCH_PARENT));
@@ -1743,12 +1753,24 @@ public class MainActivity extends Activity {
         }
 
         new Thread(() -> {
-            /* ① 杀投屏的目标 App */
+            /* ① 杀投屏的目标 App。
+             *
+             * **系统预装应用杀不掉**：地图（com.geely.map）、音乐这类由
+             * ecarx.intent.action.MAP_SERVICE 之类的系统服务托管，force-stop
+             * 之后 Android 会立刻把它们拉起来（实测 PID 秒级就变新的）。
+             * 所以这里不再是"一定要杀掉"，做完就完，日志如实记结果。 */
+            boolean killedOk = true;
             if (killed != null && !killed.isEmpty()) {
                 try {
                     AdbShell.exec("am force-stop " + killed, 5000);
-                    Log.i(TAG, "已结束投屏 App: " + killed);
+                    sleepQuiet(1200);
+                    String still = AdbShell.exec("pidof " + killed, 3000);
+                    killedOk = still == null || still.trim().isEmpty();
+                    Log.i(TAG, killedOk
+                            ? "已结束投屏 App: " + killed
+                            : "投屏 App 仍在运行（系统应用会被自动拉起）: " + killed);
                 } catch (Throwable t) {
+                    killedOk = false;
                     Log.w(TAG, "结束投屏 App 失败: " + t.getMessage());
                 }
             }
@@ -1761,10 +1783,24 @@ public class MainActivity extends Activity {
                 Log.w(TAG, "还原仪表异常: " + t.getMessage());
             }
             final boolean done = ok;
-            mainHandler.post(() -> setStatus(done
-                    ? "状态：投屏已停止（仪表已还原）"
-                    : "状态：投屏已停止（仪表还原未确认）"));
+            final boolean appGone = killedOk;
+            mainHandler.post(() -> {
+                if (!done) {
+                    setStatus("状态：投屏已停止（仪表还原未确认）");
+                } else if (!appGone) {
+                    setStatus("状态：投屏已停止（仪表已还原 · 目标为系统应用，它自己会留在后台）");
+                } else {
+                    setStatus("状态：投屏已停止（仪表已还原）");
+                }
+            });
         }, "stop-cast").start();
+    }
+
+    private static void sleepQuiet(long ms) {
+        try {
+            Thread.sleep(ms);
+        } catch (InterruptedException ignored) {
+        }
     }
 
     /** 真正干活的停止动作：投递 ACTION_STOP（服务同步 release）+ stopService */
@@ -1790,6 +1826,45 @@ public class MainActivity extends Activity {
     }
 
     /** 往运行日志面板追加一条（环形 12 条，带时间戳） */
+    /**
+     * 隐藏系统导航栏 + 让内容顶到状态栏下面。
+     *
+     * 为什么不用 themes.xml 的 navigationBarColor：Flyme Auto 车机的导航栏
+     * 是独立窗口（带 Home/音乐/音量那排），App 里设 navigationBarColor 对它
+     * 完全无效 —— 实测设了还是白的。只能整条藏起来。
+     *
+     * 用 SYSTEM_UI_FLAG_IMMERSIVE_STICKY：划一下能临时叫出来，几秒后自动藏，
+     * 用户不会因为找不到返回键而卡住。
+     */
+    private void applyImmersive() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            Window w = getWindow();
+            if (w != null) {
+                w.setDecorFitsSystemWindows(false);
+                WindowInsetsController ctl = w.getInsetsController();
+                if (ctl != null) {
+                    ctl.hide(WindowInsets.Type.navigationBars());
+                    ctl.setSystemBarsBehavior(
+                            WindowInsetsController.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE);
+                }
+            }
+            return;
+        }
+        /* API 30 以下的老路径（这台车机是 Android 11，所以这条其实不会走，
+         * 留着是为了以后换机型不用改） */
+        try {
+            Window w = getWindow();
+            if (w != null) {
+                w.getDecorView().setSystemUiVisibility(
+                        View.SYSTEM_UI_FLAG_HIDE_NAVIGATION
+                        | View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY
+                        | View.SYSTEM_UI_FLAG_LAYOUT_STABLE
+                        | View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION);
+            }
+        } catch (Throwable ignored) {
+        }
+    }
+
     private void appendLog(String raw) {
         if (logView == null || raw == null || raw.isEmpty()) return;
         String msg = raw;
@@ -1821,6 +1896,10 @@ public class MainActivity extends Activity {
         ((TextView) btnMapMode.getChildAt(1)).setText(mapModeLabel());
         btnMapMode.setBackgroundResource(mirror.isMapMode()
                 ? R.drawable.btn_selected : R.drawable.btn_secondary);
+        /* 预览上的"抓取区"参考框跟着开关走 */
+        if (maskPreview != null) {
+            maskPreview.setMapMode(mirror.isMapMode(), 2560, 1600);
+        }
     }
 
     /** 按状态文字更新右上角徽标（运行中/进行中/失败/未运行） */
