@@ -1024,25 +1024,24 @@ static void setup_layer(void) {
     /*
      * ② 清残留 + 建层。
      *
-     * **关键：先把我们的 surface 从所有其他图层上摘掉**。
+     * ivi-shell 的语义：一个 surface **可以同时属于多个 layer**，
+     * 而 `add surface to layer` 是**追加**，不是迁移 ——
+     * 它不会把 surface 从原层摘走。
      *
-     * ivi-shell 的语义是一个 surface 可以同时属于多个 layer，而且
-     * `destroy layer 99` 并不会把它挂过的 surface 一并清干净 ——
-     * surface 会"掉回"到它之前所属的那个 layer。
-     *
-     * 实测踩到（2026-11-01，仪表重影排查）：
+     * 实测踩到（2026-11-01）：
      *   layer 10（原厂图层）surface render order: 4711, 9001
      *   layer 99（投屏图层）surface render order: 9001
-     * 同一个 surface 9001 同时挂在两层上 → 仪表上出现两份画面，
-     * 其中一份被原厂图层的 dest region 拉伸，看起来就是"重影"。
+     * 同一个 surface 9001 同时挂在两层上 → 仪表上出现两份画面
+     * （原厂层那份被 dest region 拉伸），用户报"重影"。
      *
-     * 所以顺序必须是：摘干净 → 建新层 → 再挂回去。
+     * 根因是时序：
+     *   init_wayland() 里 ivi_application_surface_create(9001) + wl_surface_commit()
+     *   → ivi-shell 自动把它挂到**默认层**（这台机器上是 layer 10）。
+     *   之后 setup_layer() 只做 add 到 99，从不摘 10 —— 所以一直双挂。
      *
-     * 实现上不用 shell 里的 sed/管道（这台 CP 的 busybox 上正则行为不一致，
-     * 实测按 layer 关键字提取 id 的写法输出为空）——
+     * **正确顺序必须是：先 add 到 99，再摘掉其他所有层**。
+     * 反过来（先摘后 add）没用：add 之后 ivi-shell 仍保留 10 上的登记。
      */
-    detach_surface_from_all_layers();
-
     snprintf(cmd, sizeof(cmd),
              "LayerManagerControl destroy layer %d 2>/dev/null", LAYER_ID);
     system(cmd);
@@ -1056,6 +1055,27 @@ static void setup_layer(void) {
              "LayerManagerControl add surface %d to layer %d 2>/dev/null",
              SURFACE_ID, LAYER_ID);
     system(cmd);
+
+    /* 挂到 99 之后，再把 10（以及其他任何层）上的登记摘掉 */
+    detach_surface_from_all_layers();
+
+    /* 立刻回读验证：如果这里还有 9001，说明是 detach 本身没生效；
+     * 如果这里干净、几秒后又有，那就是后面某个操作把它挂回去了。 */
+    {
+        char vbuf[512];
+        snprintf(cmd, sizeof(cmd),
+                 "LayerManagerControl get layer 10 2>/dev/null "
+                 "| grep 'surface render'");
+        FILE *vf = popen(cmd, "r");
+        if (vf) {
+            if (fgets(vbuf, sizeof(vbuf), vf)) {
+                LOG("[自检 detach 后] layer10 surface: %.120s", vbuf);
+            } else {
+                LOG("[自检 detach 后] 读不到 layer10 的 surface 列表");
+            }
+            pclose(vf);
+        }
+    }
 
     /* ②-b 设可见：create layer 的默认 visibility 是 0，不设这一条图层永远不会上屏。
      *     实测踩过：surface 里明明有完整画面，仪表上却是原厂界面 —— 就是少这一步。 */
