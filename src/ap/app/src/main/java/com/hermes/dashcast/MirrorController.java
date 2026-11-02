@@ -894,47 +894,6 @@ public class MirrorController {
         return prefs(c).getBoolean(PREF_MAP_MODE, false);
     }
 
-    // ==================== 地图来源（截屏投送 / 原生仪表）====================
-
-    /*
-     * 地图模式下有两种取画面方式，本质完全不同：
-     *
-     *   SCREENSHOT（现有）：
-     *     dcapd2 截屏 → 编码 → TCP → CP 的 dashcastd → Weston layer 99
-     *     优点：可控（遮罩、形状、构图全是我们的）
-     *     缺点：带宽 49 KB/s、延迟 ~100ms、拿不到车道级渲染
-     *
-     *   NATIVE_DIM（新增）：
-     *     往 Settings 写 display_on_dashboard → 地图自己画到仪表
-     *     优点：零带宽、零延迟、原生画质、可能就是车道级
-     *     缺点：完全交给地图，遮罩/构图不可控
-     *
-     * 两条路互斥，但代码上并存 —— 用户随时可切，互不影响。
-     */
-    public static final int SOURCE_SCREENSHOT = 0;
-    public static final int SOURCE_NATIVE_DIM = 1;
-
-    private static final String PREF_MAP_SOURCE = "map_source";
-
-    public static int loadMapSource(Context c) {
-        return prefs(c).getInt(PREF_MAP_SOURCE, SOURCE_SCREENSHOT);
-    }
-
-    public static void saveMapSource(Context c, int src) {
-        prefs(c).edit().putInt(PREF_MAP_SOURCE, src).apply();
-    }
-
-    /** AR 实景（true）还是完整地图（false），只在 NATIVE_DIM 下有意义 */
-    private static final String PREF_DIM_AR = "dim_ar_mode";
-
-    public static boolean loadDimAr(Context c) {
-        return prefs(c).getBoolean(PREF_DIM_AR, false);
-    }
-
-    public static void saveDimAr(Context c, boolean ar) {
-        prefs(c).edit().putBoolean(PREF_DIM_AR, ar).apply();
-    }
-
     // ============================== 设备查询 ==============================
 
     /** 读目标 App 的窗口矩形。优先 mAppBounds（排除底部导航条）。 */

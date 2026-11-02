@@ -80,12 +80,6 @@ public class MainActivity extends Activity {
     private LinearLayout btnMapMode;                 /* 地图模式开关 */
     private LinearLayout viewRow;                    /* 视角三档容器 */
     private LinearLayout[] viewBtns;                 /* 远景/中景/近景 */
-    private LinearLayout mapSourceRow;               /* 地图来源容器 */
-    private LinearLayout btnSourceScreenshot;        /* 截屏投送 */
-    private LinearLayout btnSourceNative;            /* 原生仪表（DIM 通道） */
-    private LinearLayout dimArRow;                   /* AR 开关容器 */
-    private LinearLayout btnDimNormal;               /* 完整地图 */
-    private LinearLayout btnDimAr;                   /* AR 实景 */
 
     /** 操作互斥标志：任一 CP 操作进行中为 true */
     private boolean busy = false;
@@ -320,51 +314,6 @@ public class MainActivity extends Activity {
         castCard.addView(btnMapMode);
 
         /*
-         * ── 地图来源：截屏投送 / 原生仪表 ──
-         *
-         * 两条完全不同的路：
-         *   截屏投送  = dcapd2 截屏 → 编码 → CP 图层（现有，可控但慢）
-         *   原生仪表  = 写 Settings → 地图自己画到仪表（零带宽零延迟）
-         *
-         * 只在地图模式下显示。切到「原生仪表」后，开始投屏不再拉起
-         * dcapd2，而是让地图接管仪表 —— 视角三档也随之隐藏（那是
-         * 截屏方案才有的概念）。
-         */
-        mapSourceRow = new LinearLayout(this);
-        mapSourceRow.setOrientation(LinearLayout.HORIZONTAL);
-        mapSourceRow.setVisibility(mirror.isMapMode() ? View.VISIBLE : View.GONE);
-
-        btnSourceScreenshot = iconButton("截屏投送", "▦", R.drawable.btn_secondary,
-                R.color.accent_soft, v -> setMapSource(MirrorController.SOURCE_SCREENSHOT));
-        mapSourceRow.addView(btnSourceScreenshot, rowLp(1f));
-
-        btnSourceNative = iconButton("原生仪表", "◈", R.drawable.btn_secondary,
-                R.color.accent_soft, v -> setMapSource(MirrorController.SOURCE_NATIVE_DIM));
-        mapSourceRow.addView(btnSourceNative, rowLp(1f));
-
-        castCard.addView(mapSourceRow);
-
-        /*
-         * 原生仪表的 AR 开关（只在「原生仪表」来源下显示）。
-         *
-         * "normal" = 完整地图，"ar" = AR 实景导航。
-         * 实测哪个效果好看再定默认值，现在默认 normal。
-         */
-        dimArRow = new LinearLayout(this);
-        dimArRow.setOrientation(LinearLayout.HORIZONTAL);
-        dimArRow.setVisibility(View.GONE);
-
-        btnDimNormal = iconButton("完整地图", "▢", R.drawable.btn_secondary,
-                R.color.accent_soft, v -> setDimAr(false));
-        dimArRow.addView(btnDimNormal, rowLp(1f));
-
-        btnDimAr = iconButton("AR 实景", "◉", R.drawable.btn_secondary,
-                R.color.accent_soft, v -> setDimAr(true));
-        dimArRow.addView(btnDimAr, rowLp(1f));
-
-        castCard.addView(dimArRow);
-
-        /*
          * 地图视角三档：远 / 中 / 近。
          *
          * 只在地图模式开启时显示 —— 普通 App 投屏用不到视角档位。
@@ -484,28 +433,6 @@ public class MainActivity extends Activity {
             }
             updateViewBtns();
         }
-
-        /*
-         * ── 启动恢复：清掉可能残留的「原生仪表」状态 ──
-         *
-         * 为什么每次启动都要做：
-         *   如果上次是原生仪表模式，且进程被杀死 / 崩溃 / 用户强退，
-         *   Settings 里可能还留着 "normal"/"ar"，仪表就会一直显示地图。
-         *   用户的硬性条件是「重启就能恢复」，所以这里无条件兜一次。
-         *
-         * 只在**当前没有在投屏**时恢复 —— 否则会把正在用的原生仪表关掉。
-         */
-        if (!MirrorController.isMirroring()) {
-            new Thread(() -> {
-                try {
-                    DimChannel.restoreOnStartup(MainActivity.this);
-                } catch (Throwable t) {
-                    Log.w(TAG, "启动恢复原生仪表状态失败: " + t);
-                }
-            }, "dim-restore").start();
-        }
-
-        updateMapSourceBtns();
         updateTargetHint();
         refreshCodecButtons();
 
@@ -1636,27 +1563,6 @@ public class MainActivity extends Activity {
             showAppPicker();
             return;
         }
-
-        /*
-         * ── 原生仪表通道：完全不碰 CP ──
-         *
-         * 地图自己会往仪表画（SURFACE_VIEW_ID_DIM），
-         * 我们只需要把一个 Settings 值改成 "normal"/"ar"。
-         *
-         * 这条路的三个好处正好对上用户的硬性条件：
-         *   · 不碰车机系统：只写一个可随时改回的 Settings 值
-         *   · CP 零残留：根本不连 CP，仪表是车机自己渲染的
-         *   · 重启可恢复：Settings 会被 App 启动时的 restoreOnStartup 兜住
-         *
-         * 所以这条分支不能走 startCastInner —— 那会拉起 dcapd2、
-         * 建虚拟屏、连 CP，全都是多余的。
-         */
-        if (mirror.isMapMode()
-                && MirrorController.loadMapSource(this) == MirrorController.SOURCE_NATIVE_DIM) {
-            startNativeDim();
-            return;
-        }
-
         // 上一场还在跑（服务的静态标志为准，Activity 的字段会被重建清零）。
         // 这种情况直接 startForegroundService 会因为 sRunning==true 而跳过建屏，
         // 回调永远不来 → UI 卡在"等待虚拟屏就绪…"。所以先停干净，再重开。
@@ -1668,77 +1574,6 @@ public class MainActivity extends Activity {
             return;
         }
         startCastInner();
-    }
-
-    /**
-     * 原生仪表模式的开投：只改 Settings，不碰 CP。
-     *
-     * 顺序：
-     *   ① 关掉可能残留的截屏投送（杀 dcapd2、还原 CP 图层）
-     *   ② 写 Settings 打开仪表地图
-     *   ③ 把目标 App 拉到前台 —— 地图要在前台才会渲染导航
-     */
-    private void startNativeDim() {
-        enterBusy();
-        running = true;
-        setDotColor(R.color.accent_soft);
-        setStatus("状态：正在打开原生仪表地图…");
-        appendLog("开始投屏 · 原生仪表通道（不经过 CP）");
-
-        final boolean useAr = MirrorController.loadDimAr(this);
-        final String pkg = targetPkg;
-
-        new Thread(() -> {
-            boolean ok = false;
-            String err = null;
-            try {
-                /*
-                 * ① 先把截屏那一路收干净。
-                 * 两路同时往仪表画会打架，而且 dcapd2 白占 CPU。
-                 */
-                try {
-                    if (mirror != null) mirror.stop();
-                } catch (Throwable ignored) {
-                }
-
-                /* ② 把地图拉起来（它是渲染的主角，必须在运行） */
-                try {
-                    if (pkg != null && !pkg.isEmpty()) {
-                        AdbShell.exec("monkey -p " + pkg
-                                + " -c android.intent.category.LAUNCHER 1", 6000);
-                        sleepQuiet(1500);
-                    }
-                } catch (Throwable t) {
-                    Log.w(TAG, "拉起目标 App 失败: " + t);
-                }
-
-                /* ③ 打开仪表地图 */
-                ok = DimChannel.open(this, useAr);
-                if (!ok) err = "Settings 写入失败";
-            } catch (Throwable t) {
-                Log.e(TAG, "原生仪表开投异常", t);
-                err = String.valueOf(t);
-            }
-
-            final boolean done = ok;
-            final String e2 = err;
-            mainHandler.post(() -> {
-                leaveBusy();
-                if (done) {
-                    setDotColor(R.color.accent);
-                    setStatus("状态：仪表已显示地图"
-                            + (useAr ? "（AR 实景）" : "（完整地图）"));
-                    appendLog("原生仪表已开启 · "
-                            + DimChannel.KEY + "="
-                            + (useAr ? DimChannel.VAL_AR : DimChannel.VAL_FULL));
-                } else {
-                    running = false;
-                    setDotColor(R.color.state_warn);
-                    setStatus("状态：原生仪表开启失败"
-                            + (e2 != null ? "（" + e2 + "）" : ""));
-                }
-            });
-        }, "native-dim-start").start();
     }
 
     private void startCastInner() {
@@ -2084,29 +1919,6 @@ public class MainActivity extends Activity {
         }
 
         new Thread(() -> {
-            /*
-             * ⓪ **先关原生仪表（DIM 通道）**。
-             *
-             * 必须放在最前面：DIM 通道是地图自己往仪表画的，
-             * 和 CP 的 layer 99 无关。如果它没关掉，
-             * 后面"还原仪表"再成功也没用 —— 地图还在往仪表画。
-             *
-             * 这一步是"重启恢复 + CP 零残留"硬性条件的关键：
-             *   关不掉 → 仪表会一直显示地图，用户只能重启车机
-             * 所以无论后面发生什么，这里先无条件关一次。
-             */
-            if (MirrorController.loadMapSource(MainActivity.this)
-                    == MirrorController.SOURCE_NATIVE_DIM) {
-                try {
-                    boolean okDim = DimChannel.close(MainActivity.this);
-                    Log.i(TAG, "已关闭原生仪表通道 (" + DimChannel.KEY
-                            + " = " + DimChannel.VAL_OFF + ")："
-                            + (okDim ? "成功" : "失败（看日志）"));
-                } catch (Throwable t) {
-                    Log.w(TAG, "关闭原生仪表通道失败: " + t);
-                }
-            }
-
             /* ① 杀投屏的目标 App。
              *
              * **系统预装应用杀不掉**：地图（com.geely.map）、音乐这类由
@@ -2272,117 +2084,6 @@ public class MainActivity extends Activity {
         /* 视角三档只在地图模式下有意义 */
         if (viewRow != null) {
             viewRow.setVisibility(mirror.isMapMode() ? View.VISIBLE : View.GONE);
-        }
-        /* 地图来源行 + AR 行跟着地图模式走 */
-        if (mapSourceRow != null) {
-            mapSourceRow.setVisibility(mirror.isMapMode() ? View.VISIBLE : View.GONE);
-        }
-        updateMapSourceBtns();
-    }
-
-    // ================== 地图来源：截屏投送 / 原生仪表 ==================
-
-    /**
-     * 切换地图来源。
-     *
-     * 两条路互斥：
-     *   · 截屏投送 → dcapd2 拉起，视角三档可用
-     *   · 原生仪表 → 不拉 dcapd2，直接让地图画到仪表，视角三档失效
-     *
-     * 如果正在投屏，切换后必须**立刻收敛**：
-     *   · 切到原生 → 停掉截屏投送、关 CP 图层、打开 DIM
-     *   · 切回截屏 → 关掉 DIM（仪表回到原厂），提示重新开始投屏
-     *
-     * 不收敛的话会两条路同时在仪表上画，画面打架。
-     */
-    private void setMapSource(int src) {
-        MirrorController.saveMapSource(this, src);
-        updateMapSourceBtns();
-
-        final int fSrc = src;
-        final boolean casting = MirrorController.isMirroring();
-
-        if (casting) {
-            new Thread(() -> {
-                try {
-                    if (fSrc == MirrorController.SOURCE_NATIVE_DIM) {
-                        /* 先停截屏，再开 DIM —— 顺序反了会有一瞬间两路都在画 */
-                        mirror.stop();
-                        DimChannel.open(getApplicationContext(), MirrorController.loadDimAr(this));
-                        Log.i("DashcastSrc", "已切到原生仪表（截屏投屏已停）");
-                    } else {
-                        /* 切回截屏：先关 DIM 还原厂，剩下的靠用户重新点开始 */
-                        DimChannel.close(getApplicationContext());
-                        Log.i("DashcastSrc", "已切回截屏投送（仪表已还原厂）");
-                    }
-                } catch (Throwable ex) {
-                    Log.w("DashcastSrc", "切换地图来源失败: " + ex);
-                }
-            }, "map-source-switch").start();
-        }
-
-        appendLog("地图来源 → " + (src == MirrorController.SOURCE_NATIVE_DIM
-                ? "原生仪表" : "截屏投送"));
-
-        if (casting) {
-            setStatus(src == MirrorController.SOURCE_NATIVE_DIM
-                    ? "状态：已切到原生仪表（地图自己画）"
-                    : "状态：已切回截屏投送，请重新开始投屏");
-        }
-    }
-
-    /** AR 开关（只在原生仪表来源下有意义） */
-    private void setDimAr(boolean ar) {
-        MirrorController.saveDimAr(this, ar);
-        updateMapSourceBtns();
-        appendLog("原生仪表模式 → " + (ar ? "AR 实景" : "完整地图"));
-
-        /* 正在用原生仪表就立刻生效，不用等下次 */
-        if (MirrorController.isMirroring()
-                && MirrorController.loadMapSource(this) == MirrorController.SOURCE_NATIVE_DIM) {
-            new Thread(() -> {
-                try {
-                    DimChannel.open(getApplicationContext(), ar);
-                } catch (Throwable ex) {
-                    Log.w("DashcastSrc", "切换 AR 失败: " + ex);
-                }
-            }, "dim-ar-switch").start();
-        }
-    }
-
-    /** 刷新地图来源相关按钮的高亮与可见性 */
-    private void updateMapSourceBtns() {
-        int src = MirrorController.loadMapSource(this);
-        boolean isNative = (src == MirrorController.SOURCE_NATIVE_DIM);
-        boolean mapOn = mirror.isMapMode();
-
-        if (btnSourceScreenshot != null) {
-            btnSourceScreenshot.setBackgroundResource(isNative
-                    ? R.drawable.btn_secondary : R.drawable.btn_selected);
-        }
-        if (btnSourceNative != null) {
-            btnSourceNative.setBackgroundResource(isNative
-                    ? R.drawable.btn_selected : R.drawable.btn_secondary);
-        }
-
-        /* 视角三档只属于截屏方案 */
-        if (viewRow != null) {
-            viewRow.setVisibility(mapOn && !isNative ? View.VISIBLE : View.GONE);
-        }
-
-        /* AR 开关只在原生方案下显示 */
-        if (dimArRow != null) {
-            dimArRow.setVisibility(mapOn && isNative ? View.VISIBLE : View.GONE);
-        }
-
-        boolean dimAr = MirrorController.loadDimAr(this);
-        if (btnDimNormal != null) {
-            btnDimNormal.setBackgroundResource(dimAr
-                    ? R.drawable.btn_secondary : R.drawable.btn_selected);
-        }
-        if (btnDimAr != null) {
-            btnDimAr.setBackgroundResource(dimAr
-                    ? R.drawable.btn_selected : R.drawable.btn_secondary);
         }
     }
 
