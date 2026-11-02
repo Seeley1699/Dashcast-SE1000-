@@ -148,17 +148,40 @@ public class MirrorController {
     public static final int HUD_SRC_W = 722;
     public static final int HUD_SRC_H = 200;
 
-    /** 是否走「HUD 投屏」模式（prefs 持久化） */
-    private static final String PREF_MAP_HUD = "map_hud";
+    /*
+     * ══════════════════════════════════════════════════════════════
+     * HUD 会话标志 —— **瞬态，不持久化**
+     * ══════════════════════════════════════════════════════════════
+     *
+     * 这是整个 HUD 设计里最容易搞错的一点：
+     *
+     *   早先把它存在 prefs（`map_hud`），结果一旦开过就永久生效 ——
+     *   之后**任何**一次投屏都走 HUD 分支，选 App 投屏也把 HUD 推上仪表。
+     *   用户报的就是这个：选定 app 开始投屏，不管怎样都会把 hud 投到仪表。
+     *
+     * 正确语义：HUD 是**一次投屏会话**的取景方式，不是全局开关。
+     *   · 点「地图 HUD」        → 开会话 → 投 HUD
+     *   · 再点「地图 HUD」      → 关会话（同时也停投屏）
+     *   · 选 App 点「开始投屏」 → 关会话 → 投 App
+     *   · 点「停止」            → 关会话 → 仪表还原
+     *
+     * 所以放**静态内存字段**：进程活着就有效，App 重启自然归零，
+     * 也不会污染下一次投屏。用 static 是为了跨 MainActivity 重建 /
+     * 多个 MirrorController 实例都能读到同一个值 ——
+     * 实例字段实测会不同步（见 isMapHudActive 的注释）。
+     */
+    private static volatile boolean sHudSession = false;
 
-    public static boolean loadMapHud(Context c) {
-        return prefs(c).getBoolean(PREF_MAP_HUD, false);
+    /** 当前是不是 HUD 投屏会话 */
+    public static boolean isHudSession() {
+        return sHudSession;
     }
 
-    public static void saveMapHud(Context c, boolean on) {
-        prefs(c).edit().putBoolean(PREF_MAP_HUD, on).apply();
+    /** 设置 / 清除 HUD 会话 */
+    public static void setHudSession(boolean on) {
+        sHudSession = on;
+        Log.i(TAG, "HUD 会话 " + (on ? "开启" : "清除"));
     }
-
 
     private static final int DEFAULT_FPS = 30;
     public static final int[] FPS_CHOICES = {60, DEFAULT_FPS, 25, 20, 15};
@@ -870,7 +893,7 @@ public class MirrorController {
              */
             Log.i(TAG, "launchDaemon 判定: isMapHudActive=" + hud
                     + " mapMode=" + mapMode
-                    + " prefMapHud=" + (ctx != null && loadMapHud(ctx))
+                    + " hudSession=" + sHudSession
                     + " ctx=" + (ctx != null));
             if (hud) {
                 s    = new int[]{HUD_W, HUD_H};
@@ -1145,20 +1168,27 @@ public class MirrorController {
      */
     public boolean isMapHudActive() {
         /*
-         * **判据只看 prefs，不看 mapMode 字段**（2026-11-02 修复）。
+         * **只认会话标志，不读 prefs、不看 mapMode**。
          *
-         * 原来写作 `if (!mapMode) return false;` —— 但 mapMode 是**实例字段**，
-         * 而 setMapMode() 可能被另一个实例（MainActivity 重建后的新 mirror）
-         * 调用。实测踩到的现象：
-         *   prefs 里 map_mode=true、map_hud=true，
-         *   但 dcapd2 拿到的还是 App 模式参数（2560x1600 / 740,924），
-         *   因为 launchDaemon 所属实例的 mapMode 字段还是 false。
+         * 演化过程（三个版本的教训都在这）：
          *
-         * prefs 是全局共享的、也是唯一真正被"投屏流程"读到的配置源，
-         * 所以直接用 prefs 判定最可靠。mapMode 字段只用于 UI 显示。
+         * v1：`if (!mapMode) return false;`
+         *     mapMode 是实例字段，MainActivity 重建后新 mirror 的字段是
+         *     false，而 prefs 里是 true → 判定分叉，dcapd2 拿到的还是
+         *     App 模式参数。
+         *
+         * v2：`return loadMapHud(ctx);`  —— 直接读 prefs
+         *     字段同步问题解决了，但引入了**更严重**的问题：
+         *     map_hud 一旦写进 prefs 就永久生效，之后任何一次投屏
+         *     （包括选 App 投屏）都会走 HUD 分支，
+         *     用户看到"选 app 投屏却把 HUD 推上仪表"。
+         *
+         * v3（当前）：读**静态瞬态标志 sHudSession**
+         *     · 跨实例可见（static）
+         *     · 不持久化（App 重启归零，不污染下一次）
+         *     · 由 UI 显式开关：点 HUD / 点开始投屏 / 点停止 都会设置它
          */
-        if (ctx == null) return false;
-        return loadMapHud(ctx);
+        return sHudSession;
     }
 
     /**

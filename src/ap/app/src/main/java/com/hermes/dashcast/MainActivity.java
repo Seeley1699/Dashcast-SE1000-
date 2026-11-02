@@ -369,16 +369,28 @@ public class MainActivity extends Activity {
         btnMapHud = iconButton(mapHudLabel(), "◈", R.drawable.btn_secondary,
                 R.color.accent_soft, v -> {
                     /*
-                     * 已经在投 HUD → 点一下就是停。
-                     * 注意判据不是 isMirroring() 而是"HUD 模式且正在投" ——
-                     * 正在投 App 时点这个按钮应该是"切到 HUD"，不是"停投屏"。
+                     * **这是个纯开关**（需求：点一下开，再点一下关）。
+                     *
+                     *   · 没在投屏 → 开 HUD 投屏
+                     *   · 正在投 HUD → 停（仪表回原厂）
+                     *   · 正在投 App → 停 App，再开 HUD（抢占）
+                     *
+                     * 三种情况都不跳转别的 App、不弹选 App 面板 ——
+                     * HUD 的取景源是固定的 com.ecarx.hud，跟"投哪个 App"无关。
                      */
-                    if (MirrorController.isMirroring() && mirror.isMapHudActive()) {
-                        stopCastOnly();
-                        return;
+                    if (MirrorController.isMirroring()) {
+                        if (mirror.isMapHudActive()) {
+                            /* 正在投 HUD → 关 */
+                            appendLog("地图 HUD · 关闭投屏");
+                            stopCastOnly();
+                        } else {
+                            /* 正在投 App → 抢占切到 HUD */
+                            startHudCast();
+                        }
+                    } else {
+                        /* 空闲 → 开 */
+                        startHudCast();
                     }
-                    /* 没在投，或在投 App → 切到 HUD（内部会先把 App 投屏停掉） */
-                    startHudCast();
                 });
         btnMapHud.setVisibility(View.GONE);
         castCard.addView(btnMapHud);
@@ -1628,18 +1640,22 @@ public class MainActivity extends Activity {
          * 停完后必须**等一下**：stopCastOnly() 内部是异步的
          * （mirror.stop() 会走 SSH/线程 join），立刻启 dcapd2 会撞车 ——
          * 旧进程还没退、CP 的 layer 99 还没清。
-         *
-         * sleepQuiet 放在后台线程，别阻塞 UI。
          */
         final boolean wasAppCasting = MirrorController.isMirroring() && !mirror.isMapHudActive();
         if (wasAppCasting) {
             appendLog("地图 HUD · 先停止 App 投屏");
         }
 
-        /* ② 把 HUD 模式打开 —— startCastInner 靠这两个标志走 HUD 分支 */
-        MirrorController.saveMapHud(this, true);
-        mirror.setMapMode(this, true);
-        updateMapModeBtn();
+        /*
+         * ② 开 HUD 会话。
+         *
+         * **不动 mapMode** —— 「地图模式」和「地图 HUD」是两条独立的路径：
+         *   · 地图模式  = 抓主屏上地图 App 的窗口，按遮罩裁剪
+         *   · 地图 HUD  = 抓 Display 1 上的 com.ecarx.hud
+         * 早先这里顺手把 mapMode 也置 true，导致用户在 HUD 模式下
+         * 还能看到视角三档、遮罩也在生效，两个概念被搅在一起。
+         */
+        MirrorController.setHudSession(true);
         updateMapHudBtn();
 
         if (wasAppCasting) {
@@ -1657,19 +1673,16 @@ public class MainActivity extends Activity {
         if (busy) return;
 
         /*
-         * **进到这里必须重新确认 HUD 标志是开的**（2026-11-02 实测踩到）。
+         * **必须重新确认 HUD 会话还在**。
          *
          * 抢占流程是：停 App 投屏 → 等 2.5 秒 → 再起 HUD。
-         * 这 2.5 秒里 stopCastOnly() 的异步收尾可能已经把
-         * map_hud / map_mode 改回 false（比如它的 finish 逻辑），
-         * 于是 startCastInner() 走的是 App 分支 ——
-         * 实测 dcapd2 参数变成「抓帧 480x320 源 740,924」（App 模式），
-         * 而不是 HUD 的「722x200 源 70,180」。
+         * 这 2.5 秒里 stopCastOnly() 的收尾会把会话清掉（它本来就要清，
+         * 见"停止投屏把所有的投屏都关掉"那条需求）。
          *
-         * 所以起投前无条件再写一次标志，确保分支判定正确。
+         * 所以这里再置一次 —— 注意只碰 HUD 会话，不碰 mapMode，
+         * 两者独立（地图模式属于 App 投屏路径）。
          */
-        MirrorController.saveMapHud(this, true);
-        mirror.setMapMode(this, true);
+        MirrorController.setHudSession(true);
 
         appendLog("地图 HUD · 一键开投");
 
@@ -1711,7 +1724,7 @@ public class MainActivity extends Activity {
         if (MirrorController.isMirroring() && mirror.isMapHudActive()) {
             appendLog("开始投屏 · 先停止地图 HUD");
             setStatus("状态：正在从地图 HUD 切到 App 投屏…");
-            MirrorController.saveMapHud(this, false);   /* 关掉 HUD 标志，走普通分支 */
+            MirrorController.setHudSession(false);   /* 关掉 HUD 会话，走 App 分支 */
             updateMapHudBtn();
             stopCastOnly();
             mainHandler.postDelayed(this::startCastAfterHudStop, 2500);
@@ -1740,7 +1753,7 @@ public class MainActivity extends Activity {
          * 否则 startCastInner 里 isMapHudActive() 还是 true，
          * 会继续走 HUD 分支（抓 Display 1），而用户要的是投 App。
          */
-        MirrorController.saveMapHud(this, false);
+        MirrorController.setHudSession(false);
 
         if (DashcastSenderService.isRunning()) {
             stopServiceNow();
@@ -2126,6 +2139,19 @@ public class MainActivity extends Activity {
          */
         final String killed = targetPkg;
         running = false;
+
+        /*
+         * **停止 = 关掉所有投屏，仪表还原**（需求）。
+         *
+         * HUD 会话标志必须在这里清 —— 它是一次投屏会话的状态，
+         * 会话结束了就该没了。不清的话：
+         *   · 下次点「开始投屏」投 App，isMapHudActive() 还是 true
+         *     → 又把 HUD 推上仪表
+         *   · UI 上「地图 HUD · 开」一直亮着，看起来像还在投
+         */
+        MirrorController.setHudSession(false);
+        updateMapHudBtn();
+
         setDotColor(R.color.content_secondary);
         setStatus("状态：投屏已停止，正在还原仪表…");
         appendLog("停止投屏" + (targetLabel != null ? " · " + targetLabel : ""));
@@ -2155,7 +2181,7 @@ public class MainActivity extends Activity {
              * 不 force-stop：地图是系统应用，杀了会被立刻拉起。
              * 只需把 HUD 页面挪回主屏。
              */
-            if (mirror != null && MirrorController.loadMapHud(MainActivity.this)
+            if (mirror != null && MirrorController.isHudSession()
                     && false) {   /* HUD 是系统应用，停止时无需撤离 */
                 try {
                     mirror.dismissMapHud();
@@ -2321,14 +2347,14 @@ public class MainActivity extends Activity {
 
     /** 地图 HUD 按钮文案 */
     private String mapHudLabel() {
-        return MirrorController.loadMapHud(this) ? "地图 HUD · 开" : "地图 HUD · 关";
+        return MirrorController.isHudSession() ? "地图 HUD · 开" : "地图 HUD · 关";
     }
 
     /** 刷新地图 HUD 按钮的高亮与可见性 */
     private void updateMapHudBtn() {
         if (btnMapHud == null) return;
         ((TextView) btnMapHud.getChildAt(1)).setText(mapHudLabel());
-        btnMapHud.setBackgroundResource(MirrorController.loadMapHud(this)
+        btnMapHud.setBackgroundResource(MirrorController.isHudSession()
                 ? R.drawable.btn_selected : R.drawable.btn_secondary);
         /*
          * 只在地图模式 + 目标就是地图时才显示 ——
@@ -2338,7 +2364,7 @@ public class MainActivity extends Activity {
                 && true;   /* HUD 是独立系统应用，不限定目标 */
         btnMapHud.setVisibility(show ? View.VISIBLE : View.GONE);
         /* HUD 模式下视角三档无意义（抓的是 HUD 全屏，不是主屏某块） */
-        if (viewRow != null && show && MirrorController.loadMapHud(this)) {
+        if (viewRow != null && show && MirrorController.isHudSession()) {
             viewRow.setVisibility(View.GONE);
         } else if (viewRow != null && mirror.isMapMode()) {
             viewRow.setVisibility(View.VISIBLE);
