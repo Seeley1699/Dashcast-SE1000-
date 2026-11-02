@@ -1814,17 +1814,22 @@ public class MainActivity extends Activity {
                 setStatus("状态：启动镜像抓帧…");
                 KeepAliveService.start(MainActivity.this);
                 /*
-                 * HUD 模式下 targetPkg 可能是空的（一键入口不要求选 App）。
-                 * 这时把 target 设成 HUD 自己的包名 —— mirror.start() 会用
-                 * 它判断"目标是否还活着"，而 HUD 是系统应用、常年运行，
-                 * 用它反而比空字符串更稳（空的话 targetAlive() 会误判）。
+                 * HUD 模式下 **target 和 comp 都指向 HUD 自己** ——
+                 *
+                 * 不能沿用 targetPkg：那可能是用户上次选的 B 站/地图，
+                 * loop() 会拿它去"确保目标在运行"，于是去 am start 那个 App，
+                 * 把焦点抢走 —— 用户看到"点地图 HUD 就跳到别的 App"。
+                 *
+                 * 而 HUD 是系统应用、常年运行，用它最稳：
+                 *   · targetAlive() 永远为 true，不会误判"目标已退出"
+                 *   · loop() 的 HUD 分支根本不看它，只是兜底
                  */
                 final String target = mirror.isMapHudActive()
                         ? MirrorController.HUD_PKG
                         : targetPkg;
-                final String comp = targetPkg != null && targetCls != null
-                        ? targetPkg + "/" + targetCls
-                        : MirrorController.HUD_PKG + "/" + MirrorController.HUD_CLS;
+                final String comp = mirror.isMapHudActive()
+                        ? MirrorController.HUD_PKG + "/" + MirrorController.HUD_CLS
+                        : targetPkg + "/" + targetCls;
                 mirror.start(target, comp, makeMirrorListener());
                 running = true;
                 leaveBusy();
@@ -2356,18 +2361,27 @@ public class MainActivity extends Activity {
         ((TextView) btnMapHud.getChildAt(1)).setText(mapHudLabel());
         btnMapHud.setBackgroundResource(MirrorController.isHudSession()
                 ? R.drawable.btn_selected : R.drawable.btn_secondary);
+
         /*
-         * 只在地图模式 + 目标就是地图时才显示 ——
-         * HUD 是地图独有的页面，投别的 App 无从谈起。
+         * **HUD 按钮永远可见**（2026-11-03 修复）。
+         *
+         * 原来写作 `boolean show = mirror.isMapMode() && true;` ——
+         * 挂在「地图模式」上。后果：
+         *   · 用户在投 HUD 时关掉地图模式 → 按钮消失
+         *   · HUD 会话还在跑，仪表还显示 HUD，但用户找不到关闭入口
+         *   · 用户报的就是："点地图模式关就会收回地图 HUD"
+         *
+         * 现在 HUD 和地图模式是**完全独立**的两条路：
+         *   地图模式 = 抓主屏地图窗口 + 遮罩裁剪（影响 App 投屏）
+         *   地图 HUD = 抓 Display 1 的 com.ecarx.hud
+         * 所以 HUD 按钮不依赖任何别的开关，始终可点。
          */
-        boolean show = mirror.isMapMode()
-                && true;   /* HUD 是独立系统应用，不限定目标 */
-        btnMapHud.setVisibility(show ? View.VISIBLE : View.GONE);
-        /* HUD 模式下视角三档无意义（抓的是 HUD 全屏，不是主屏某块） */
-        if (viewRow != null && show && MirrorController.isHudSession()) {
-            viewRow.setVisibility(View.GONE);
-        } else if (viewRow != null && mirror.isMapMode()) {
-            viewRow.setVisibility(View.VISIBLE);
+        btnMapHud.setVisibility(View.VISIBLE);
+
+        /* 视角三档只属于「地图模式」（App 投屏路径），HUD 会话时不显示 */
+        if (viewRow != null) {
+            boolean showView = mirror.isMapMode() && !MirrorController.isHudSession();
+            viewRow.setVisibility(showView ? View.VISIBLE : View.GONE);
         }
     }
 

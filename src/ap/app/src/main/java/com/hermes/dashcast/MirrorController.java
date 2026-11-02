@@ -579,9 +579,25 @@ public class MirrorController {
                 if (!running) return;
                 long now = SystemClock.elapsedRealtime();
 
-                /* ① 首次进入：目标 App 必然在后台（用户是在我们界面点的按钮），
-                 *    主动拉到前台，否则会一直停在"等目标 App 到前台"。 */
-                if (!broughtForward) {
+                /*
+                 * ① 首次进入：目标 App 必然在后台（用户是在我们界面点的按钮），
+                 *    主动拉到前台，否则会一直停在"等目标 App 到前台"。
+                 *
+                 * **HUD 模式绝不能做这一步**（2026-11-03 实测踩到）。
+                 *
+                 * 第 588 行 `am start --display 0 -n <component>` 会：
+                 *   · 把 component 拉到**主屏（Display 0）前台**
+                 *   · HUD 模式下 component 是 com.ecarx.hud/...，
+                 *     所以每次点「地图 HUD」都把 HUD 拽到主屏、抢走焦点 ——
+                 *     用户看到的就是"点几次地图 HUD 就跳转到别的 App"
+                 *   · 更糟的是 HUD 会从 Display 1 移到 Display 0/2，
+                 *     dcapd2 抓 Display 1 就抓空了
+                 *
+                 * HUD 的画面本来就在 Display 1 上由系统维持，
+                 * 我们抓的是那块屏的像素，完全不需要它在前台。
+                 */
+                boolean hudMode = isMapHudActive();
+                if (!broughtForward && !hudMode) {
                     broughtForward = true;
                     state("正在打开目标 App…", false);
                     try {
@@ -590,6 +606,8 @@ public class MirrorController {
                     }
                     sleep(1000);
                     if (gen.get() != myGen) return;
+                } else if (hudMode) {
+                    broughtForward = true;   /* 标记已完成，避免重复判断 */
                 }
 
                 /*
@@ -1216,12 +1234,35 @@ public class MirrorController {
      */
     public boolean launchMapHud() {
         try {
-            /* ① 确保 HUD 在 Display 1 上运行 */
+            /*
+             * **HUD 通常已经在跑**（系统预装、开机自启）。
+             * 先判断进程，活着就完全不动它 ——
+             * 这是"点多次不要跳转别的 App"的根本保证。
+             *
+             * 为什么不能每次 `am start`：
+             *   `am start` 即使指定了 display，也会把目标 Activity
+             *   **带到前台 / 抢焦点**，于是 dashcast 自己的界面被挤走。
+             *   用户看到的就是"点几次地图 HUD 就跳到别的 App"。
+             *   实测确认。
+             *
+             * 而且我们抓的是 Display 1 的**像素**，跟它是否在前台无关 ——
+             * 进程活着就行。
+             */
+            String running = AdbShell.exec("pidof " + HUD_PKG, 3000);
+            boolean alive = running != null && !running.trim().isEmpty();
+
+            if (alive) {
+                Log.i(TAG, "HUD 进程已在运行（pid=" + running.trim()
+                        + "），不重复启动、不抢焦点");
+                return true;
+            }
+
+            /* 真没在跑才启动（这时才可能抢焦点，但属于必要的一次） */
             AdbShell.exec("am start --display " + HUD_DISPLAY_ID
                     + " -n " + HUD_PKG + "/" + HUD_CLS, 6000);
             sleep(1200);
 
-            /* ② 回读确认它确实在 Display 1 上 */
+            /* 回读确认 */
             String out = AdbShell.exec(
                     "dumpsys activity activities | grep -A3 'Display #"
                             + HUD_DISPLAY_ID + "'", 6000);
