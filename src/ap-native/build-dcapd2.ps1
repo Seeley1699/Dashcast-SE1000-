@@ -31,6 +31,7 @@ foreach ($p in $inc) { [void]$a.Add("-I"); [void]$a.Add($p) }
 
 [void]$a.Add("$HERE\dcapd2.c")
 [void]$a.Add("$HERE\h264enc.c")
+[void]$a.Add("$HERE\layer_mask.c")
 [void]$a.Add("-o"); [void]$a.Add("$HERE\dcapd2")
 
 [void]$a.Add("-L"); [void]$a.Add("$HERE\carlibs")

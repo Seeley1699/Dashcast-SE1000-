@@ -78,6 +78,8 @@ public class MainActivity extends Activity {
     private static final int LOG_MAX = 12;
     private LinearLayout btnCodecBgra, btnCodecH264;   /* 编码档二选一 */
     private LinearLayout btnMapMode;                 /* 地图模式开关 */
+    private LinearLayout viewRow;                    /* 视角三档容器 */
+    private LinearLayout[] viewBtns;                 /* 远景/中景/近景 */
 
     /** 操作互斥标志：任一 CP 操作进行中为 true */
     private boolean busy = false;
@@ -311,6 +313,30 @@ public class MainActivity extends Activity {
                 });
         castCard.addView(btnMapMode);
 
+        /*
+         * 地图视角三档：远 / 中 / 近。
+         *
+         * 只在地图模式开启时显示 —— 普通 App 投屏用不到视角档位。
+         *
+         * 为什么做成三档而不是让用户拖四个数字：
+         *   抓取区必须同时满足「比例 = 1920/532」和「本车纵向位置合适」两个约束，
+         *   手动凑几乎不可能。三档已经把这两个约束算好了。
+         */
+        viewRow = new LinearLayout(this);
+        viewRow.setOrientation(LinearLayout.HORIZONTAL);
+        viewRow.setVisibility(mirror.isMapMode() ? View.VISIBLE : View.GONE);
+
+        viewBtns = new LinearLayout[LayerConfig.VIEW_NAMES.length];
+        for (int i = 0; i < LayerConfig.VIEW_NAMES.length; i++) {
+            final int vi = i;
+            LinearLayout b = iconButton(LayerConfig.VIEW_NAMES[i], "◎",
+                    R.drawable.btn_secondary, R.color.accent_soft,
+                    v -> applyViewMode(vi));
+            viewBtns[i] = b;
+            viewRow.addView(b, rowLp(1f));
+        }
+        castCard.addView(viewRow);
+
         left.addView(castCard);
 
         /* ── 运行日志（占满剩余高度）── */
@@ -391,6 +417,22 @@ public class MainActivity extends Activity {
         refreshCodecButtons();
         mirror.setMapMode(this, MirrorController.loadMapMode(this));
         updateMapModeBtn();
+
+        /*
+         * 恢复上一次选的视角档。
+         * 只在 prefs 里记了档位号（0/1/2），不记具体像素 —— 这样以后
+         * 调整 viewRect() 的三组数字，用户不需要重新选一次。
+         */
+        {
+            int savedView = getSharedPreferences(PREF, MODE_PRIVATE)
+                    .getInt("map_view", LayerConfig.VIEW_MID);
+            if (MirrorController.loadMapMode(this) && savedView != LayerConfig.VIEW_MID) {
+                maskCfg.applyView(savedView, 1920, 532);
+                syncMaskControls();
+                refreshMask();
+            }
+            updateViewBtns();
+        }
         updateTargetHint();
         refreshCodecButtons();
 
@@ -2038,6 +2080,66 @@ public class MainActivity extends Activity {
         /* 预览上的"抓取区"参考框跟着开关走 */
         if (maskPreview != null) {
             maskPreview.setMapMode(mirror.isMapMode(), 2560, 1600);
+        }
+        /* 视角三档只在地图模式下有意义 */
+        if (viewRow != null) {
+            viewRow.setVisibility(mirror.isMapMode() ? View.VISIBLE : View.GONE);
+        }
+    }
+
+    /**
+     * 应用地图视角档位（远/中/近）。
+     *
+     * 做的事就三步，全部走 LayerConfig 的既有路径：
+     *   ① applyView() —— 把该档的抓取区和遮罩尺寸算进内存
+     *   ② syncMaskControls() + refreshMask() —— 界面跟着更新
+     *   ③ applyFully() —— 后台线程完整下发（push + prefs + CP 图层）
+     *
+     * 第③步是关键：只改内存不落盘的话，dcapd2 那边还是旧参数，
+     * 仪表纹丝不动（和"点预设不生效"是同一个坑）。
+     */
+    private void applyViewMode(int view) {
+        int prefsView = view;
+
+        maskCfg.applyView(prefsView, 1920, 532);
+
+        /* 记住选择，下次进来还是这档 */
+        getSharedPreferences(PREF, MODE_PRIVATE).edit()
+                .putInt("map_view", prefsView).apply();
+
+        syncMaskControls();
+        refreshMask();
+        updateViewBtns();
+
+        appendLog("视角 → " + LayerConfig.VIEW_NAMES[prefsView]
+                + " · " + LayerPreviewView.geometryText(maskCfg));
+
+        final LayerConfig snap = maskCfg;
+        final android.content.Context appCtx = getApplicationContext();
+        final boolean casting = MirrorController.isMirroring();
+        new Thread(() -> {
+            try {
+                snap.applyFully(appCtx);
+                Log.i("DashcastView", "视角档已下发"
+                        + (casting ? "（含图层矩形）" : "（未投屏，仅落盘）"));
+            } catch (Throwable ex) {
+                Log.w("DashcastView", "视角档下发失败: " + ex);
+            }
+        }, "view-apply").start();
+
+        if (casting) {
+            setStatus("状态：视角已切换为 " + LayerConfig.VIEW_NAMES[prefsView]);
+        }
+    }
+
+    /** 高亮当前视角档 */
+    private void updateViewBtns() {
+        if (viewBtns == null) return;
+        int cur = getSharedPreferences(PREF, MODE_PRIVATE).getInt("map_view", LayerConfig.VIEW_MID);
+        for (int i = 0; i < viewBtns.length; i++) {
+            if (viewBtns[i] == null) continue;
+            viewBtns[i].setBackgroundResource(i == cur
+                    ? R.drawable.btn_selected : R.drawable.btn_secondary);
         }
     }
 

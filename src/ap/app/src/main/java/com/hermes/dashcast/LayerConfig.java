@@ -505,4 +505,78 @@ public final class LayerConfig {
         int g = grid > 0 ? grid : 1;
         return (int) (Math.round((double) v / g) * g);
     }
+
+    /* ===================== 地图视角档位（三档） ===================== */
+
+    /*
+     * 为什么做成"档位"而不是让用户拖四个数字：
+     *
+     * 地图模式的抓取区必须同时满足两个约束，用户很难手动凑对：
+     *   ① 比例 = 仪表比例 1920/532 ≈ 3.609（否则画面被拉伸变形）
+     *   ② 本车在画面里的纵向位置要合适（太高看不到前方，太低看不到身后）
+     *
+     * 所以预置三个已经算好的档位，用户只管选"远/中/近"。
+     *
+     * 三档的抓取区宽高都按 3.6:1 算，编码尺寸 = 遮罩尺寸（1:1 零缩放）。
+     * 遮罩统一铺满仪表 1920×532 —— 远景档正好是 1920×532 全屏，
+     * 中/近景档遮罩小于画布时由 dcapd2 居中摆放。
+     *
+     * srcY 的选取原则：让本车箭头落在画面 33% 高度附近，
+     * 这样上方有足够的前方视野，下方还能看到刚走过的路。
+     * 实测本车在窗口 y≈1030 附近。
+     */
+    public static final int VIEW_FAR   = 0;   /* 远景：视野最广 */
+    public static final int VIEW_MID   = 1;   /* 中景：默认 */
+    public static final int VIEW_NEAR  = 2;   /* 近景：本车最大 */
+
+    public static final String[] VIEW_NAMES = { "远景", "中景", "近景" };
+
+    /** 返回 {srcX, srcY, srcW, srcH}（窗口坐标，宽高比 = 3.6） */
+    public static int[] viewRect(int view) {
+        switch (view) {
+            case VIEW_FAR:
+                /* 1920×533 → 3.602。x 居中，y 让本车落在 33%
+                 *   (1030 - srcY) / 533 = 0.33  → srcY ≈ 854 */
+                return new int[]{ 320, 854, 1920, 533 };
+            case VIEW_NEAR:
+                /* 1080×300 → 3.600。本车在 33%: (1030-srcY)/300=0.33 → 931
+                 * 但 300 太矮会把下方路线切掉，取 320 高度更平衡 */
+                return new int[]{ 740, 924, 1152, 320 };
+            case VIEW_MID:
+            default:
+                /* 1440×400 → 3.600。本车在 33%: (1030-srcY)/400=0.33 → 898 */
+                return new int[]{ 560, 898, 1440, 400 };
+        }
+    }
+
+    /** 该档位对应的遮罩矩形（画布坐标，居中） */
+    public static int[] viewMask(int view, int canvasW, int canvasH) {
+        int[] r = viewRect(view);
+        int w = r[2], h = r[3];
+        /* 遮罩不能超过画布 */
+        if (w > canvasW) w = canvasW;
+        if (h > canvasH) h = canvasH;
+        return new int[]{ (canvasW - w) / 2, (canvasH - h) / 2, w, h };
+    }
+
+    /** 把某个视角档位应用到自己身上（只改内存，落盘由 applyFully 负责） */
+    public void applyView(int view, int canvasW, int canvasH) {
+        this.canvasW = canvasW > 0 ? canvasW : this.canvasW;
+        this.canvasH = canvasH > 0 ? canvasH : this.canvasH;
+        int[] r = viewRect(view);
+        this.srcX = r[0];
+        this.srcY = r[1];
+        this.srcH = r[3];          /* 宽度由 applyMapCrop 按比例反推 */
+
+        int[] m = viewMask(view, this.canvasW, this.canvasH);
+        this.x = m[0];
+        this.y = m[1];
+        this.w = m[2];
+        this.h = m[3];
+
+        this.enabled = true;
+        this.shape = SHAPE_RECT;   /* 形状由编码档决定，这里不预设圆角 */
+        this.fit = 0;              /* 铺满遮罩，不留黑边 */
+        sanitize();
+    }
 }
