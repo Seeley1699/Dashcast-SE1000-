@@ -136,14 +136,28 @@ public final class LayerConfig {
      * BGRA 档的圆角/羽化会失效。两者配合才是完整效果。
      */
     /**
-     * **保存并应用**：写配置文件 + 存 prefs + 同步图层矩形。
+     * **保存并应用**（异步版）：完整下发三步。
      *
      * 这是编辑器里唯一会真实落到仪表的动作 —— 拖拽/滑块只改内存，
      * 点「保存」才生效。这样：
      *   · 拖动时不会每松一次手就把仪表刷一遍（原来是几十次 SSH + 图层重设）
      *   · 试错的形状不会污染当前投屏，不保存就等于取消
+     *
+     * 具体三步都在 applyFully() 里，这里只负责扔到后台线程。
      */
     public void pushAsync() {
+        final LayerConfig snapshot = this;
+        new Thread(() -> {
+            try {
+                snapshot.applyFully(null);
+            } catch (Throwable t) {
+                Log.e(TAG, "下发配置失败", t);
+            }
+        }, "layer-push").start();
+    }
+
+    /** 旧版异步下发实现（保留注释供追溯，逻辑已并入 applyFully） */
+    private void pushAsyncLegacy() {
         final LayerConfig snapshot = this;
         new Thread(() -> {
             try {
@@ -334,6 +348,10 @@ public final class LayerConfig {
         p.setProperty(k + "feather",  String.valueOf(feather));
         p.setProperty(k + "border",   String.valueOf(border));
         p.setProperty(k + "fit",      String.valueOf(fit));
+        /* 地图模式的抓取源区域也要一起存，否则切回预设时构图会丢 */
+        p.setProperty(k + "src_x", String.valueOf(srcX));
+        p.setProperty(k + "src_y", String.valueOf(srcY));
+        p.setProperty(k + "src_h", String.valueOf(srcH));
         writePresetProps(ctx, p);
         LocalStore.log(ctx, "保存预设 " + (slot + 1) + " · " + w + "×" + h);
     }
@@ -357,8 +375,61 @@ public final class LayerConfig {
         feather  = intProp(p, k + "feather", feather);
         border   = intProp(p, k + "border", border);
         fit      = intProp(p, k + "fit", fit);
+        /* 老预设里没有这三个键 → 保持当前值（intProp 的 def 就是自 assignment） */
+        srcX     = intProp(p, k + "src_x", srcX);
+        srcY     = intProp(p, k + "src_y", srcY);
+        srcH     = intProp(p, k + "src_h", srcH);
         sanitize();
         return true;
+    }
+
+    /**
+     * 应用预设槽的**完整路径** —— 点一下预设就等于点一次「保存并应用」。
+     *
+     * ══════════════════════════════════════════════════════════════
+     * 为什么需要这个方法（2026-11-02 bug 修复）
+     * ══════════════════════════════════════════════════════════════
+     * 原来 MainActivity 里点预设只做三件事：
+     *     maskCfg.loadPreset(...)   → 改内存字段
+     *     syncMaskControls()        → 改滑块 UI
+     *     refreshMask()             → 刷预览
+     *
+     * **三处持久状态全没动**：
+     *   · /data/local/tmp/dcapd2.layer 还是旧尺寸 → dcapd2 的编码尺寸、画面映射都不变
+     *   · SharedPreferences 还是旧尺寸 → 8 秒保活的 currentMaskRect() 读到旧值
+     *     → CP 的 destination region 还是旧值
+     *   · 结果：用户看到预览变了，仪表纹丝不动
+     *
+     * 用户只能再点一次「保存并应用」把这三步补上 —— 这就是
+     * 「预设的遮罩尺寸应用不上，需要重新保存并应用」的真正原因。
+     *
+     * H.264 档之所以最先暴露，是因为它要求编码尺寸 = 遮罩尺寸、
+     * CP destination = 遮罩尺寸、三者 1:1；一旦不一致就是明显的
+     * 「位置错 + 拉伸」。BGRA 整屏画布 + alpha 挖洞，容错性高得多。
+     *
+     * 所以把这三步收进 LayerConfig 里做成一个原子操作，
+     * 预设、编辑器、主界面都调它，避免以后再漏。
+     *
+     * 注意：必须在**后台线程**调用（push() 里会 adb 写文件）。
+     */
+    public boolean applyFully(Context ctx) {
+        boolean ok = push();                 /* ① 写 dcapd2.layer */
+        if (ctx != null) saveToPrefs(ctx);   /* ② 写 prefs */
+
+        /* ③ 同步 CP 图层矩形（只有投屏中才有 layer 99） */
+        CpManager cp = sCp;
+        if (cp != null && sCasting && enabled && w > 0 && h > 0) {
+            try {
+                int[] dest = LayerGeometry.destinationFor(
+                        MirrorController.getCodec(),
+                        new int[]{x, y, w, h},
+                        canvasW, canvasH);
+                cp.setLayerRect(dest[0], dest[1], dest[2], dest[3]);
+            } catch (Throwable t) {
+                Log.w(TAG, "预设同步图层矩形失败: " + t);
+            }
+        }
+        return ok;
     }
 
     private static int intProp(java.util.Properties p, String key, int def) {

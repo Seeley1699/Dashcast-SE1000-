@@ -651,6 +651,33 @@ public class MainActivity extends Activity {
                     appendLog("已应用预设 " + (s + 1) + " · "
                             + LayerPreviewView.geometryText(maskCfg));
                     setStatus("状态：已应用预设 " + (s + 1));
+
+                    /*
+                     * **必须走完整下发路径**（2026-11-02 bug 修复）。
+                     *
+                     * 原来这里只做到上面三行就结束了 —— 内存和预览变了，
+                     * 但 dcapd2.layer、SharedPreferences、CP 的 destination
+                     * 三处持久状态全是旧值。表现就是：
+                     *   「预设的遮罩尺寸应用不上，得再点一次保存并应用」
+                     * H.264 档最先暴露（它要求编码尺寸=遮罩尺寸=destination
+                     * 三者 1:1，不一致就是明显的位置错+拉伸）。
+                     *
+                     * applyFully() 把这套完整路径收进了 LayerConfig，
+                     * 与「保存并应用」走同一份代码，以后不会再漏。
+                     * 它会写文件（adb），必须在后台线程。
+                     */
+                    final LayerConfig snap = maskCfg;
+                    final boolean casting = MirrorController.isMirroring();
+                    final android.content.Context appCtx = getApplicationContext();
+                    new Thread(() -> {
+                        try {
+                            snap.applyFully(appCtx);
+                            Log.i("DashcastMask", "预设 " + (s + 1) + " 已完整下发"
+                                    + (casting ? "（含图层矩形）" : "（未投屏，仅落盘）"));
+                        } catch (Throwable ex) {
+                            Log.w("DashcastMask", "预设下发失败: " + ex);
+                        }
+                    }, "preset-apply").start();
                 }
             });
 
