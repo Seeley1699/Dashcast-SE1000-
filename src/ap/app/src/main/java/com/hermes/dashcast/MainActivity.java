@@ -78,6 +78,7 @@ public class MainActivity extends Activity {
     private static final int LOG_MAX = 12;
     private LinearLayout btnCodecBgra, btnCodecH264;   /* 编码档二选一 */
     private LinearLayout btnMapMode;                 /* 地图模式开关 */
+    private LinearLayout btnMapHud;                  /* 地图 HUD 开关 */
     private LinearLayout viewRow;                    /* 视角三档容器 */
     private LinearLayout[] viewBtns;                 /* 远景/中景/近景 */
 
@@ -336,6 +337,33 @@ public class MainActivity extends Activity {
             viewRow.addView(b, rowLp(1f));
         }
         castCard.addView(viewRow);
+
+        /*
+         * ── 地图 HUD 开关 ──
+         *
+         * 打开后，开始投屏会：
+         *   ① 把地图的 HudActivity 用 `am start --display 1` 投到车机的
+         *      Display 1（HDMI 800×480，FLAG_PRESENTATION）
+         *   ② 让 dcapd2 抓那块屏（argv[13] = 1）
+         *
+         * 拿到的是**地图自己渲染的原生 HUD 页面** ——
+         * 浅底高对比、粗路线、居中车标、无 POI 无地名，
+         * 比截主屏上的地图干净得多。
+         *
+         * 只在地图模式开启时显示（这是地图独有的页面）。
+         */
+        btnMapHud = iconButton(mapHudLabel(), "◈", R.drawable.btn_secondary,
+                R.color.accent_soft, v -> {
+                    boolean on = !MirrorController.loadMapHud(this);
+                    MirrorController.saveMapHud(this, on);
+                    updateMapHudBtn();
+                    appendLog("地图 HUD " + (on ? "开启" : "关闭"));
+                    if (MirrorController.isMirroring()) {
+                        setStatus("状态：地图 HUD 已切换，重新投屏后生效");
+                    }
+                });
+        btnMapHud.setVisibility(View.GONE);
+        castCard.addView(btnMapHud);
 
         left.addView(castCard);
 
@@ -1587,6 +1615,23 @@ public class MainActivity extends Activity {
             boolean ok;
             int[] size = null;
             try {
+                /*
+                 * ── 地图 HUD 模式：先把地图的 HUD 页面投到 Display 1 ──
+                 *
+                 * 必须在启动 dcapd2 **之前**做：dcapd2 一起来就去抓
+                 * 物理屏 #1，那块屏得先有内容，否则头几帧全是黑的。
+                 *
+                 * 失败不阻断投屏 —— HUD 起不来就退回抓主屏（老路径），
+                 * 顶多画面差一点，不该让整个投屏开不起来。
+                 */
+                if (mirror.isMapHudActive()) {
+                    setStatus("状态：正在投地图 HUD 到 HUD 屏…");
+                    boolean hudOk = mirror.launchMapHud();
+                    appendLog(hudOk
+                            ? "地图 HUD 已投到 Display " + MirrorController.HUD_DISPLAY_ID
+                            : "地图 HUD 未确认到位（继续尝试抓取）");
+                }
+
                 // 先确认 CP 上有可执行的 dashcastd（被「停止服务」删过就自动重推），再启动
                 ok = cpManager.ensureDashcastd() && cpManager.startDashcastd();
                 if (ok) size = cpManager.queryScreenSize();   // 按 CP 真实分辨率建屏
@@ -1919,6 +1964,29 @@ public class MainActivity extends Activity {
         }
 
         new Thread(() -> {
+            /*
+             * ⓪ **先把地图 HUD 从 HUD 屏撤下来**。
+             *
+             * 必须放最前面：HUD 页面还留在 Display 1 上，那块屏就一直
+             * 显示导航画面。用户点「停止」的期望是"仪表回到原厂"，
+             * Display 1 上残留的 HUD 虽然不影响仪表（那是另一块屏），
+             * 但下次再投屏时 dcapd2 抓到的还是旧画面 —— 会出现
+             * "刚点开始就看到上一场的画面"这种错觉。
+             *
+             * 不 force-stop：地图是系统应用，杀了会被立刻拉起。
+             * 只需把 HUD 页面挪回主屏。
+             */
+            if (mirror != null && MirrorController.loadMapHud(MainActivity.this)
+                    && false) {   /* HUD 是系统应用，停止时无需撤离 */
+                try {
+                    mirror.dismissMapHud();
+                    Log.i(TAG, "地图 HUD 已从 Display "
+                            + MirrorController.HUD_DISPLAY_ID + " 撤回");
+                } catch (Throwable t) {
+                    Log.w(TAG, "撤回地图 HUD 失败: " + t);
+                }
+            }
+
             /* ① 杀投屏的目标 App。
              *
              * **系统预装应用杀不掉**：地图（com.geely.map）、音乐这类由
@@ -2072,6 +2140,32 @@ public class MainActivity extends Activity {
         return mirror.isMapMode() ? "地图模式 · 开" : "地图模式 · 关";
     }
 
+    /** 地图 HUD 按钮文案 */
+    private String mapHudLabel() {
+        return MirrorController.loadMapHud(this) ? "地图 HUD · 开" : "地图 HUD · 关";
+    }
+
+    /** 刷新地图 HUD 按钮的高亮与可见性 */
+    private void updateMapHudBtn() {
+        if (btnMapHud == null) return;
+        ((TextView) btnMapHud.getChildAt(1)).setText(mapHudLabel());
+        btnMapHud.setBackgroundResource(MirrorController.loadMapHud(this)
+                ? R.drawable.btn_selected : R.drawable.btn_secondary);
+        /*
+         * 只在地图模式 + 目标就是地图时才显示 ——
+         * HUD 是地图独有的页面，投别的 App 无从谈起。
+         */
+        boolean show = mirror.isMapMode()
+                && true;   /* HUD 是独立系统应用，不限定目标 */
+        btnMapHud.setVisibility(show ? View.VISIBLE : View.GONE);
+        /* HUD 模式下视角三档无意义（抓的是 HUD 全屏，不是主屏某块） */
+        if (viewRow != null && show && MirrorController.loadMapHud(this)) {
+            viewRow.setVisibility(View.GONE);
+        } else if (viewRow != null && mirror.isMapMode()) {
+            viewRow.setVisibility(View.VISIBLE);
+        }
+    }
+
     private void updateMapModeBtn() {
         if (btnMapMode == null) return;
         ((TextView) btnMapMode.getChildAt(1)).setText(mapModeLabel());
@@ -2085,6 +2179,8 @@ public class MainActivity extends Activity {
         if (viewRow != null) {
             viewRow.setVisibility(mirror.isMapMode() ? View.VISIBLE : View.GONE);
         }
+        /* 地图 HUD 开关跟着地图模式 + 目标 App 走 */
+        updateMapHudBtn();
     }
 
     /**

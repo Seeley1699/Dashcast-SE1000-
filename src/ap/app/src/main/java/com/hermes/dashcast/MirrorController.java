@@ -35,7 +35,7 @@ public class MirrorController {
     private static final String TAG = "DashcastMirror";
 
     private static final String BIN = "/data/local/tmp/dcapd2";
-    private static final String BIN_MD5 = "f37aaf262d6c7c844bde39de3a02657e";
+    private static final String BIN_MD5 = "dfd158c2257eced5ff6a62f90a03c368";
     private static final String PAUSE = "/data/local/tmp/dcapd2.pause";
     private static final String LOGF = "/data/local/tmp/dcapd2.log";
     /** 编码档位文件：App 写数字，dcapd2 每 500ms 轮询，运行时切档不重启进程 */
@@ -54,6 +54,111 @@ public class MirrorController {
 
     public static final int CODEC_BGRA = 0;
     public static final int CODEC_H264 = 2;
+
+    // ==================== 地图 HUD（原生渲染）====================
+
+    /*
+     * 地图的 HUD 页面 —— **地图自己为小屏导航设计的渲染**。
+     *
+     * 和主界面地图（MainActivity）比，它干净得多：
+     *   浅底高对比 / 粗路线 / 居中车标 / 无 POI / 无地名 / 无 UI 按钮
+     * 正是开车时该看的东西。
+     *
+     * 实测（2026-11-02）：
+     *   am start --display 1 -n <这个 Activity>
+     *   → 车机 Display 1（HDMI 800×480, FLAG_PRESENTATION）上出现原生 HUD 画面
+     *   → dcapd2 抓物理屏 #1 就能拿到，投到仪表
+     *
+     * 关键：这是个**普通 Activity**，不需要任何系统权限 ——
+     * 不像 DIM 通道（要 signature|privileged）或 VirtualDisplay（要 CAPTURE_VIDEO_OUTPUT）。
+     */
+    /*
+     * ══════════════════════════════════════════════════════════════
+     * 两个不同的"HUD"，别搞混（2026-11-02 实测区分）
+     * ══════════════════════════════════════════════════════════════
+     *
+     * ① com.geely.map 的 HudActivity —— 地图给自己做的小屏渲染
+     *    浅底、只有路线和车标、无文字信息。**不是我们要的。**
+     *
+     * ② com.ecarx.hud —— 车机真正的 HUD 应用（系统预装，开机自启）
+     *    黑底、档位 + 车标 + 转向提示 + 剩余距离/时间。
+     *    **这才是 HUD 该有的样子**，也正是开车要的信息。
+     *
+     * 它跑在 Display 1（HDMI 800×480）。用户这台车没有 HUD 硬件，
+     * 那块屏平时是"空跑"的 —— 正好拿来抓取投到仪表。
+     */
+    public static final String HUD_PKG = "com.ecarx.hud";
+    public static final String HUD_CLS = "com.ecarx.hud.view.MainActivity";
+
+    /** 地图：HUD 的导航数据来源。地图在导航态时 HUD 才有转向提示 */
+    public static final String MAP_PKG  = "com.geely.map";
+    public static final String MAP_MAIN_CLS = "com.ecarx.navi.MainActivity";
+
+    /** HUD 那块屏的 DisplayManager displayId */
+    public static final int HUD_DISPLAY_ID = 1;
+    /** dcapd2 的物理屏序号（getPhysicalDisplayIds 下标） */
+    public static final int HUD_PHYSICAL_INDEX = 1;
+    /** HUD 屏分辨率 */
+    public static final int HUD_W = 800;
+    public static final int HUD_H = 480;
+
+    /*
+     * HUD 画面的有效区域（实测标定，2026-11-02）。
+     *
+     * ══════════════════════════════════════════════════════════════
+     * 为什么不能直接照抓整块 800×480
+     * ══════════════════════════════════════════════════════════════
+     * HUD 是 800×480（比例 1.667），仪表是 1920×532（比例 3.609）。
+     * 整块照抓等比缩放后 HUD 只占中间 886×532 —— 两侧大片黑边，
+     * 内容又小又远，等于没用。
+     *
+     * ══════════════════════════════════════════════════════════════
+     * 实测的内容边界（逐像素扫描 HUD 截图得出的真实值）
+     * ══════════════════════════════════════════════════════════════
+     *   x 126..735（宽 610）
+     *   y 221..338（高 118）
+     *   内容中心 (430, 279)
+     *
+     * 内容是：档位「P」（左）+ 车辆图标（中）
+     *        + 转向箭头「↶ 164米进入 无名道路」+「剩24公里 22:36到」（右）
+     *
+     * ══════════════════════════════════════════════════════════════
+     * 裁剪参数怎么来的
+     * ══════════════════════════════════════════════════════════════
+     * 目标：比例必须 ≈ 3.609（仪表），且内容四周留 padding 不被切。
+     *
+     *   取 h = 200  → 放大倍率 532/200 = 2.66 倍
+     *   对应 w = 200 × 3.609 = 722
+     *   以内容中心 430 为锚 → x = 430 - 722/2 = 69  →  70
+     *   y = 279 - 200/2 = 179  →  180
+     *
+     * 校验：
+     *   x 70..792 覆盖内容 126..735   ✅ 左右各留 56/57 px
+     *   y 180..380 覆盖内容 221..338  ✅ 上下各留 41/42 px
+     *   722/200 = 3.610 ≈ 3.609      ✅ 误差 0.03%
+     *
+     * 早先试过 x=0,w=800（全宽）：右侧文字（「入」「到」）会顶到画面
+     * 右边界被切掉 —— 因为文字本来就在 HUD 右侧（x≈735），
+     * 放大 2.66 倍后正好超出。所以必须右移并留 padding。
+     *
+     * 换车型 / 换 HUD 版本时这几个数要重新量。
+     */
+    public static final int HUD_SRC_X = 70;
+    public static final int HUD_SRC_Y = 180;
+    public static final int HUD_SRC_W = 722;
+    public static final int HUD_SRC_H = 200;
+
+    /** 是否走「HUD 投屏」模式（prefs 持久化） */
+    private static final String PREF_MAP_HUD = "map_hud";
+
+    public static boolean loadMapHud(Context c) {
+        return prefs(c).getBoolean(PREF_MAP_HUD, false);
+    }
+
+    public static void saveMapHud(Context c, boolean on) {
+        prefs(c).edit().putBoolean(PREF_MAP_HUD, on).apply();
+    }
+
 
     private static final int DEFAULT_FPS = 30;
     public static final int[] FPS_CHOICES = {60, DEFAULT_FPS, 25, 20, 15};
@@ -658,7 +763,46 @@ public class MirrorController {
             int[] s = screenSize();
             int[] cap = applyMapCrop(r);
 
-            if (mapMode) {
+            /*
+             * **地图 HUD 模式**（2026-11-02 新增）。
+             *
+             * 不走主屏抓取，改抓车机的 Display 1（HDMI 800×480）——
+             * 那里是地图自己渲染的原生 HUD 画面（浅底、粗路线、居中车标）。
+             *
+             * 三个参数整体换掉：
+             *   屏幕尺寸 → HUD 屏的 800×480
+             *   抓取区   → 整块 HUD 屏（HUD 的关键信息就在中间一竖条，
+             *              两侧空白由遮罩裁掉，这里先照全抓，靠遮罩定位）
+             *   display  → 物理屏序号 1
+             */
+            boolean hud = isMapHudActive();
+            if (hud) {
+                s    = new int[]{HUD_W, HUD_H};
+                /*
+                 * **裁 HUD 的中间信息条**（2026-11-02 实测标定）。
+                 *
+                 * HUD 是 800×480（比例 1.667），仪表是 1920×532（比例 3.609）。
+                 * 整块照抓的话，等比缩放后 HUD 只能占中间 886×532，
+                 * 两侧大片黑边，内容显得又小又远。
+                 *
+                 * 实测 HUD 画面里真正的信息都在中间那条黑色横条上：
+                 *   档位「P」+ 车辆图标 + 转向箭头 +「剩24公里 22:36到」
+                 *   横条边界：y=160 开始黑，y=348 结束（高 188，全宽 800）
+                 *
+                 * 取 y=140, h=220（信息条 + 上下各留一点绿线背景）：
+                 *   比例 800/220 = 3.64 ≈ 仪表 3.609，误差 0.9%，肉眼无感
+                 *   → 内容几乎铺满整屏，字和图标都放大了 2.4 倍
+                 *
+                 * 这两个数（HUD_SRC_Y / HUD_SRC_H）是量出来的，不是猜的。
+                 * 换车型/换 HUD 版本时可能要重标。
+                 */
+                cap  = new int[]{HUD_SRC_X, HUD_SRC_Y, HUD_SRC_W, HUD_SRC_H};
+                Log.i(TAG, "HUD 投屏：抓 Display " + HUD_DISPLAY_ID
+                        + "（物理屏 #" + HUD_PHYSICAL_INDEX + "）"
+                        + "源 " + HUD_W + "×" + HUD_H
+                        + " → 裁 x=" + HUD_SRC_X + " y=" + HUD_SRC_Y
+                        + " " + HUD_SRC_W + "×" + HUD_SRC_H);
+            } else if (mapMode) {
                 Log.i(TAG, "地图模式：源 " + r[2] + "×" + r[3]
                         + " → 抓 " + cap[2] + "×" + cap[3]
                         + " @ (" + cap[0] + "," + cap[1] + ")");
@@ -671,6 +815,7 @@ public class MirrorController {
                     + OUT_W + " " + OUT_H + " "
                     + DashcastSenderService.CP_HOST + " " + DashcastSenderService.CP_PORT
                     + " " + fps + " " + codec
+                    + " " + (hud ? HUD_PHYSICAL_INDEX : -1)   /* argv[13]：抓哪块屏 */
                     + " > " + LOGF + " 2>&1 &";
             try {
                 // 命令以 & 结尾，adbd 那边不会立刻关流，这里超时是正常现象
@@ -892,6 +1037,74 @@ public class MirrorController {
 
     public static boolean loadMapMode(Context c) {
         return prefs(c).getBoolean(PREF_MAP_MODE, false);
+    }
+
+    // ==================== HUD 取景 ====================
+
+    /**
+     * HUD 模式是否生效：地图模式 + HUD 开关。
+     *
+     * HUD（com.ecarx.hud）是独立的系统应用，只作为"取景源"，
+     * 不要求投屏目标是哪个 App —— 开了开关就走它。
+     */
+    public boolean isMapHudActive() {
+        if (!mapMode) return false;
+        return ctx != null && loadMapHud(ctx);
+    }
+
+    /**
+     * 确保车机真正的 HUD（com.ecarx.hud）跑在 Display 1 上。
+     *
+     * ══════════════════════════════════════════════════════════════
+     * 为什么是 com.ecarx.hud，不是地图的 HudActivity
+     * ══════════════════════════════════════════════════════════════
+     * 实测（2026-11-02）两者完全不同：
+     *
+     *   com.geely.map/...multiscreen.hud.HudActivity —— 地图给自己做的
+     *   小屏渲染。浅底、只有路线和车标、**没有任何文字信息**。不是我们要的。
+     *
+     *   com.ecarx.hud —— 车机真正的 HUD 应用。黑底，显示：
+     *     档位「P」+ 车辆俯视图标
+     *     + 转向箭头「↶ 164米进入 无名道路」
+     *     + 「剩24公里 22:36到」
+     *   **这才是开车要看的。**
+     *
+     * 它平时就在 Display 1 上跑（系统预装、开机自启）。这台车没 HUD
+     * 硬件，那块屏是"空跑"的 —— 正好拿来抓取投到仪表。
+     *
+     * 不需要让地图进导航：HUD 的转向提示来自车机的导航服务，
+     * 地图在后台导航时也会推过去。
+     */
+    public boolean launchMapHud() {
+        try {
+            /* ① 确保 HUD 在 Display 1 上运行 */
+            AdbShell.exec("am start --display " + HUD_DISPLAY_ID
+                    + " -n " + HUD_PKG + "/" + HUD_CLS, 6000);
+            sleep(1200);
+
+            /* ② 回读确认它确实在 Display 1 上 */
+            String out = AdbShell.exec(
+                    "dumpsys activity activities | grep -A3 'Display #"
+                            + HUD_DISPLAY_ID + "'", 6000);
+            boolean ok = out != null && out.contains(HUD_PKG);
+            Log.i(TAG, "HUD 投 Display " + HUD_DISPLAY_ID
+                    + "：" + (ok ? "确认到位" : "未确认（看 dumpsys）"));
+            return ok;
+        } catch (Throwable t) {
+            Log.w(TAG, "启动 HUD 失败: " + t);
+            return false;
+        }
+    }
+
+    /**
+     * 停止时对 HUD 的处理：**什么都不做**。
+     *
+     * HUD 是系统预装应用，本来就在 Display 1 上常年运行；
+     * force-stop 会被立刻拉起，而且用户可能真在看那块屏。
+     * 停止投屏只需要 dcapd2 停止抓取，Display 1 上留着 HUD 不影响任何事。
+     */
+    public void dismissMapHud() {
+        Log.i(TAG, "HUD 保留在 Display " + HUD_DISPLAY_ID + "（系统应用，无需撤离）");
     }
 
     // ============================== 设备查询 ==============================

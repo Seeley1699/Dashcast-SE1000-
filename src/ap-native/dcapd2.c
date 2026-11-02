@@ -33,6 +33,7 @@
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
+#include <vector>
 
 #include <arpa/inet.h>
 #include <fcntl.h>
@@ -119,6 +120,16 @@ static long long g_ctrl_check = 0;
 static int g_enc_w = 0, g_enc_h = 0;
 static int g_last_enc_w = 0, g_last_enc_h = 0;   /* 上次算过的编码尺寸，避免重复打日志 */
 static int g_enc_live_w = 0, g_enc_live_h = 0;   /* 编码器**实际**生效的尺寸，用于检测变化 */
+
+/*
+ * 抓哪块屏（argv[13]，可选）。
+ *   <  0（默认）= 主屏（老行为，getInternalDisplayToken）
+ *   >= 0        = 第 n 块物理屏（getPhysicalDisplayIds()[n]）
+ *
+ * 用途：把地图的 HudActivity 投到 Display 1（HDMI 800×480），
+ * 抓那一块就能拿到地图的原生 HUD 渲染，比截主屏干净得多。
+ */
+static int g_target_display = -1;
 
 /* —— 取证用：切模式那一下"仪表上到底是什么"无从远观，只能把帧拍下来 ——
  * 只在排查问题时落盘（每次切模式 3 张，几毫秒），平时不写。 */
@@ -1257,8 +1268,13 @@ static void on_signal(int sig)
 static void usage(const char *p)
 {
     fprintf(stderr,
-        "用法: %s <dispW> <dispH> <srcX> <srcY> <srcW> <srcH> <outW> <outH> <host> <port> [maxFps]\n"
-        "  例: %s 2560 1440 0 96 2560 1344 1920 532 198.18.34.2 8444 30\n", p, p);
+        "用法: %s <dispW> <dispH> <srcX> <srcY> <srcW> <srcH> <outW> <outH> <host> <port> [maxFps] [codec] [display]\n"
+        "  codec:   0=BGRA+LZ4（默认）  2=H.264\n"
+        "  display: 抓第几块物理屏；省略或 -1 = 主屏\n"
+        "  例（主屏）: %s 2560 1440 0 96 2560 1344 1920 532 198.18.34.2 8444 30 2\n"
+        "  例（HUD） : %s 800 480 0 0 800 480 1920 532 198.18.34.2 8444 30 2 1\n"
+        "            （先 am start --display 1 -n com.geely.map/...hud.HudActivity）\n",
+        p, p, p);
 }
 
 int main(int argc, char **argv)
@@ -1277,6 +1293,15 @@ int main(int argc, char **argv)
     const int port   = atoi(argv[10]);
     int maxFps = (argc > 11) ? atoi(argv[11]) : 30;
     g_codec    = (argc > 12) ? atoi(argv[12]) : 0;
+    /*
+     * argv[13]：抓哪块屏。省略或负数 = 主屏（老行为）。
+     *
+     * 配合 HudActivity 用：把地图的 HUD 页面用
+     *   am start --display 1 -n com.geely.map/...hud.HudActivity
+     * 投到 Display 1（HDMI 800×480），再让 dcapd2 抓那一块，
+     * 就能拿到地图的**原生 HUD 渲染**（浅底高对比、粗路线、居中车标）。
+     */
+    g_target_display = (argc > 13) ? atoi(argv[13]) : -1;
     g_enc_w    = (outW / 2) & ~1;          /* YUV420 要求偶数 */
     g_enc_h    = (outH / 2) & ~1;
     if (maxFps <= 0) maxFps = 30;
@@ -1352,9 +1377,45 @@ int main(int argc, char **argv)
 
     ProcessState::self()->startThreadPool();
 
-    sp<IBinder> display = SurfaceComposerClient::getInternalDisplayToken();
+    sp<IBinder> display;
+
+    /*
+     * **抓哪块屏**（2026-11-02 新增）。
+     *
+     * 原来写死 getInternalDisplayToken() = 永远抓主屏（2560×1600）。
+     *
+     * 现在车机上还有一块 Display 1（HDMI 800×480，FLAG_PRESENTATION）。
+     * 实测把地图的 HudActivity 用 `am start --display 1` 投过去之后，
+     * 那块屏上就是**原生 HUD 渲染**：浅底、高对比、粗路线、居中车标，
+     * 无 POI 无地名 —— 比截屏主屏上的地图干净得多，正是开车该看的东西。
+     *
+     * 所以加一个参数 g_target_display：
+     *   >= 0 → 抓第 n 块物理屏
+     *   <  0 → 保持老行为，抓主屏
+     *
+     * 用 getPhysicalDisplayIds() 而不是硬编码编号：物理屏 id 是 64 位的
+     * PhysicalDisplayId，和 DisplayManager 里那个小整数 displayId
+     * 不是一回事，不能直接互转。
+     */
+    if (g_target_display >= 0) {
+        std::vector<PhysicalDisplayId> ids =
+                SurfaceComposerClient::getPhysicalDisplayIds();
+        if (g_target_display < (int) ids.size()) {
+            display = SurfaceComposerClient::getPhysicalDisplayToken(
+                    ids[g_target_display]);
+            LOGI("抓帧目标：物理屏 #%d（共 %d 块）",
+                 g_target_display, (int) ids.size());
+        } else {
+            LOGE("指定的物理屏 #%d 不存在（共 %d 块），回落主屏",
+                 g_target_display, (int) ids.size());
+            display = SurfaceComposerClient::getInternalDisplayToken();
+        }
+    } else {
+        display = SurfaceComposerClient::getInternalDisplayToken();
+    }
+
     if (display == nullptr) {
-        LOGE("拿不到主屏 token");
+        LOGE("拿不到 display token（目标=%d）", g_target_display);
         return 3;
     }
 
@@ -1564,7 +1625,27 @@ int main(int argc, char **argv)
                          * 有遮罩时直接用 sx/sy/sw/sh，画面绝对稳定。
                          */
                         int cropL = 0, cropR = 0;
-                        if (!g_mask_ready) {
+                        /*
+                         * **HUD 模式必须禁用自动裁黑边**（2026-11-02 实测踩到）。
+                         *
+                         * 抓 HUD 屏时不走遮罩（g_mask_ready=0），于是这里会
+                         * 跑 detect_crop_columns。而 HUD 画面本身就是
+                         * 「黑底 + 中间一坨内容」—— 左右大片纯黑。
+                         *
+                         * 自动裁黑边的判定逻辑把那些黑当成"内容黑边"，
+                         * 实测报「内容黑边 56/58 px」，把 722 宽裁成 608。
+                         * 结果：
+                         *   · 左边的「P」被切掉一半
+                         *   · 右边的「164米进入」贴边
+                         *   · 整体横向被拉宽 19%
+                         *
+                         * 用户的抓取区是我们按内容边界精确量出来的
+                         * （HUD_SRC_X/Y/W/H），任何"每帧现算"的二次裁剪
+                         * 都是在破坏这个标定。
+                         *
+                         * 所以：抓非主屏（g_target_display >= 0）时一律不裁。
+                         */
+                        if (!g_mask_ready && g_target_display < 0) {
                             detect_crop_columns((const uint8_t *) pixels, gb->getStride(),
                                                 sx, sy, sw, sh, &cropL, &cropR);
                         }
