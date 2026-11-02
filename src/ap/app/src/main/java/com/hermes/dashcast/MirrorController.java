@@ -232,6 +232,13 @@ public class MirrorController {
                     if (screenOff) {
                         setPause();
                         state("熄屏 —— 仪表停在最后一帧", true);
+                    } else if (isMapHudActive()) {
+                        /*
+                         * HUD 模式：dashcast 活动退到后台跟 HUD 无关 ——
+                         * HUD 画面一直在 Display 1 上，不需要建虚拟屏搬运。
+                         * 这里直接什么都不做，保持投屏继续。
+                         */
+                        Log.i(TAG, "HUD 模式：忽略后台事件（无需虚拟屏跟随）");
                     } else {
                         enterBg(myGen);
                     }
@@ -562,9 +569,81 @@ public class MirrorController {
                     if (gen.get() != myGen) return;
                 }
 
-                /* ② 前台判定：800ms 一次。dumpsys window 约 60ms，占不到单核 10%。 */
+                /*
+                 * ② 前台判定：800ms 一次。dumpsys window 约 60ms，占不到单核 10%。
+                 *
+                 * **HUD 模式整段跳过**（2026-11-02 实测踩到）。
+                 *
+                 * 这套逻辑是给"App 投屏"设计的：目标 App 被切到后台时，
+                 * 把它搬进虚拟屏继续跟随，免得仪表停在最后一帧。
+                 *
+                 * 但 HUD 模式的取景源是 Display 1 上的 com.ecarx.hud ——
+                 * 它**永远不在主屏前台**（主屏前台是桌面或别的 App）。
+                 * 于是 foregroundPkg() 读到的永远是桌面，
+                 * fgIsTarget 永远 false → 每次进来都触发 enterBg()：
+                 *   · 日志「回桌面 —— App 转后台」
+                 *   · 去建虚拟屏、搬一个不存在的 App 上去 → 失败
+                 *   · 日志「后台跟随不可用 —— 仪表停在最后一帧」
+                 *   · 连带把 HUD 的画面挤掉
+                 *
+                 * HUD 画面本来就在固定的 Display 1 上，不需要"跟随前台"。
+                 */
+                boolean hud = isMapHudActive();
+
+                /*
+                 * **HUD 模式必须在这里自己拉 dcapd2**（2026-11-02 关键修复）。
+                 *
+                 * 下面第 ⑧ 段（`fgIsTarget && !daemonAlive()`）是唯一的
+                 * 正常起 dcapd2 的入口 —— 但它要求 **目标 App 在前台**。
+                 * HUD 模式下我们把 fgIsTarget 强制设成 false（HUD 永远不在
+                 * 主屏前台），于是那段永远不会执行 → dcapd2 要么根本没起，
+                 * 要么是上一次会话残留的旧进程（参数还是 App 模式的
+                 * 2560x1600 / 740,924）。
+                 *
+                 * 实测现象：点「地图 HUD」日志全对（一键开投、正在投 HUD），
+                 * 但 dcapd2 抓的还是主屏 2560x1600 —— 因为压根没重启过它。
+                 *
+                 * 所以 HUD 模式在这里直接拉起：只要 dcapd2 不在、或它在跑
+                 * 但参数不是 HUD 的，就重起一次。
+                 */
+                if (hud) {
+                    if (!daemonAlive()) {
+                        if (!ensureBinary()) {
+                            state("抓帧进程部署失败（检查 assets/dcapd2.b64）", false);
+                            sleep(2000);
+                            continue;
+                        }
+                        /*
+                         * HUD 模式没有"窗口矩形"（那是 App 投屏才有的概念），
+                         * lastRect 可能是 null。但 launchDaemon 的签名要一个
+                         * int[]，而且它在 HUD 分支里会**整体覆盖** s 和 cap ——
+                         * 传进去的值完全不参与计算。
+                         *
+                         * 传一个整屏矩形当占位，避免 null 被解引用
+                         * （实测踩到 "Attempt to read from null array"）。
+                         */
+                        int[] rect = lastRect != null
+                                ? lastRect
+                                : new int[]{0, 0, HUD_W, HUD_H};
+                        if (launchDaemon(rect)) {
+                            if (gen.get() != myGen) return;
+                            failCount = 0;
+                            clearPause();
+                            vd.hold();
+                            LayerConfig.setCasting(true);
+                            syncLayerRectAsync();
+                            state("地图 HUD 投屏运行中（Display "
+                                    + HUD_DISPLAY_ID + " → CP）", true);
+                        } else if (++failCount >= 2) {
+                            state("拉起 dcapd2 失败，稍后重试", false);
+                            sleep(1500);
+                        }
+                    }
+                    /* HUD 模式到此为止：不做前台判定、不进后台跟随 */
+                }
+
                 boolean fgIsTarget = false;
-                if (now - lastFgCheck >= 800) {
+                if (!hud && now - lastFgCheck >= 800) {
                     lastFgCheck = now;
                     String fg = foregroundPkg();
                     fgIsTarget = pkg != null && pkg.equals(fg);
@@ -761,7 +840,14 @@ public class MirrorController {
     private boolean launchDaemon(int[] r) {
         synchronized (cleanupLock) {
             int[] s = screenSize();
-            int[] cap = applyMapCrop(r);
+
+            /*
+             * r 可能是 null —— HUD 模式没有"窗口矩形"可言。
+             * 下面 HUD 分支会整体覆盖 s/cap，所以这里给个占位即可；
+             * 但 applyMapCrop(r) 会解引用 r，必须先兜住。
+             */
+            int[] safeR = r != null ? r : new int[]{0, 0, OUT_W, OUT_H};
+            int[] cap = applyMapCrop(safeR);
 
             /*
              * **地图 HUD 模式**（2026-11-02 新增）。
@@ -776,6 +862,16 @@ public class MirrorController {
              *   display  → 物理屏序号 1
              */
             boolean hud = isMapHudActive();
+            /*
+             * 诊断日志：HUD 模式判定失败时，一定要能看出是哪一条不满足。
+             * 实测踩过：prefs 里 map_mode/map_hud 都是 true，但 dcapd2
+             * 拿到的还是 App 模式参数 —— 因为判定发生在那两个字段
+             * 生效之前的时机。这条日志能立刻定位。
+             */
+            Log.i(TAG, "launchDaemon 判定: isMapHudActive=" + hud
+                    + " mapMode=" + mapMode
+                    + " prefMapHud=" + (ctx != null && loadMapHud(ctx))
+                    + " ctx=" + (ctx != null));
             if (hud) {
                 s    = new int[]{HUD_W, HUD_H};
                 /*
@@ -803,7 +899,7 @@ public class MirrorController {
                         + " → 裁 x=" + HUD_SRC_X + " y=" + HUD_SRC_Y
                         + " " + HUD_SRC_W + "×" + HUD_SRC_H);
             } else if (mapMode) {
-                Log.i(TAG, "地图模式：源 " + r[2] + "×" + r[3]
+                Log.i(TAG, "地图模式：源 " + safeR[2] + "×" + safeR[3]
                         + " → 抓 " + cap[2] + "×" + cap[3]
                         + " @ (" + cap[0] + "," + cap[1] + ")");
             }
@@ -1048,8 +1144,21 @@ public class MirrorController {
      * 不要求投屏目标是哪个 App —— 开了开关就走它。
      */
     public boolean isMapHudActive() {
-        if (!mapMode) return false;
-        return ctx != null && loadMapHud(ctx);
+        /*
+         * **判据只看 prefs，不看 mapMode 字段**（2026-11-02 修复）。
+         *
+         * 原来写作 `if (!mapMode) return false;` —— 但 mapMode 是**实例字段**，
+         * 而 setMapMode() 可能被另一个实例（MainActivity 重建后的新 mirror）
+         * 调用。实测踩到的现象：
+         *   prefs 里 map_mode=true、map_hud=true，
+         *   但 dcapd2 拿到的还是 App 模式参数（2560x1600 / 740,924），
+         *   因为 launchDaemon 所属实例的 mapMode 字段还是 false。
+         *
+         * prefs 是全局共享的、也是唯一真正被"投屏流程"读到的配置源，
+         * 所以直接用 prefs 判定最可靠。mapMode 字段只用于 UI 显示。
+         */
+        if (ctx == null) return false;
+        return loadMapHud(ctx);
     }
 
     /**

@@ -352,15 +352,33 @@ public class MainActivity extends Activity {
          *
          * 只在地图模式开启时显示（这是地图独有的页面）。
          */
+        /*
+         * ── 地图 HUD：一键开投 / 一键停 ──
+         *
+         * 两条投屏路径是**互斥**的：
+         *   · App 投屏  → 抓主屏某窗口
+         *   · 地图 HUD → 抓 Display 1 上的 com.ecarx.hud
+         * 同一时刻只能有一个，否则两路都往 CP 的 layer 99 写，画面会打架。
+         *
+         * 所以点这个按钮要能"抢占"：正在 App 投屏 → 先停它 → 再开 HUD。
+         * 反过来点「开始投屏」时也一样（见 startCast 里调 stopMapHudOnly）。
+         *
+         * 前提：CP 侧服务已部署（点过「部署」）。没部署时
+         *   startCastInner 会自己 ensureDashcastd 重推，只是慢一点。
+         */
         btnMapHud = iconButton(mapHudLabel(), "◈", R.drawable.btn_secondary,
                 R.color.accent_soft, v -> {
-                    boolean on = !MirrorController.loadMapHud(this);
-                    MirrorController.saveMapHud(this, on);
-                    updateMapHudBtn();
-                    appendLog("地图 HUD " + (on ? "开启" : "关闭"));
-                    if (MirrorController.isMirroring()) {
-                        setStatus("状态：地图 HUD 已切换，重新投屏后生效");
+                    /*
+                     * 已经在投 HUD → 点一下就是停。
+                     * 注意判据不是 isMirroring() 而是"HUD 模式且正在投" ——
+                     * 正在投 App 时点这个按钮应该是"切到 HUD"，不是"停投屏"。
+                     */
+                    if (MirrorController.isMirroring() && mirror.isMapHudActive()) {
+                        stopCastOnly();
+                        return;
                     }
+                    /* 没在投，或在投 App → 切到 HUD（内部会先把 App 投屏停掉） */
+                    startHudCast();
                 });
         btnMapHud.setVisibility(View.GONE);
         castCard.addView(btnMapHud);
@@ -1580,6 +1598,97 @@ public class MainActivity extends Activity {
      *  ② 起推流服务（服务内部自建虚拟屏，无需录屏授权）
      *  ③ 虚拟屏就绪 → 把目标 App 启动/迁移到虚拟屏 → 抓帧推流到 CP
      */
+    /**
+     * 「地图 HUD」一键投屏 —— 不需要选目标 App，且会**抢占**当前正在跑的
+     * App 投屏。
+     *
+     * ══════════════════════════════════════════════════════════════
+     * 为什么单独开一个入口
+     * ══════════════════════════════════════════════════════════════
+     * HUD 的取景源是固定的：com.ecarx.hud 一直在 Display 1 上跑，
+     * dcapd2 抓的就是那块屏。**没有任何"投哪个 App"的概念**。
+     * 走普通 startCast() 会被 targetPkg==null 拦下来弹选 App 面板。
+     *
+     * ══════════════════════════════════════════════════════════════
+     * 为什么要先停 App 投屏
+     * ══════════════════════════════════════════════════════════════
+     * 两条路都写 CP 的 layer 99，同时跑画面会打架。
+     * 用户点「地图 HUD」的意图是"我要看 HUD"——那就应该把 App 投屏让出来，
+     * 而不是弹个"请先停止投屏"让他自己去点。
+     */
+    private void startHudCast() {
+        if (busy) {
+            Log.i(TAG, "操作进行中，忽略重复点击: 地图 HUD");
+            return;
+        }
+
+        /*
+         * ① 如果正在投 App，先停干净再开 HUD。
+         *
+         * 停完后必须**等一下**：stopCastOnly() 内部是异步的
+         * （mirror.stop() 会走 SSH/线程 join），立刻启 dcapd2 会撞车 ——
+         * 旧进程还没退、CP 的 layer 99 还没清。
+         *
+         * sleepQuiet 放在后台线程，别阻塞 UI。
+         */
+        final boolean wasAppCasting = MirrorController.isMirroring() && !mirror.isMapHudActive();
+        if (wasAppCasting) {
+            appendLog("地图 HUD · 先停止 App 投屏");
+        }
+
+        /* ② 把 HUD 模式打开 —— startCastInner 靠这两个标志走 HUD 分支 */
+        MirrorController.saveMapHud(this, true);
+        mirror.setMapMode(this, true);
+        updateMapModeBtn();
+        updateMapHudBtn();
+
+        if (wasAppCasting) {
+            setStatus("状态：正在切换到地图 HUD…");
+            stopCastOnly();
+            /* 给停止流程留时间收尾，再启 HUD */
+            mainHandler.postDelayed(this::startHudCastInner, 2500);
+        } else {
+            startHudCastInner();
+        }
+    }
+
+    /** startHudCast 的第二段：真正起投（抽取出来便于延迟调用） */
+    private void startHudCastInner() {
+        if (busy) return;
+
+        /*
+         * **进到这里必须重新确认 HUD 标志是开的**（2026-11-02 实测踩到）。
+         *
+         * 抢占流程是：停 App 投屏 → 等 2.5 秒 → 再起 HUD。
+         * 这 2.5 秒里 stopCastOnly() 的异步收尾可能已经把
+         * map_hud / map_mode 改回 false（比如它的 finish 逻辑），
+         * 于是 startCastInner() 走的是 App 分支 ——
+         * 实测 dcapd2 参数变成「抓帧 480x320 源 740,924」（App 模式），
+         * 而不是 HUD 的「722x200 源 70,180」。
+         *
+         * 所以起投前无条件再写一次标志，确保分支判定正确。
+         */
+        MirrorController.saveMapHud(this, true);
+        mirror.setMapMode(this, true);
+
+        appendLog("地图 HUD · 一键开投");
+
+        /*
+         * 上一场还在跑就先停干净。
+         * DashcastSenderService 的静态 sRunning 为 true 时，
+         * 直接 startForegroundService 会被跳过、回调永远不来。
+         */
+        if (DashcastSenderService.isRunning()) {
+            setStatus("状态：结束上一场投屏…");
+            stopServiceNow();
+            mainHandler.postDelayed(this::startHudCastInner, 800);
+            return;
+        }
+
+        /* 直接进投屏流程（不校验 targetPkg） */
+        startCastInner();
+    }
+
     private void startCast() {
         if (busy) {
             Log.i(TAG, "操作进行中，忽略重复点击: 开始投屏");
@@ -1591,6 +1700,24 @@ public class MainActivity extends Activity {
             showAppPicker();
             return;
         }
+
+        /*
+         * **抢占：正在投地图 HUD 就先把它停掉。**
+         *
+         * 两条投屏路径互斥 —— 都写 CP 的 layer 99，同时跑画面会打架。
+         * 用户选了 App 又点「开始投屏」，意图很明确："我要投这个 App"，
+         * 那就该把 HUD 让出来，而不是弹"请先停止 HUD"让他自己点两次。
+         */
+        if (MirrorController.isMirroring() && mirror.isMapHudActive()) {
+            appendLog("开始投屏 · 先停止地图 HUD");
+            setStatus("状态：正在从地图 HUD 切到 App 投屏…");
+            MirrorController.saveMapHud(this, false);   /* 关掉 HUD 标志，走普通分支 */
+            updateMapHudBtn();
+            stopCastOnly();
+            mainHandler.postDelayed(this::startCastAfterHudStop, 2500);
+            return;
+        }
+
         // 上一场还在跑（服务的静态标志为准，Activity 的字段会被重建清零）。
         // 这种情况直接 startForegroundService 会因为 sRunning==true 而跳过建屏，
         // 回调永远不来 → UI 卡在"等待虚拟屏就绪…"。所以先停干净，再重开。
@@ -1599,6 +1726,25 @@ public class MainActivity extends Activity {
             setStatus("状态：结束上一场投屏…");
             stopServiceNow();
             mainHandler.postDelayed(this::startCastInner, 500);
+            return;
+        }
+        startCastInner();
+    }
+
+    /** startCast 在停止 HUD 之后的续接（抽取出来便于延迟调用） */
+    private void startCastAfterHudStop() {
+        if (busy) return;
+
+        /*
+         * 同理，进这里必须确认 HUD 标志是**关**的 ——
+         * 否则 startCastInner 里 isMapHudActive() 还是 true，
+         * 会继续走 HUD 分支（抓 Display 1），而用户要的是投 App。
+         */
+        MirrorController.saveMapHud(this, false);
+
+        if (DashcastSenderService.isRunning()) {
+            stopServiceNow();
+            mainHandler.postDelayed(this::startCastAfterHudStop, 800);
             return;
         }
         startCastInner();
@@ -1654,8 +1800,18 @@ public class MainActivity extends Activity {
                 // App 一直留在中控，所以随时可点。
                 setStatus("状态：启动镜像抓帧…");
                 KeepAliveService.start(MainActivity.this);
-                final String target = targetPkg;
-                final String comp = targetPkg + "/" + targetCls;
+                /*
+                 * HUD 模式下 targetPkg 可能是空的（一键入口不要求选 App）。
+                 * 这时把 target 设成 HUD 自己的包名 —— mirror.start() 会用
+                 * 它判断"目标是否还活着"，而 HUD 是系统应用、常年运行，
+                 * 用它反而比空字符串更稳（空的话 targetAlive() 会误判）。
+                 */
+                final String target = mirror.isMapHudActive()
+                        ? MirrorController.HUD_PKG
+                        : targetPkg;
+                final String comp = targetPkg != null && targetCls != null
+                        ? targetPkg + "/" + targetCls
+                        : MirrorController.HUD_PKG + "/" + MirrorController.HUD_CLS;
                 mirror.start(target, comp, makeMirrorListener());
                 running = true;
                 leaveBusy();
@@ -1735,6 +1891,29 @@ public class MainActivity extends Activity {
 
         // 送 App 上屏这一步可能要走本机 adbd（socket 阻塞），不能放在主线程
         projectionTried = false;
+
+        /*
+         * **HUD 模式不需要"送 App 上屏"**（2026-11-02）。
+         *
+         * 上面那个虚拟屏（displayId）是给普通 App 投屏用的：把目标 App
+         * 搬到那块私有屏，再截那块屏的像素。
+         *
+         * 但 HUD 模式的取景源是 **Display 1 上的 com.ecarx.hud** ——
+         * 跟这块虚拟屏毫无关系。如果还往虚拟屏送 App：
+         *   · 会把 HUD 挤到后台（日志实测「回桌面 —— App 转后台」）
+         *   · dcapd2 抓 Display 1 时画面反而空了
+         *   · 日志「后台跟随不可用 —— 仪表停在最后一帧」
+         *
+         * 所以 HUD 模式直接跳过这段，只把状态标为运行中。
+         */
+        if (mirror.isMapHudActive()) {
+            setStatus("状态：地图 HUD 投屏运行中（Display "
+                    + MirrorController.HUD_DISPLAY_ID + " → CP）");
+            setDotColor(R.color.state_ok);
+            leaveBusy();
+            return;
+        }
+
         setStatus("状态：虚拟屏 " + displayId + " 就绪，正在送 App 上屏…");
         new Thread(() -> {
             String what = targetLabel == null ? targetPkg : targetLabel;
