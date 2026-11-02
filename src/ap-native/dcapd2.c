@@ -120,17 +120,6 @@ static int g_enc_w = 0, g_enc_h = 0;
 static int g_last_enc_w = 0, g_last_enc_h = 0;   /* 上次算过的编码尺寸，避免重复打日志 */
 static int g_enc_live_w = 0, g_enc_live_h = 0;   /* 编码器**实际**生效的尺寸，用于检测变化 */
 
-/*
- * H.264 档的边缘暗角宽度（像素）。
- *
- * H.264 没有 alpha，做不出真正的羽化，只能在画布上把边缘压暗来柔化硬边。
- * 默认 16px —— 实测在 1440x400 的抓取画面上，16px 足以让矩形边界
- * 不再"一刀切"，又不至于吃掉太多有效画面。
- *
- * 0 = 关闭。可以用环境变量 DC_EDGE 覆盖（排查时方便试不同值）。
- */
-static int g_edge_feather = 16;
-
 /* —— 取证用：切模式那一下"仪表上到底是什么"无从远观，只能把帧拍下来 ——
  * 只在排查问题时落盘（每次切模式 3 张，几毫秒），平时不写。 */
 static uint8_t     *g_canvas    = NULL;
@@ -161,10 +150,6 @@ static long long       g_mask_mtime_ms = 0;  /* 上次看到的文件 mtime */
 
 static void recompute_dst(void);      /* 前向声明 */
 static void recompute_enc_size(int canvas_w, int canvas_h);
-
-/* H.264 档的边缘暗角（定义在 blit 之后，这里先前置声明） */
-static void canvas_vignette(uint8_t *canvas, int cw, int ch,
-                            int rx, int ry, int rw, int rh, int f);
 
 /*
  * 按遮罩比例重算 H.264 编码尺寸。
@@ -1259,85 +1244,6 @@ static void blit_bilinear(const uint8_t *cap, int cap_stride_px, int cap_w, int 
     }
 }
 
-/*
- * 在画布上给矩形边缘做渐暗（H.264 档的"假羽化"）。
- *
- * ══════════════════════════════════════════════════════════════
- * 为什么需要它
- * ══════════════════════════════════════════════════════════════
- * H.264 是 4:2:0 YUV，**没有 alpha 通道**。BGRA 档能用 alpha 做圆角/羽化，
- * 让投屏区边缘柔和地过渡到原厂仪表；H.264 档做不到，仪表上就是一块
- * 硬边矩形，和原厂 UI 风格很割裂。
- *
- * 折中：把矩形最外 f 个像素的亮度按距离线性压暗（越靠外越黑）。
- * 视觉上像一层渐晕，边界从"一刀切"变成十几像素的过渡带。
- *
- * ══════════════════════════════════════════════════════════════
- * 为什么在 BGRA 画布上做，而不是编码后的 YUV
- * ══════════════════════════════════════════════════════════════
- * 编码后的 YUV 要处理 Y/U/V 三个平面、还要按 16×16 宏块对齐，
- * 边界会落在宏块内部，处理起来既麻烦又容易出错。
- * 画布是 BGRA，一次字节循环就够；而且这张画布反正要被
- * h264_enc_feed_crop 逐像素读一遍，多这一次遍历的代价可以忽略。
- *
- * ══════════════════════════════════════════════════════════════
- * 衰减曲线
- * ══════════════════════════════════════════════════════════════
- *   最外圈 (d=1)   → 亮度 25%（几乎黑，边界不生硬）
- *   中间   (d=f/2) → 亮度 62%
- *   内圈   (d=f)   → 亮度 100%（完全不受影响）
- * 用二次曲线而不是线性 —— 线性渐变的"折角"在暗背景上仍然看得出来。
- */
-static void canvas_vignette(uint8_t *canvas, int cw, int ch,
-                            int rx, int ry, int rw, int rh, int f)
-{
-    if (!canvas || cw <= 0 || ch <= 0) return;
-    if (rw <= 0 || rh <= 0 || f <= 0) return;
-
-    /* 夹住：feather 不能超过矩形的一半，否则整块都暗了 */
-    if (f > rw / 2) f = rw / 2;
-    if (f > rh / 2) f = rh / 2;
-    if (f <= 0) return;
-
-    const int x0 = rx < 0 ? 0 : rx;
-    const int y0 = ry < 0 ? 0 : ry;
-    const int x1 = (rx + rw) > cw ? cw : (rx + rw);
-    const int y1 = (ry + rh) > ch ? ch : (ry + rh);
-    if (x1 <= x0 || y1 <= y0) return;
-
-    /* 预计算每个距离档位的亮度系数（0..255 定点） */
-    uint8_t coef[512];
-    if (f > (int) sizeof(coef)) f = (int) sizeof(coef);
-    for (int d = 1; d <= f; d++) {
-        /* t: 0=最外, 1=最内 */
-        double t = (double) d / (double) f;
-        /* 二次曲线：最外 25%，最内 100% */
-        double v = 0.25 + 0.75 * t * t;
-        int c = (int) (v * 255.0);
-        if (c < 0) c = 0;
-        if (c > 255) c = 255;
-        coef[d] = (uint8_t) c;
-    }
-
-    for (int y = y0; y < y1; y++) {
-        int dy = (y - ry < ry + rh - 1 - y) ? (y - ry) : (ry + rh - 1 - y);
-        if (dy < 0) dy = 0;
-        uint8_t *row = canvas + (size_t) y * (size_t) cw * 4;
-        for (int x = x0; x < x1; x++) {
-            int dx = (x - rx < rx + rw - 1 - x) ? (x - rx) : (rx + rw - 1 - x);
-            if (dx < 0) dx = 0;
-            int d = dx < dy ? dx : dy;
-            if (d >= f) continue;            /* 内圈，完全不动 */
-            uint8_t c = coef[d + 1];
-            uint8_t *p = row + (size_t) x * 4;
-            p[0] = (uint8_t) ((p[0] * c) / 255);
-            p[1] = (uint8_t) ((p[1] * c) / 255);
-            p[2] = (uint8_t) ((p[2] * c) / 255);
-            /* alpha 保持不动（H.264 路径不用它，但别破坏画布一致性） */
-        }
-    }
-}
-
 /* ================================== main ================================== */
 
 static volatile sig_atomic_t g_stop = 0;
@@ -1374,20 +1280,6 @@ int main(int argc, char **argv)
     g_enc_w    = (outW / 2) & ~1;          /* YUV420 要求偶数 */
     g_enc_h    = (outH / 2) & ~1;
     if (maxFps <= 0) maxFps = 30;
-
-    /*
-     * H.264 边缘暗角宽度，可用环境变量 DC_EDGE 覆盖（排查时方便试值）。
-     *   DC_EDGE=0   → 关闭暗角
-     *   DC_EDGE=24  → 更宽的过渡带
-     * 默认 16px（见 g_edge_feather 的声明处）。
-     */
-    {
-        const char *ev = getenv("DC_EDGE");
-        if (ev && *ev) {
-            int v = atoi(ev);
-            if (v >= 0) g_edge_feather = v;
-        }
-    }
 
     if (dispW <= 0 || dispH <= 0 || srcW <= 0 || srcH <= 0 || outW <= 0 || outH <= 0) {
         LOGE("参数不合法");
@@ -1862,31 +1754,6 @@ int main(int argc, char **argv)
                  * 无遮罩时回落到整块（cw/ch <= 0 走旧路径）。
                  */
                 if (g_mask_ready && g_mask.cfg.w > 0 && g_mask.cfg.h > 0) {
-                    /*
-                     * **边缘暗角（方案 C，2026-11-02）**。
-                     *
-                     * H.264 是 4:2:0 YUV，物理上没有 alpha 通道，
-                     * 所以没办法像 BGRA 那样用 alpha 做圆角/羽化 ——
-                     * 仪表上就是一块硬边矩形，和原厂仪表风格割裂。
-                     *
-                     * 折中办法：在**画布上先把边缘像素压暗**，再喂给编码器。
-                     * 观感上像一层渐晕（vignette），矩形边界不再一刀切，
-                     * 而是十几像素的柔和过渡。
-                     *
-                     * 为什么在画布上做而不是编码后做：
-                     *   编码后的 YUV 域要处理 Y/U/V 三个平面并对齐宏块；
-                     *   画布是 BGRA，一次字节循环就够，而且这张画布本来
-                     *   就要被 h264_enc_feed_crop 逐像素读一遍。
-                     *
-                     * 只在 H.264 档做：BGRA 有真正的 alpha 羽化，
-                     * 再压暗边缘会让画面暗一圈，多此一举。
-                     */
-                    if (g_codec == DASHCAST_CODEC_H264 && g_edge_feather > 0) {
-                        canvas_vignette(canvas, outW, outH,
-                                        g_mask.cfg.x, g_mask.cfg.y,
-                                        g_mask.cfg.w, g_mask.cfg.h,
-                                        g_edge_feather);
-                    }
                     h264_enc_feed_crop(canvas, outW, outH,
                                        g_mask.cfg.x, g_mask.cfg.y,
                                        g_mask.cfg.w, g_mask.cfg.h);

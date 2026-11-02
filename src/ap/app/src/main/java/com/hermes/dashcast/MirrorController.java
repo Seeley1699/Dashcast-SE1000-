@@ -35,7 +35,7 @@ public class MirrorController {
     private static final String TAG = "DashcastMirror";
 
     private static final String BIN = "/data/local/tmp/dcapd2";
-    private static final String BIN_MD5 = "292bc83c9857ae8cf4a57c44f5265abb";
+    private static final String BIN_MD5 = "f37aaf262d6c7c844bde39de3a02657e";
     private static final String PAUSE = "/data/local/tmp/dcapd2.pause";
     private static final String LOGF = "/data/local/tmp/dcapd2.log";
     /** 编码档位文件：App 写数字，dcapd2 每 500ms 轮询，运行时切档不重启进程 */
