@@ -86,19 +86,46 @@ public final class LayerConfig {
     public int srcW = 0;
     public String srcAppPkg = null;
 
+    /*
+     * ===== 遮罩是不是"铺满整块画布"（2026-11-03 新增）=====
+     *
+     * 为什么单独存一个标志，而不是每次用 x/y/w/h 反推：
+     *
+     * 画布尺寸现在跟着 CP 真实分辨率走（可能 1920×720 而不是 1920×532）。
+     * 用户上次设好"铺满"（w=canvasW, h=canvasH），下次启动画布变大/变小后，
+     * prefs 里读回来的 w/h 还是**旧画布的数** —— 用 x/y/w/h 反推会判成
+     * "不是铺满"，于是遮罩只盖住一角。
+     *
+     * 用户的原话就是这个：「遮罩尺寸无法铺满仪表盘（明明遮罩尺寸已经铺满网格了）」。
+     *
+     * 存标志后：凡是从"铺满"状态加载的，一律重新铺满新画布。
+     * 拖动/改尺寸会把它置 false（见 LayerPreviewView 的 notifyChanged）。
+     */
+    public boolean canvasFill = false;
+
     /* ============================ 持久化 ============================ */
 
-    /** 生成 key=value 文本（格式必须与 dcapd2 的 dc_layer_parse 对齐） */
+    /**
+     * 生成 key=value 文本（格式必须与 dcapd2 的 dc_layer_parse 对齐）。
+     *
+     * **x/y/w/h 会按当前编码档处理**（2026-11-03）：
+     *   · H.264 → 下发对齐到 16 倍数的值（硬编要求，否则比例漂移变形）
+     *   · BGRA  → 下发用户原始值（不需要对齐，1:1 零损失）
+     *
+     * 注意 cfg 自身**始终保存用户原始尺寸**，只有落盘这一刻才降级。
+     * 这样切回 BGRA 时遮罩立刻恢复原样，不需要用户重调。
+     */
     public String toText() {
+        int[] rr = rectForCodec(MirrorController.getCodec());
         StringBuilder sb = new StringBuilder(512);
         sb.append("version=1\n");
         sb.append("enabled=").append(enabled ? 1 : 0).append('\n');
         sb.append("canvas_w=").append(canvasW).append('\n');
         sb.append("canvas_h=").append(canvasH).append('\n');
-        sb.append("x=").append(x).append('\n');
-        sb.append("y=").append(y).append('\n');
-        sb.append("w=").append(w).append('\n');
-        sb.append("h=").append(h).append('\n');
+        sb.append("x=").append(rr[0]).append('\n');
+        sb.append("y=").append(rr[1]).append('\n');
+        sb.append("w=").append(rr[2]).append('\n');
+        sb.append("h=").append(rr[3]).append('\n');
         sb.append("grid=").append(grid).append('\n');
         sb.append("shape=").append(shape).append('\n');
         sb.append("dpi=").append(dpi).append('\n');
@@ -273,6 +300,7 @@ public final class LayerConfig {
         e.putInt("layer_y", y);
         e.putInt("layer_w", w);
         e.putInt("layer_h", h);
+        e.putBoolean("layer_canvas_fill", canvasFill);
         e.putInt("layer_grid", grid);
         e.putInt("layer_shape", shape);
         e.putInt("layer_dpi", dpi);
@@ -369,6 +397,22 @@ public final class LayerConfig {
         c.y          = p.getInt("layer_y", 0);
         c.w          = p.getInt("layer_w", c.canvasW);
         c.h          = p.getInt("layer_h", c.canvasH);
+        /*
+         * 「上次是不是铺满整块画布」（2026-11-03）。
+         *
+         * 老版本没存这个键 → 用 x/y/w/h 反推（w/h 恰好等于当时的画布就认为铺满）。
+         * 反推只会漏，不会误判成铺满，所以是安全的降级路径。
+         */
+        c.canvasFill = p.contains("layer_canvas_fill")
+                ? p.getBoolean("layer_canvas_fill", false)
+                : (c.x == 0 && c.y == 0 && c.w >= 1920 && c.h >= 532);
+        /* 铺满状态 → 直接按**新画布**铺满（画布尺寸可能已经变了） */
+        if (c.canvasFill) {
+            c.x = 0;
+            c.y = 0;
+            c.w = c.canvasW;
+            c.h = c.canvasH;
+        }
         c.grid       = p.getInt("layer_grid", 32);
         c.shape      = p.getInt("layer_shape", SHAPE_ROUND);
         c.dpi        = p.getInt("layer_dpi", 160);
@@ -522,9 +566,20 @@ public final class LayerConfig {
         CpManager cp = sCp;
         if (cp != null && sCasting && enabled && w > 0 && h > 0) {
             try {
+                /*
+                 * **用按编码档对齐后的矩形**，不是原始 w/h。
+                 *
+                 * H.264 下 dcapd2 编码尺寸是 (w/16)*16 × (h/16)*16，
+                 * 而 CP 的 destination region 必须与之**完全一致**，
+                 * 否则合成器要把编码画面拉伸到 layer 尺寸 → 变形。
+                 *
+                 * 例：原始遮罩 1920×532，H.264 编码 1920×528，
+                 * 若 CP 仍设 1920×532 → 528 拉成 532（纵向 +0.76%）。
+                 */
+                int[] rr = rectForCodec(MirrorController.getCodec());
                 int[] dest = LayerGeometry.destinationFor(
                         MirrorController.getCodec(),
-                        new int[]{x, y, w, h},
+                        new int[]{rr[0], rr[1], rr[2], rr[3]},
                         canvasW, canvasH);
                 cp.setLayerRect(dest[0], dest[1], dest[2], dest[3]);
             } catch (Throwable t) {
@@ -554,6 +609,35 @@ public final class LayerConfig {
     }
 
     /** 夹到合法范围（与 C 侧 sanitize 同规则） */
+    /**
+     * 截取区的合法性夹取（**屏幕坐标系**，和遮罩的画布坐标是两回事）。
+     *
+     * 为什么不复用 sanitize()：那个把 x/w 夹在 canvasW/canvasH 内
+     * （1920×532），而截取区是屏幕像素（2560×1600）。
+     * 混用会把用户的框压成一小条。
+     *
+     * @param scrW 整屏宽（wm size）
+     * @param scrH 整屏高
+     */
+    public void sanitizeCrop(int scrW, int scrH) {
+        if (scrW < 16) scrW = 2560;
+        if (scrH < 16) scrH = 1600;
+
+        if (srcW < 16) srcW = 16;
+        if (srcH < 16) srcH = 16;
+
+        if (srcX < 0) srcX = 0;
+        if (srcY < 0) srcY = 0;
+
+        /* 不许超出屏幕：先保证宽高不超，再把起点往回推 */
+        if (srcW > scrW) srcW = scrW;
+        if (srcH > scrH) srcH = scrH;
+        if (srcX + srcW > scrW) srcX = scrW - srcW;
+        if (srcY + srcH > scrH) srcY = scrH - srcH;
+        if (srcX < 0) srcX = 0;
+        if (srcY < 0) srcY = 0;
+    }
+
     public void sanitize() {
 
         if (canvasW < 1) canvasW = 1;
@@ -582,8 +666,62 @@ public final class LayerConfig {
         trapTop = Math.min(trapTop, w / 2);
         trapBot = Math.min(trapBot, w / 2);
 
+        /* "铺满整块画布"的状态实时校验：用户一改就不是铺满了 */
+        canvasFill = (x == 0 && y == 0 && w == canvasW && h == canvasH);
+
         if (shape < SHAPE_RECT || shape > SHAPE_ELLIPSE) shape = SHAPE_RECT;
         if (fit != 0) fit = 1;
+    }
+
+    /**
+     * **把遮罩宽高对齐到 16 的整数倍 —— 只在 H.264 档需要**。
+     *
+     * ══════════════════════════════════════════════════════════════
+     * 为什么只有 H.264 需要
+     * ══════════════════════════════════════════════════════════════
+     *   · H.264：MediaCodec 硬编要求宽高是 16 的倍数（YUV420 宏块），
+     *            dcapd2 里是 `g_enc_w = (bw / 16) * 16`（向下取整）。
+     *            不对齐 → 编码尺寸比遮罩小 → 比例漂移 → 合成器拉伸变形。
+     *             遮罩 1920×532 → 编码 1920×528（3.64:1 vs 3.61:1）
+     *   · BGRA：直接传 RGB 原始像素，**没有任何对齐要求**，
+     *            遮罩 1920×532 就是 1920×532，1:1 零损失。
+     *
+     * ══════════════════════════════════════════════════════════════
+     * 为什么不在 sanitize() 里无条件对齐（踩过的坑）
+     * ══════════════════════════════════════════════════════════════
+     *   一开始写成无条件对齐，结果 BGRA 用户的遮罩也被砍：
+     *     1920×532 → 1920×528，白白矮 4px，用户精调的位置被破坏。
+     *   而这个 4px 对 BGRA 毫无必要 —— 它压根不经过编码器。
+     *
+     * 所以拆成独立方法，由**下发前**按当前编码档决定是否调用。
+     * cfg 里始终保存用户原始尺寸，只有真正要给 H.264 编码时才降级。
+     */
+    public void alignForCodec(int codec) {
+        /* CODEC_H264 = 2（与 dashcast_proto.h 一致） */
+        if (codec != 2) return;
+
+        if (w >= 16) w = (w / 16) * 16;
+        if (h >= 16) h = (h / 16) * 16;
+
+        /* 对齐后可能压到边界外，往回收 */
+        if (x + w > canvasW) x = Math.max(0, canvasW - w);
+        if (y + h > canvasH) y = Math.max(0, canvasH - h);
+        if (x < 0) x = 0;
+        if (y < 0) y = 0;
+    }
+
+    /** 返回按编码档对齐后的 {x,y,w,h}，不改自身（给下发用） */
+    public int[] rectForCodec(int codec) {
+        int rx = x, ry = y, rw = w, rh = h;
+        if (codec == 2) {
+            if (rw >= 16) rw = (rw / 16) * 16;
+            if (rh >= 16) rh = (rh / 16) * 16;
+            if (rx + rw > canvasW) rx = Math.max(0, canvasW - rw);
+            if (ry + rh > canvasH) ry = Math.max(0, canvasH - rh);
+            if (rx < 0) rx = 0;
+            if (ry < 0) ry = 0;
+        }
+        return new int[]{rx, ry, rw, rh};
     }
 
     /** 把另一个配置的全部字段拷进来（「取消」用来回滚到 prefs 里的版本） */

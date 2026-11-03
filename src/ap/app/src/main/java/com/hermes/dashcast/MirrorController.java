@@ -35,7 +35,7 @@ public class MirrorController {
     private static final String TAG = "DashcastMirror";
 
     private static final String BIN = "/data/local/tmp/dcapd2";
-    private static final String BIN_MD5 = "dfd158c2257eced5ff6a62f90a03c368";
+    private static final String BIN_MD5 = "974682dfd006e4f385497882249234e0";
     private static final String PAUSE = "/data/local/tmp/dcapd2.pause";
     private static final String LOGF = "/data/local/tmp/dcapd2.log";
     /** 编码档位文件：App 写数字，dcapd2 每 500ms 轮询，运行时切档不重启进程 */
@@ -45,13 +45,55 @@ public class MirrorController {
     private static final String PREF_FPS = "fps";
     private static final String PREF_MAP_MODE = "map_mode";
 
-    /** 仪表画布固定尺寸 */
-    private static final int OUT_W = 1920;
-    private static final int OUT_H = 532;
+    /*
+     * 仪表画布尺寸 —— **跟着 CP 真实分辨率走**（2026-11-03 修复「遮罩铺满网格，
+     * 仪表上却铺不满」）。
+     *
+     * 原来写死 1920×532：画布、dcapd2 输出、ivi 图层、destination region
+     * 全是这个数。但只要 CP 屏不是正好 1920×532（实测有的车机是 1920×720），
+     * 图层就只盖住屏幕上面一截，下面露出原厂仪表 ——
+     * 用户看到的就是"遮罩明明铺满了网格，仪表却铺不满"。
+     *
+     * 现在：App 起投屏时把 cpManager.queryScreenSize() 的结果写进 prefs，
+     * 这边静态读出来用。拿不到就退回 1920×532（老行为）。
+     */
+    private static final int DEF_OUT_W = 1920;
+    private static final int DEF_OUT_H = 532;
+    private static volatile int sOutW = DEF_OUT_W;
+    private static volatile int sOutH = DEF_OUT_H;
 
-    /** 仪表输出尺寸（供 UI 计算比例提示用，只读） */
-    public static final int OUT_W_PUBLIC = OUT_W;
-    public static final int OUT_H_PUBLIC = OUT_H;
+    private static final String PREF_OUT_W = "cp_scr_w";
+    private static final String PREF_OUT_H = "cp_scr_h";
+
+    public static int getOutputW() { return sOutW; }
+    public static int getOutputH() { return sOutH; }
+
+    /** App 启动时读一次缓存的 CP 分辨率 */
+    public static void loadOutputSize(Context c) {
+        try {
+            SharedPreferences p = prefs(c);
+            int w = p.getInt(PREF_OUT_W, 0);
+            int h = p.getInt(PREF_OUT_H, 0);
+            if (w >= 640 && h >= 320) {
+                sOutW = w;
+                sOutH = h;
+                Log.i(TAG, "仪表画布尺寸（缓存）= " + w + "×" + h);
+            }
+        } catch (Throwable ignored) {
+        }
+    }
+
+    /** 起投屏时拿到 CP 实测分辨率 → 记住并生效 */
+    public static void setOutputSize(Context c, int w, int h) {
+        if (w < 640 || h < 320) return;
+        sOutW = w;
+        sOutH = h;
+        try {
+            prefs(c).edit().putInt(PREF_OUT_W, w).putInt(PREF_OUT_H, h).apply();
+        } catch (Throwable ignored) {
+        }
+        Log.i(TAG, "仪表画布尺寸 → " + w + "×" + h);
+    }
 
     /** 分片推送时每片的 base64 字符数（adbd 单条命令别太长） */
     private static final int CHUNK = 3000;
@@ -462,14 +504,52 @@ public class MirrorController {
 
         if (gen.get() != myGen) return;
 
-        int srcW = lastRect != null ? lastRect[2]
-                : ctx.getResources().getDisplayMetrics().widthPixels;
-        int srcH = lastRect != null ? lastRect[3]
-                : ctx.getResources().getDisplayMetrics().heightPixels;
+        /*
+         * ══════════════════════════════════════════════════════════════
+         * **虚拟屏尺寸必须用「整屏」，不能用遮罩尺寸**（2026-11-03 修复）
+         * ══════════════════════════════════════════════════════════════
+         *
+         * 原来取 lastRect[2]/[3]，而 lastRect 现在可能是：
+         *   · 用户框选的 App 截取区（比如 2560×544）
+         *   · 地图模式的遮罩换算区（比如 1440×400）
+         * 都不是整屏。
+         *
+         * 后果（用户反馈"回桌面后截取失效"）：
+         *   虚拟屏按 2560×544 建 → App 被塞进一块很矮的屏里
+         *   → App 按 544 的高度重新排版（列表压缩、按钮挤在一起）
+         *   → 抓出来的画面和"前台时的样子"完全不同
+         *   → 用户以为"截取失效了"
+         *
+         * 必须用真实屏幕尺寸（2560×1600），App 才会保持原有布局。
+         * 我们只是换个地方渲染它，不是把它压扁。
+         */
+        int[] scr = getScreenPx();
+        int srcW = scr[0] > 0 ? scr[0] : 2560;
+        int srcH = scr[1] > 0 ? scr[1] : 1600;
         int mainDpi = ctx.getResources().getDisplayMetrics().densityDpi;
 
         VdMirror.setProxyWanted(true);   /* 挂控制通道（按 HOME 停抓用） */
         VdMirror.setFeedFrames(true);    /* 虚拟屏模式：允许喂帧 */
+
+        /*
+         * **把「截取 App 页面」的框也带进后台**（2026-11-03 修复）。
+         *
+         * 用户报：设好截取框，App 在前台时正常，一按 HOME 回桌面就失效。
+         * 根因是 VD 分支整块 blit，完全不认截取框。
+         * 这里拿到截取框 + 目标窗口矩形交给 VdMirror，它换算成虚拟屏坐标
+         * 后用 'DCVP' 命令下发给 dcapd2。
+         */
+        try {
+            LayerConfig lc = LayerConfig.loadFromPrefs(ctx, getOutputW(), getOutputH());
+            if (lc != null && lc.srcW > 0 && lc.srcH > 0) {
+                int[] crop = {lc.srcX, lc.srcY, lc.srcW, lc.srcH};
+                vd.setCropRect(crop, lastRect);
+            } else {
+                vd.setCropRect(null, null);
+            }
+        } catch (Throwable t) {
+            Log.w(TAG, "读取截取框失败（后台跟随将取整块）: " + t);
+        }
 
         /*
          * vd.start() 里是 am display move-stack / am start --display，
@@ -891,7 +971,7 @@ public class MirrorController {
              * 下面 HUD 分支会整体覆盖 s/cap，所以这里给个占位即可；
              * 但 applyMapCrop(r) 会解引用 r，必须先兜住。
              */
-            int[] safeR = r != null ? r : new int[]{0, 0, OUT_W, OUT_H};
+            int[] safeR = r != null ? r : new int[]{0, 0, getOutputW(), getOutputH()};
             int[] cap = applyMapCrop(safeR);
 
             /*
@@ -953,7 +1033,7 @@ public class MirrorController {
                     + "cd /data/local/tmp && nohup ./dcapd2 "
                     + s[0] + " " + s[1] + " "
                     + cap[0] + " " + cap[1] + " " + cap[2] + " " + cap[3] + " "
-                    + OUT_W + " " + OUT_H + " "
+                    + getOutputW() + " " + getOutputH() + " "
                     + DashcastSenderService.CP_HOST + " " + DashcastSenderService.CP_PORT
                     + " " + fps + " " + codec
                     + " " + (hud ? HUD_PHYSICAL_INDEX : -1)   /* argv[13]：抓哪块屏 */
@@ -1021,7 +1101,7 @@ public class MirrorController {
                  *   BGRA：画布遮罩外已透明 → destination = 整屏，1:1 零缩放
                  *   H.264：无 alpha → destination = 遮罩矩形，图层本身缩进那块
                  */
-                int[] r = LayerGeometry.destinationFor(codec, currentMaskRect(), OUT_W, OUT_H);
+                int[] r = LayerGeometry.destinationFor(codec, currentMaskRect(), getOutputW(), getOutputH());
 
                 /* 保活每 8 秒一次，矩形没变就不必每次打两条日志。
                  * 原来每轮都打（Mirror 一条 + CpManager 一条），
@@ -1070,13 +1150,13 @@ public class MirrorController {
     /** 读当前遮罩矩形（从 prefs）；没有遮罩就返回整屏 */
     private int[] currentMaskRect() {
         try {
-            LayerConfig lc = LayerConfig.loadFromPrefs(ctx, OUT_W, OUT_H);
+            LayerConfig lc = LayerConfig.loadFromPrefs(ctx, getOutputW(), getOutputH());
             if (lc != null && lc.enabled && lc.w > 0 && lc.h > 0) {
                 return new int[]{lc.x, lc.y, lc.w, lc.h};
             }
         } catch (Throwable ignored) {
         }
-        return new int[]{0, 0, OUT_W, OUT_H};
+        return new int[]{0, 0, getOutputW(), getOutputH()};
     }
 
     // ============================== 地图模式 ==============================
@@ -1107,28 +1187,75 @@ public class MirrorController {
          *   App 截取区（srcW 显式给全）      → 任何 App 投屏都该生效
          * 所以把 App 截取区提到 mapMode 判断之前。
          */
-        LayerConfig lc0 = LayerConfig.loadFromPrefs(ctx, OUT_W, OUT_H);
-        if (lc0 != null && lc0.srcW > 0 && lc0.srcH > 0) {
+        LayerConfig lc0 = LayerConfig.loadFromPrefs(ctx, getOutputW(), getOutputH());
+        /*
+         * **先看总开关**（2026-11-03）。
+         *
+         * 「启用页面截取」默认关闭 —— 关着就完全不做裁切，抓整个窗口
+         * 铺满遮罩，行为和没有这个功能时一致。
+         *
+         * 这样才满足"默认关闭（就是铺满遮罩尺寸）"：
+         * 用户不主动开，就不会被框选参数干扰。
+         */
+        boolean cropOn = MainActivity.isAppCropEnabled(ctx);
+        if (cropOn && lc0 != null && lc0.srcW > 0 && lc0.srcH > 0) {
             int sw = ((lc0.srcW + 15) / 16) * 16;   /* 16 对齐（H.264 硬编要求） */
             int sh = ((lc0.srcH + 15) / 16) * 16;
             int sx = lc0.srcX;
             int sy = lc0.srcY;
-            /* 夹住，别出屏幕 */
-            if (sx + sw > win[0] + win[2]) sx = win[0] + win[2] - sw;
-            if (sy + sh > win[1] + win[3]) sy = win[1] + win[3] - sh;
-            if (sx < win[0]) sx = win[0];
-            if (sy < win[1]) sy = win[1];
+
+            /*
+             * **夹住时用「整屏尺寸」，不是「窗口矩形」**（2026-11-03 修复）。
+             *
+             * 用户在右侧预览区框选时，看到的是**整块屏幕**（2560×1600 缩略图），
+             * 所以 X/Y/W/H 是屏幕坐标。
+             *
+             * 原来这里用 win[0]+win[2] 当边界 —— 而 win 是目标 App 的窗口矩形，
+             * 它可能比屏幕小（App 不是全屏时），也可能因为读不到窗口而降级成
+             * 一个默认值。结果用户设 X=320 W=2560 会被夹成 X=0
+             * （320+2560 > 2560），看起来就是"截取区不生效"。
+             *
+             * 改成按屏幕尺寸夹：只要框选本身没超出屏幕，就原样保留。
+             */
+            int[] scr = screenSize();
+            int scrW = scr[0] > 0 ? scr[0] : 2560;
+            int scrH = scr[1] > 0 ? scr[1] : 1600;
+
+            /*
+             * ⚠ **顺序很关键**：先夹到屏幕 → 再 16 对齐 → 对齐后可能
+             * 又超出去，所以要**再夹一次**。
+             *
+             * 原来的写法是先对齐、再夹 X/Y，但漏了"对齐让尺寸变大"这种
+             * 情况 —— 比如用户 H=1590，对齐成 1600（正好）；
+             * H=1595 也对齐成 1600。但如果某次读到的旧值是
+             * W=2560 H=1610（上次在更大屏幕上设的），
+             * 对齐后 sh=1616 > 屏幕 1600，**sh 完全没被夹** ——
+             * dcapd2 会去抓屏幕外的像素，画面下半截是黑的。
+             */
+            sw = ((sw + 15) / 16) * 16;
+            sh = ((sh + 15) / 16) * 16;
+            if (sw > scrW) sw = ((scrW + 15) / 16) * 16;
+            if (sh > scrH) sh = (scrH / 16) * 16;   /* 向下取，避免超界 */
+            if (sw <= 0) sw = (scrW / 16) * 16;
+            if (sh <= 0) sh = 16;
+
+            /* 再夹起点（此时尺寸已定） */
             if (sx < 0) sx = 0;
             if (sy < 0) sy = 0;
-            Log.i(TAG, "App 截取区生效：源 " + sw + "×" + sh + " @(" + sx + "," + sy + ")");
+            if (sx + sw > scrW) sx = Math.max(0, scrW - sw);
+            if (sy + sh > scrH) sy = Math.max(0, scrH - sh);
+
+            Log.i(TAG, "App 截取区生效：源 " + sw + "×" + sh + " @(" + sx + "," + sy
+                    + ")  屏幕 " + scrW + "×" + scrH + "  窗口 "
+                    + win[0] + "," + win[1] + " " + win[2] + "×" + win[3]);
             return new int[]{sx, sy, sw, sh};
         }
 
         if (!mapMode) return win;
 
-        LayerConfig lc = LayerConfig.loadFromPrefs(ctx, OUT_W, OUT_H);
+        LayerConfig lc = LayerConfig.loadFromPrefs(ctx, getOutputW(), getOutputH());
         if (lc == null || lc.w <= 0 || lc.h <= 0
-                || lc.w >= OUT_W || lc.h >= OUT_H) {
+                || lc.w >= getOutputW() || lc.h >= getOutputH()) {
             return win;   /* 无遮罩或遮罩是整屏 → 不裁 */
         }
 
@@ -1160,10 +1287,10 @@ public class MirrorController {
             return new int[]{sx, sy, sw, sh};
         }
 
-        double px0 = (double) lc.x / OUT_W;
-        double py0 = (double) lc.y / OUT_H;
-        double px1 = (double) (lc.x + lc.w) / OUT_W;
-        double py1 = (double) (lc.y + lc.h) / OUT_H;
+        double px0 = (double) lc.x / getOutputW();
+        double py0 = (double) lc.y / getOutputH();
+        double px1 = (double) (lc.x + lc.w) / getOutputW();
+        double py1 = (double) (lc.y + lc.h) / getOutputH();
 
         double maskAspect = (double) lc.w / lc.h;
         double winAspect = (double) win[2] / win[3];
@@ -1330,6 +1457,51 @@ public class MirrorController {
         return windowRect(pkg);
     }
 
+    /** 整屏像素（wm size）。**只在后台线程调** —— 内部走 adb socket。 */
+    private int[] cachedScreenPx;
+    public int[] getScreenPx() {
+        if (cachedScreenPx == null) {
+            cachedScreenPx = screenSize();
+        }
+        return cachedScreenPx;
+    }
+
+    /**
+     * **供 UI 线程安全读取屏幕尺寸**（不碰 adb）。
+     *
+     * 为什么必须有这个：`getScreenPx()` 内部走 `AdbShell.exec("wm size")`，
+     * 那是**真实 socket 连接**。在 UI 线程调它会卡几百毫秒起，
+     * 严重时 ANR（Android 禁止主线程做网络操作）。
+     *
+     * 实测隐患：MainActivity 里有 5 处（初始化预览、同步配置、
+     * 读取窗口、应用投屏）都是在主线程调的 —— 打开面板就卡一下。
+     *
+     * 这个版本只读缓存，没缓存就返回本车主屏的已知默认值（2560×1600）。
+     * 缓存由后台线程（loop 里 / 应用投屏的后台任务）填。
+     */
+    private static final int[] DEFAULT_SCREEN_PX = {2560, 1600};
+    public int[] getScreenPxSafe() {
+        int[] c = cachedScreenPx;
+        return (c != null && c[0] > 0 && c[1] > 0) ? c : DEFAULT_SCREEN_PX;
+    }
+
+    /** 后台线程预热屏幕尺寸缓存（打开面板时调一次） */
+    public void warmScreenPxAsync() {
+        if (cachedScreenPx != null) return;
+        new Thread(() -> {
+            try {
+                cachedScreenPx = screenSize();
+            } catch (Throwable ignored) {
+            }
+        }, "warm-screenpx").start();
+    }
+
+    /** 清掉屏幕尺寸缓存（分辨率变化时调） */
+    public static void clearScreenPxCache() {
+        MirrorController c = sActive;
+        if (c != null) c.cachedScreenPx = null;
+    }
+
     private int[] windowRect(String pkg) {
         try {
             String cmd = "dumpsys window windows | awk '/Window\\{/{b=($0 ~ /" + pkg
@@ -1396,6 +1568,11 @@ public class MirrorController {
         }
     }
 
+    /** 供 UI 读取主屏前台包名（截屏前确认目标 App 真的在前台） */
+    public String foregroundPkgPublic() {
+        return foregroundPkg();
+    }
+
     /** 取主屏（display 0）的前台包名 */
     private String foregroundPkg() {
         try {
@@ -1428,6 +1605,41 @@ public class MirrorController {
     }
 
     // ============================== 参数与统计 ==============================
+
+    /**
+     * **重拉 dcapd2**（按当前配置重新起进程）。
+     *
+     * 供 UI 改完「截取 App 页面」后调用 —— 只写配置文件是不够的：
+     * loop() 拉起 dcapd2 的条件是 `fgIsTarget && !daemonAlive()`，
+     * **进程活着就不重起**，抓取参数永远是旧的。
+     * 用户看到的就是"截取页面不生效"。
+     *
+     * ══════════════════════════════════════════════════════════════
+     * **用 sActive 而不是 this**（2026-11-03 排查出的隐患）
+     * ══════════════════════════════════════════════════════════════
+     * MainActivity 持有的 mirror 可能是个旧实例（onCreate 时从静态
+     * `prev` 取来的），而真正在跑投屏的是 `sActive`。
+     * 如果这里判断 `this.running`，旧实例的字段是 false →
+     * 直接 return，dcapd2 根本不重拉 —— 又是"不生效"。
+     *
+     * 所以统一走静态的活跃实例。
+     *
+     * 必须在后台线程调用（AdbShell.exec 会开 socket）。
+     */
+    public boolean restartDaemonNow() {
+        MirrorController c = sActive;
+        if (c == null || !c.running) {
+            Log.i(TAG, "未在投屏（sActive=" + (c != null) + "），"
+                    + "restartDaemonNow 跳过（交给 startCast 起新进程）");
+            return false;
+        }
+        synchronized (c.cleanupLock) {
+            c.ensureBinary();
+            int[] rect = c.lastRect != null ? c.lastRect : new int[]{0, 0, getOutputW(), getOutputH()};
+            Log.i(TAG, "按新配置重拉 dcapd2（用 sActive 实例）");
+            return c.launchDaemon(rect);
+        }
+    }
 
     public static int getFps() {
         return fps;
@@ -1481,6 +1693,7 @@ public class MirrorController {
     public void setCodec(int c) {
         codec = (c == CODEC_H264) ? CODEC_H264 : CODEC_BGRA;
         if (ctx != null) prefs(ctx).edit().putInt(PREF_CODEC, codec).apply();
+        markCodecSwitchStart();
 
         new Thread(() -> {
             try {
@@ -1492,6 +1705,83 @@ public class MirrorController {
                 Log.w(TAG, "写编码档文件失败: " + t.getMessage());
             }
         }, "codec-switch").start();
+    }
+
+    /**
+     * 等 dcapd2 **真的**切完编码档再返回（最多 3 秒）。
+     *
+     * ══════════════════════════════════════════════════════════════
+     * 为什么必须等（2026-11-03 "H.264 不按原遮罩位置投屏"的根因）
+     * ══════════════════════════════════════════════════════════════
+     * setCodec() 只是写了一个数字文件，dcapd2 **每 500ms 才轮询一次**。
+     * 而 MainActivity 切档后立刻 applyFully() → 按**新档位**算 destination
+     * 并下发 setLayerRect。两条路赛跑：
+     *   · CP 已按 H.264 把图层缩到遮罩矩形
+     *   · dcapd2 还在吐 BGRA（整块画布 + alpha 挖洞）
+     *   → 画布被压进那块矩形，位置和大小全不对。
+     * 要等下一次「保存并应用」才会纠正 —— 正是用户反馈的现象。
+     *
+     * 这里用日志里的切换完成标记来判定，等不到就退化成固定等待。
+     *
+     * 必须在后台线程调用。
+     */
+    public static void awaitCodecSwitched(long maxMs) {
+        final long baseline = sCodecLogBaseline;
+        long t0 = SystemClock.elapsedRealtime();
+        while (SystemClock.elapsedRealtime() - t0 < maxMs) {
+            try {
+                /*
+                 * 只数**基线之后**的行 —— 日志里本来就有历史切换记录，
+                 * 从头 grep 会永远命中，等于没等。
+                 */
+                String cmd = baseline > 0
+                        ? "tail -n +" + (baseline + 1) + " " + LOGF
+                            + " 2>/dev/null | grep -c '编码档切换完成'"
+                        : "tail -n 40 " + LOGF + " 2>/dev/null | grep -c '编码档切换完成'";
+                String out = AdbShell.exec(cmd, 2000);
+                if (out != null) {
+                    int n = 0;
+                    try {
+                        n = Integer.parseInt(out.trim().replaceAll("[^0-9]", ""));
+                    } catch (Throwable ignored) {
+                    }
+                    if (n > 0) {
+                        Log.i(TAG, "dcapd2 已完成编码档切换（"
+                                + (SystemClock.elapsedRealtime() - t0) + "ms）");
+                        return;
+                    }
+                }
+            } catch (Throwable ignored) {
+            }
+            try {
+                Thread.sleep(200);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return;
+            }
+        }
+        /* 等不到标记：固定再等一拍，至少让 dcapd2 赶上一次 500ms 轮询 */
+        try {
+            Thread.sleep(600);
+        } catch (InterruptedException ignored) {
+        }
+        Log.w(TAG, "没等到编码档切换标记，按固定延迟继续（" + maxMs + "ms）");
+    }
+
+    /** 切档前记下日志基线行号（只在后台线程写） */
+    private static volatile long sCodecLogBaseline = 0;
+
+    private static void markCodecSwitchStart() {
+        try {
+            String out = AdbShell.exec("wc -l < " + LOGF + " 2>/dev/null", 2000);
+            if (out != null) {
+                sCodecLogBaseline = Long.parseLong(
+                        out.trim().replaceAll("[^0-9]", "").isEmpty()
+                                ? "0" : out.trim().replaceAll("[^0-9]", ""));
+            }
+        } catch (Throwable ignored) {
+            sCodecLogBaseline = 0;
+        }
     }
 
     /** 读 dcapd2 的 STAT 行：帧率 / 图块 / 带宽 */

@@ -121,6 +121,16 @@ public class MainActivity extends Activity {
         mirror = (prev != null) ? prev : new MirrorController(this, cpManager);
         if (MirrorController.isMirroring()) running = true;
 
+        /*
+         * **先读回 CP 的真实分辨率**（2026-11-03）。
+         *
+         * 画布尺寸不再写死 1920×532 —— 那是"遮罩铺满网格，仪表却铺不满"
+         * 的根因：CP 屏如果不是这个尺寸，图层只盖住上面一截。
+         * 这里在读 maskCfg 之前把上次记住的分辨率装进静态字段，
+         * 后面 buildMaskPanel 才能按正确画布尺寸算遮罩。
+         */
+        MirrorController.loadOutputSize(this);
+
         DashcastSenderService.setDisplayReadyListener(displayId ->
                 mainHandler.post(() -> onDisplayReady(displayId)));
         DashcastSenderService.setStatsListener((fps, kbps, tiles, connected) ->
@@ -485,7 +495,7 @@ public class MainActivity extends Activity {
             int savedView = getSharedPreferences(PREF, MODE_PRIVATE)
                     .getInt("map_view", LayerConfig.VIEW_MID);
             if (MirrorController.loadMapMode(this) && savedView != LayerConfig.VIEW_MID) {
-                maskCfg.applyView(savedView, 1920, 532);
+                maskCfg.applyView(savedView, MirrorController.getOutputW(), MirrorController.getOutputH());
                 syncMaskControls();
                 refreshMask();
             }
@@ -665,19 +675,48 @@ public class MainActivity extends Activity {
     private LinearLayout[] maskPresetBtns;      /* 三个预设按钮 */
     private TextView maskLastSliderVal;
 
-    /* ── App 页面截取区控件（2026-11-03 新增）── */
-    private SeekBar appCropSbX, appCropSbY, appCropSbW, appCropSbH;
+    /* ── App 页面截取区控件（方案 D：预览区直接拖框）── */
+    private LayerPreviewView appCropPreview;
     private LinearLayout appCropFollow, appCropManual;
     private LinearLayout appCropFitCenter, appCropFitFill;
-    private TextView appCropHint, appCropRatio;
+    private TextView appCropHint, appCropHint2, appCropRatio;
+    private android.widget.CheckBox appCropSyncBox;
+    private android.widget.CheckBox appCropEnableBox;
     private boolean appCropFollowMode = true;
-    /** 初始化滑块时抑制回调，避免 setProgress 触发 onAppCropChanged 递归 */
-    private boolean appCropInit = false;
+
+    /* 编码档能力提示（H.264 档下列出哪些功能不生效） */
+    private TextView maskAlphaWarn;
+
+    /**
+     * 把画布尺寸对齐到 CP 真实分辨率（并保持"原来铺满的仍然铺满"）。
+     *
+     * 「遮罩铺满网格、仪表却铺不满」的根因就是画布写死 1920×532。
+     * 一切"铺满"相关的动作都先走这里。
+     */
+    private void syncCanvasToOutput() {
+        if (maskCfg == null) return;
+        int w = MirrorController.getOutputW();
+        int h = MirrorController.getOutputH();
+        if (maskCfg.canvasW == w && maskCfg.canvasH == h) return;
+        boolean wasFull = maskCfg.x == 0 && maskCfg.y == 0
+                && maskCfg.w == maskCfg.canvasW && maskCfg.h == maskCfg.canvasH;
+        maskCfg.canvasW = w;
+        maskCfg.canvasH = h;
+        if (wasFull) {
+            maskCfg.w = w;
+            maskCfg.h = h;
+        }
+        maskCfg.sanitize();
+        if (maskPreview != null) maskPreview.invalidate();
+        appendLog("画布对齐仪表分辨率 → " + w + "×" + h);
+    }
 
     /** 遮罩面板：预览 + 参数滑块 + 保存/取消，全部内嵌在首页右栏 */
     private void buildMaskPanel(LinearLayout col) {
-        maskCfg = LayerConfig.loadFromPrefs(this, 1920, 532);
+        maskCfg = LayerConfig.loadFromPrefs(this, MirrorController.getOutputW(), MirrorController.getOutputH());
         maskFps = MirrorController.getFps();
+        /* 载入时先把画布尺寸对齐一次（CP 分辨率可能变过） */
+        syncCanvasToOutput();
 
         /* 标题 */
         LinearLayout head = new LinearLayout(this);
@@ -842,6 +881,59 @@ public class MainActivity extends Activity {
         });
         r1.addView(maskBtnFit, rowLp(1f));
 
+        /*
+         * ══════════════════════════════════════════════════════════════
+         * **「铺满仪表」按钮**（2026-11-03 新增）
+         * ══════════════════════════════════════════════════════════════
+         *
+         * 用户反馈：遮罩已经在网格里铺满，仪表上却还是不满。
+         *
+         * 根因有两层：
+         *   ① 「等比」模式（fit=1）会让画面缩在遮罩中间留黑边 ——
+         *      用户看到"遮罩占满了，画面却只占中间一块"
+         *   ② H.264 档 16 对齐：遮罩 1920×532 → 编码 1920×528，
+         *      差 4px（肉眼几乎看不出，但确实不是严丝合缝）
+         *
+         * 这个按钮一键把两件事都做对：
+         *   · 遮罩 = 整个画布（0,0 1920×532）
+         *   · fit = 0（铺满，不留黑边）
+         *   · 顺手同步到配置文件与 CP 图层
+         */
+        r1.addView(chipButton("铺满仪表", v -> {
+            /*
+             * **先把画布尺寸对齐到 CP 真实分辨率，再铺满**（2026-11-03）。
+             *
+             * 用户的原话「遮罩尺寸无法铺满仪表盘（明明遮罩尺寸已经铺满网格了）」：
+             * 网格画的是画布，画布原来是写死的 1920×532；CP 屏不是这个尺寸时
+             * 图层就只盖住一截。现在按 CP 实测尺寸重算画布，再一键铺满，
+             * 才是真的"铺满仪表"。
+             */
+            syncCanvasToOutput();
+            maskCfg.x = 0;
+            maskCfg.y = 0;
+            maskCfg.w = maskCfg.canvasW;
+            maskCfg.h = maskCfg.canvasH;
+            maskCfg.fit = 0;
+            maskCfg.enabled = true;
+            maskCfg.sanitize();
+            /* sanitize 按 x/y/w/h 重算 canvasFill；这里确实是铺满，明确置位 */
+            maskCfg.canvasFill = true;
+            ((TextView) maskBtnFit.getChildAt(0)).setText(fitLabel());
+            refreshMask();
+            updateAppCropTexts();
+            appendLog("遮罩 → 铺满仪表 " + maskCfg.canvasW + "×" + maskCfg.canvasH);
+            /* 后台落盘 + 同步 CP 图层，投屏中会立刻生效 */
+            final LayerConfig snap = maskCfg;
+            final android.content.Context appCtx = getApplicationContext();
+            new Thread(() -> {
+                try {
+                    snap.applyFully(appCtx);
+                } catch (Throwable ex) {
+                    Log.w(TAG, "铺满仪表下发失败: " + ex);
+                }
+            }, "fill-dash").start();
+        }), rowLp(1f));
+
         r1.addView(chipButton("放大", v -> maskPreview.setZoomed(
                 !maskPreview.isZoomed())), rowLp(1f));
         r1.addView(chipButton("帧率 " + maskFps, v -> {
@@ -857,6 +949,28 @@ public class MainActivity extends Activity {
         }), rowLp(1f));
         col.addView(r1);
 
+        /*
+         * ══════════════════════════════════════════════════════════════
+         * **依赖 alpha 的功能在 H.264 档不生效，如实告知**（2026-11-03）
+         * ══════════════════════════════════════════════════════════════
+         *
+         * 排查结论（读 layer_mask.c 确认）：
+         *   形状（圆角/梯形/椭圆）、四角圆角、梯形上下、羽化、边框，
+         *   全部靠**写 alpha 通道**实现（dc_layer_apply 里改 p[3]）。
+         *   而 H.264 是 YUV420，**没有 alpha**，编码时直接丢弃。
+         *
+         *   所以 H.264 档下这些控件拖了完全没反应 —— 用户容易以为是 bug。
+         *   另外 fit=1（等比居中）也被 dcapd2 硬编码忽略（见 c 文件第 372 行）。
+         *
+         * 方案：置灰 + 醒目提示。诚实说明比让人白试好。
+         */
+        maskAlphaWarn = new TextView(this);
+        maskAlphaWarn.setTextSize(12);
+        maskAlphaWarn.setTextColor(getColor(R.color.state_warn));
+        maskAlphaWarn.setPadding(dp(4), dp(6), dp(4), dp(2));
+        maskAlphaWarn.setLineSpacing(0, 1.15f);
+        col.addView(maskAlphaWarn);
+
         /* 参数滑块（两列网格） */
         col.addView(maskSection("网格与 DPI"));
         /* 参数滑块：3 列 × 4 行（10 个参数） */
@@ -866,9 +980,21 @@ public class MainActivity extends Activity {
         maskSbGrid = addMaskSlider(g0, "网格", 4, 128, maskCfg.grid, "px",
                 v -> { maskCfg.grid = v; refreshMask(); });
         maskTvGrid = maskLastSliderVal;
-        maskSbDpi = addMaskSlider(g0, "DPI", 80, 480, maskCfg.dpi, "",
+        /*
+         * DPI —— **纯预留参数，不影响任何实际输出**（2026-11-03 排查确认）。
+         *
+         * 它会被解析进 LayerConfig、写进 dcapd2.layer，但 **dcapd2 和
+         * layer_mask.c 里没有任何地方读它**（grep 全项目只有 parse 那一行）。
+         * 真正决定画面尺寸的是：抓取区 srcW×srcH + 遮罩 w×h。
+         *
+         * 保留控件（档案里记载它是协议预留字段，以后若做密度相关缩放会用），
+         * 但置灰并改文案，避免用户以为"调 DPI 能改大小"。
+         */
+        maskSbDpi = addMaskSlider(g0, "DPI（预留）", 80, 480, maskCfg.dpi, "",
                 v -> { maskCfg.dpi = v; refreshMask(); });
         maskTvDpi = maskLastSliderVal;
+        maskSbDpi.setEnabled(false);
+        maskSbDpi.setAlpha(0.42f);
         col.addView(g0);
 
         LinearLayout g1 = grid2();
@@ -918,7 +1044,7 @@ public class MainActivity extends Activity {
         r2.setLayoutParams(r2Lp);
 
         r2.addView(chipButton("取消（还原）", v -> {
-            maskCfg.copyFrom(LayerConfig.loadFromPrefs(this, 1920, 532));
+            maskCfg.copyFrom(LayerConfig.loadFromPrefs(this, MirrorController.getOutputW(), MirrorController.getOutputH()));
             maskFps = MirrorController.getFps();
             syncMaskControls();
             refreshMask();
@@ -931,6 +1057,13 @@ public class MainActivity extends Activity {
         maskPreview.invalidate();
         refreshMaskInfo();
         refreshPresetBtns();
+
+        /*
+         * 面板搭好了，按当前编码档刷新一次可用性 ——
+         * 否则用户在 H.264 档下进来，控件是亮的但拖了没反应。
+         */
+        applyAlphaDependentAvailability(
+                MirrorController.getCodec() == MirrorController.CODEC_H264);
     }
 
     private String shapeLabel() {
@@ -940,7 +1073,11 @@ public class MainActivity extends Activity {
     }
 
     private String fitLabel() {
-        return maskCfg.fit == 0 ? "铺满" : "等比";
+        /*
+         * 文案直接说明后果 —— 用户反馈"遮罩铺满了仪表却不满"，
+         * 就是因为选了「等比」却不知道它会留黑边。
+         */
+        return maskCfg.fit == 0 ? "铺满 ✓" : "等比（留边）";
     }
 
     private LinearLayout maskSection(String text) {
@@ -1006,6 +1143,68 @@ public class MainActivity extends Activity {
 
         card.addView(head);
 
+        /*
+         * ══════════════════════════════════════════════════════════════
+         * **总开关：是否启用 App 页面截取**（默认关闭）
+         * ══════════════════════════════════════════════════════════════
+         *
+         * 关（默认）= 铺满遮罩尺寸，抓整个窗口，行为和以前一致。
+         * 开 = 按 srcX/Y/W/H 只抓框选的那一块。
+         *
+         * 为什么默认关：大部分用户只想"把 App 投满仪表"，
+         * 默认开会让新用户困惑"为什么只投了一小块"。
+         *
+         * 放在标题下方独立一行（不折叠），一眼看到当前状态。
+         */
+        appCropEnableBox = new android.widget.CheckBox(this);
+        appCropEnableBox.setText("启用页面截取（关闭 = 铺满遮罩）");
+        appCropEnableBox.setTextSize(13);
+        appCropEnableBox.setTextColor(getColor(R.color.content_primary));
+        appCropEnableBox.setPadding(dp(4), dp(4), 0, dp(2));
+        boolean enablePref = getSharedPreferences(PREF, MODE_PRIVATE)
+                .getBoolean("app_crop_enabled", false);
+        appCropEnableBox.setChecked(enablePref);
+        appCropEnableBox.setOnCheckedChangeListener((b, checked) -> {
+            getSharedPreferences(PREF, MODE_PRIVATE).edit()
+                    .putBoolean("app_crop_enabled", checked).apply();
+            if (!checked) {
+                /* 关掉时恢复整窗口，投屏立刻回到铺满 */
+                resetAppCropToFull();
+            }
+            appendLog("页面截取 " + (checked ? "开启" : "关闭（铺满遮罩）"));
+            updateAppCropEnableState();
+
+            /*
+             * **开关一变就要重新下发**（2026-11-03 修复）。
+             *
+             * 原来这里只写了 prefs —— 而 prefs 只在「应用并投屏」或
+             * 「保存并应用」时才被写进 dcapd2.layer / CP 图层。
+             * 后果：用户勾上开关、拖好框、以为生效了，
+             * 实际 dcapd2 还在按旧参数抓全屏。
+             *
+             * 这正是"截取 app 页面尺寸无法生效"的直接原因：
+             * 开关只是改了个布尔值，没有任何一方真正用上它。
+             *
+             * 现在：凡是正在投屏，就立刻 applyFully + 重拉 dcapd2，
+             * 和点「应用并投屏」走同一条路径。
+             */
+            if (MirrorController.isMirroring()) {
+                final LayerConfig snap = maskCfg;
+                final android.content.Context appCtx = getApplicationContext();
+                new Thread(() -> {
+                    try {
+                        snap.applyFully(appCtx);
+                        mirror.restartDaemonNow();
+                        Log.i(TAG, "截取开关变化已下发（enabled=" + checked + "）");
+                    } catch (Throwable ex) {
+                        Log.w(TAG, "截取开关下发失败: " + ex);
+                    }
+                }, "crop-toggle-apply").start();
+                setStatus("状态：截取开关已" + (checked ? "开启" : "关闭") + "，正在刷新…");
+            }
+        });
+        card.addView(appCropEnableBox);
+
         /* ── 可折叠的正文 ── */
         LinearLayout body = new LinearLayout(this);
         body.setOrientation(LinearLayout.VERTICAL);
@@ -1028,18 +1227,43 @@ public class MainActivity extends Activity {
         appCropHint.setPadding(dp(4), dp(6), 0, 0);
         body.addView(appCropHint);
 
-        /* 四滑块（两列布局，省高度） */
-        LinearLayout row1 = new LinearLayout(this);
-        row1.setOrientation(LinearLayout.HORIZONTAL);
-        appCropSbX = addMaskSlider(row1, "X", 0, 2560, 0, "", v -> onAppCropChanged());
-        appCropSbY = addMaskSlider(row1, "Y", 0, 1440, 0, "", v -> onAppCropChanged());
-        body.addView(row1);
+        /*
+         * ── 方案 D：直接在预览区拖框（不再用四个滑块）──
+         *
+         * 为什么换成拖框：
+         *   滑块要用户心算"屏幕上哪个坐标对应 App 的哪一块"，
+         *   而且四个数之间互相牵制（X+W 不能超屏幕）。
+         *   拖框是所见即所得：框住哪块就是抓哪块。
+         *
+         * 这里复用一个独立的 LayerPreviewView（appCropPreview），
+         * 切到它的 appCropMode —— 那个模式画的是**屏幕坐标系**
+         * （2560×1600 缩略 + 橙色截取框 + 灰色 App 窗口参考框），
+         * 而上方的 maskPreview 画的是**画布坐标系**（1920×532 遮罩）。
+         * 两个 View 各管一套坐标，互不干扰。
+         */
+        appCropPreview = new LayerPreviewView(this, maskCfg);
+        appCropPreview.setAppCropMode(true, mirror.getScreenPxSafe());
+        appCropPreview.setOnGeometryChanged(c -> {
+            /* 拖动中实时刷新只读文案与比例提示 */
+            updateAppCropTexts();
+        });
+        FrameLayout cropBox = new FrameLayout(this);
+        cropBox.setBackgroundColor(getColor(R.color.surface_deep));
+        LinearLayout.LayoutParams cropLp = new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, dp(420));   /* 300→420，拖拽更精确 */
+        cropLp.setMargins(0, dp(6), 0, dp(4));
+        cropBox.setLayoutParams(cropLp);
+        cropBox.addView(appCropPreview, new FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT,
+                FrameLayout.LayoutParams.MATCH_PARENT));
+        body.addView(cropBox);
 
-        LinearLayout row2 = new LinearLayout(this);
-        row2.setOrientation(LinearLayout.HORIZONTAL);
-        appCropSbW = addMaskSlider(row2, "W", 16, 2560, 2560, "", v -> onAppCropChanged());
-        appCropSbH = addMaskSlider(row2, "H", 16, 1440, 1440, "", v -> onAppCropChanged());
-        body.addView(row2);
+        /* 只读的坐标文案（替代四个滑块，仍要让用户看到精确值） */
+        appCropHint2 = new TextView(this);
+        appCropHint2.setTextSize(12);
+        appCropHint2.setTextColor(getColor(R.color.content_secondary));
+        appCropHint2.setPadding(dp(4), dp(2), 0, dp(2));
+        body.addView(appCropHint2);
 
         /* 比例提示 */
         appCropRatio = new TextView(this);
@@ -1047,6 +1271,81 @@ public class MainActivity extends Activity {
         appCropRatio.setTextColor(getColor(R.color.content_secondary));
         appCropRatio.setPadding(dp(4), dp(6), 0, dp(4));
         body.addView(appCropRatio);
+
+        /*
+         * ── 「同步遮罩比例」勾选框 ──
+         *
+         * 为什么需要这个开关：
+         *   dcapd2 的编码尺寸 = 遮罩尺寸，抓取区只决定"抓屏幕哪块"，
+         *   两者比例不一致时画面会被拉伸（实测 24% 横压）。
+         *
+         *   但自动同步会把用户精心调好的遮罩改掉（面积守恒重算宽高），
+         *   而且没有恢复入口 —— 所以做成可关。
+         *
+         *   开：画面永不变形，代价是遮罩跟着变
+         *   关：保留用户的遮罩，但比例不匹配会变形（界面会警告）
+         */
+        LinearLayout syncRow = new LinearLayout(this);
+        syncRow.setOrientation(LinearLayout.HORIZONTAL);
+        syncRow.setGravity(Gravity.CENTER_VERTICAL);
+        syncRow.setPadding(dp(4), dp(2), 0, dp(2));
+
+        appCropSyncBox = new android.widget.CheckBox(this);
+        appCropSyncBox.setText("同步遮罩比例（防变形）");
+        appCropSyncBox.setTextSize(12);
+        appCropSyncBox.setTextColor(getColor(R.color.content_secondary));
+        boolean syncPref = getSharedPreferences(PREF, MODE_PRIVATE)
+                .getBoolean("layer_sync_aspect", true);
+        appCropSyncBox.setChecked(syncPref);
+        appCropPreview.setSyncAspectEnabled(syncPref);
+        appCropSyncBox.setOnCheckedChangeListener((b, checked) -> {
+            if (appCropPreview != null) appCropPreview.setSyncAspectEnabled(checked);
+            getSharedPreferences(PREF, MODE_PRIVATE).edit()
+                    .putBoolean("layer_sync_aspect", checked).apply();
+            appendLog("遮罩比例同步 " + (checked ? "开" : "关"));
+            /* 勾上时立刻同步一次，让用户马上看到效果 */
+            if (checked && appCropPreview != null) {
+                appCropPreview.syncMaskAspectNow();
+                updateAppCropTexts();
+            }
+        });
+        syncRow.addView(appCropSyncBox, rowLp(1f));
+        body.addView(syncRow);
+
+        /*
+         * ── 「吸附网格」勾选框（2026-11-03 新增）──
+         *
+         * 用户原话：「拖动不好拖，拖不出自己想要的效果」。
+         *
+         * 根因：拖动**每一帧**都按 grid（默认 32px）取整 ——
+         * 手指移几十像素画面不动，然后突然跳一格；想微调 10px 做不到。
+         *
+         * 现在默认只在松手时吸附一次，拖动过程跟手。
+         * 想彻底像素级精确就把这个勾去掉。
+         */
+        LinearLayout snapRow = new LinearLayout(this);
+        snapRow.setOrientation(LinearLayout.HORIZONTAL);
+        snapRow.setGravity(Gravity.CENTER_VERTICAL);
+        snapRow.setPadding(dp(4), 0, 0, dp(2));
+
+        android.widget.CheckBox snapBox = new android.widget.CheckBox(this);
+        snapBox.setText("吸附网格（关掉 = 像素级精确）");
+        snapBox.setTextSize(12);
+        snapBox.setTextColor(getColor(R.color.content_secondary));
+        boolean snapPref = getSharedPreferences(PREF, MODE_PRIVATE)
+                .getBoolean("layer_snap_grid", true);
+        snapBox.setChecked(snapPref);
+        maskPreview.setSnapEnabled(snapPref);
+        appCropPreview.setSnapEnabled(snapPref);
+        snapBox.setOnCheckedChangeListener((b, checked) -> {
+            maskPreview.setSnapEnabled(checked);
+            if (appCropPreview != null) appCropPreview.setSnapEnabled(checked);
+            getSharedPreferences(PREF, MODE_PRIVATE).edit()
+                    .putBoolean("layer_snap_grid", checked).apply();
+            appendLog("网格吸附 " + (checked ? "开" : "关（像素级精确）"));
+        });
+        snapRow.addView(snapBox, rowLp(1f));
+        body.addView(snapRow);
 
         /* 适配方式：等比居中 / 裁满铺 */
         LinearLayout fitRow = new LinearLayout(this);
@@ -1070,6 +1369,87 @@ public class MainActivity extends Activity {
         actRow.addView(btnApply, rowLp(1f));
         body.addView(actRow);
 
+        /*
+         * 「恢复整页」按钮 —— 用户反馈"拖框太难用，想一键回到铺满"。
+         *
+         * 把截取区设成整屏（0,0 2560×1600）并立刻下发，
+         * 效果等同于"不裁，铺满遮罩"。比手动拖框回到边缘可靠得多。
+         */
+        LinearLayout resetRow = new LinearLayout(this);
+        resetRow.setOrientation(LinearLayout.HORIZONTAL);
+        LinearLayout btnReset = iconButton("恢复整页（铺满）", "↺",
+                R.drawable.btn_secondary, R.color.content_primary,
+                v -> {
+                    resetAppCropToFull();
+                    setAppCropMode(false);
+                    setStatus("状态：截取区已恢复整页（铺满遮罩）");
+                    appendLog("恢复整页");
+                });
+        resetRow.addView(btnReset, rowLp(1f));
+        body.addView(resetRow);
+
+        /*
+         * ══════════════════════════════════════════════════════════════
+         * 【方案 E】预设比例一键框选
+         * ══════════════════════════════════════════════════════════════
+         *
+         * 拖框最难的地方是"不知道该框多大"。大多数场景其实只要
+         * "框成某个常见比例"，点一下自动算出该比例能放下的最大区域。
+         *
+         * 3.61:1 是仪表原生比例（1920/532），最常用 —— 点了就是
+         * "整屏宽度、高度按仪表比例裁"，一步到位。
+         */
+        /*
+         * 比例按钮：每行 3 个，按需换行。
+         *
+         * 原来那段写法很绕（用 ri>2 / ri==3 / ri==length-1 三个条件
+         * 交叉判断何时新建、何时入树），虽然能跑但极易改坏。
+         * 改成直白的"每 3 个开新行"，一眼能看懂。
+         */
+        LinearLayout ratioRow = null;
+        for (int ri = 0; ri < LayerPreviewView.RATIO_NAMES.length; ri++) {
+            if (ri % 3 == 0) {
+                ratioRow = new LinearLayout(this);
+                ratioRow.setOrientation(LinearLayout.HORIZONTAL);
+                body.addView(ratioRow);
+            }
+            final int idx = ri;
+            LinearLayout b = chipButton(LayerPreviewView.RATIO_NAMES[ri], v -> {
+                if (appCropPreview == null) return;
+                appCropPreview.applyRatio(idx);
+                updateAppCropTexts();
+                appendLog("按比例框选 → " + LayerPreviewView.RATIO_NAMES[idx]
+                        + "  " + maskCfg.srcW + "×" + maskCfg.srcH);
+            });
+            if (ratioRow != null) ratioRow.addView(b, rowLp(1f));
+        }
+
+        /*
+         * ══════════════════════════════════════════════════════════════
+         * 【方案 C】实时截屏当底图
+         * ══════════════════════════════════════════════════════════════
+         *
+         * 点一下截当前屏幕，铺在预览区当底图 —— 用户直接"看着真实
+         * App 界面框选"，而不是对着空白网格猜坐标。
+         *
+         * 为什么不自动刷：截屏走 adb，每秒一次会拖慢界面；
+         * 用户调整 App 界面后主动点一次更可控。
+         */
+        LinearLayout shotRow = new LinearLayout(this);
+        shotRow.setOrientation(LinearLayout.HORIZONTAL);
+        LinearLayout btnShot = iconButton("刷新截图（当底图）", "◨",
+                R.drawable.btn_secondary, R.color.content_primary,
+                v -> refreshBackgroundShot());
+        LinearLayout btnShotClear = iconButton("清除底图", "✕",
+                R.drawable.btn_secondary, R.color.content_tertiary,
+                v -> {
+                    if (appCropPreview != null) appCropPreview.setBackgroundShot(null);
+                    appendLog("底图已清除");
+                });
+        shotRow.addView(btnShot, rowLp(2f));
+        shotRow.addView(btnShotClear, rowLp(1f));
+        body.addView(shotRow);
+
         card.addView(body);
 
         /* 点标题切换折叠 */
@@ -1083,13 +1463,23 @@ public class MainActivity extends Activity {
 
         parent.addView(card);
 
+        /*
+         * 初始化：只载入配置，**不自动读目标窗口**。
+         *
+         * 原来这里调 setAppCropMode(true)，它内部会 readTargetWindow()
+         * → 每次打开 App 就起线程走 adb 读窗口，哪怕用户没展开这个区块。
+         * 浪费几百毫秒，还会和投屏主循环抢 adb socket。
+         *
+         * 用户真要用时自己点「跟随窗口」或「读取窗口」即可。
+         */
         syncAppCropFromConfig();
-        setAppCropMode(true);
+        setAppCropModeVisual(true);
+        mirror.warmScreenPxAsync();
     }
 
     /** 从配置里把截取区读进滑块（并按当前目标 App 套用历史值） */
     private void syncAppCropFromConfig() {
-        if (appCropSbX == null) return;
+        if (appCropPreview == null) return;
 
         /* 先看当前目标 App 有没有历史尺寸 */
         boolean applied = false;
@@ -1097,25 +1487,21 @@ public class MainActivity extends Activity {
             applied = maskCfg.applyAppRect(this, targetPkg);
         }
 
-        /* 没历史值：用配置里的（可能来自别的 App 或默认） */
+        /* 没历史值：用配置里的，再不行给个合理的默认（整屏上部 3.6:1 横条） */
         if (!applied) {
-            maskCfg.srcW = maskCfg.srcW > 0 ? maskCfg.srcW : 2560;
-            maskCfg.srcH = maskCfg.srcH > 0 ? maskCfg.srcH : 1440;
+            if (maskCfg.srcW <= 0 || maskCfg.srcH <= 0) {
+                int[] scr = mirror.getScreenPxSafe();
+                int sw = scr[0] > 0 ? scr[0] : 2560;
+                int sh = scr[1] > 0 ? scr[1] : 1600;
+                maskCfg.srcW = sw;
+                maskCfg.srcH = (int) (sw / ((double) MirrorController.getOutputW()
+                        / MirrorController.getOutputH()));
+                if (maskCfg.srcH > sh) maskCfg.srcH = sh;
+                maskCfg.srcX = 0;
+                maskCfg.srcY = (sh - maskCfg.srcH) / 2;
+            }
         }
-
-        /*
-         * addMaskSlider 的 progress 是**偏移量**（`min + p`），
-         * 所以写回时要减掉 min：
-         *   X/Y 的 min=0   → 直接 setProgress
-         *   W/H 的 min=16  → setProgress(v - 16)
-         * 读出来时反过来加。这一点不注意就会"设 2560 显示 2576"。
-         */
-        appCropInit = true;
-        appCropSbX.setProgress(clamp(maskCfg.srcX, 0, 2560) - 0);
-        appCropSbY.setProgress(clamp(maskCfg.srcY, 0, 1440) - 0);
-        appCropSbW.setProgress(clamp(maskCfg.srcW, 16, 2560) - 16);
-        appCropSbH.setProgress(clamp(maskCfg.srcH, 16, 1440) - 16);
-        appCropInit = false;
+        maskCfg.sanitizeCrop(mirror.getScreenPxSafe()[0], mirror.getScreenPxSafe()[1]);
 
         if (appCropHint != null) {
             String pkg = targetPkg == null ? "（未选 App）" : targetPkg;
@@ -1123,23 +1509,23 @@ public class MainActivity extends Activity {
                     ? "✓ 已套用该 App 的历史尺寸：" + pkg
                     : "该 App 无历史尺寸，使用当前值 · " + pkg);
         }
+        appCropPreview.setAppCropMode(true, mirror.getScreenPxSafe());
+        appCropPreview.refresh();
+        updateAppCropTexts();
+    }
+
+    /** 刷新只读文案 + 比例提示 + 重绘预览（拖动和载入时都调） */
+    private void updateAppCropTexts() {
+        if (appCropHint2 != null) {
+            appCropHint2.setText("截取 X=" + maskCfg.srcX + "  Y=" + maskCfg.srcY
+                    + "  W=" + maskCfg.srcW + "  H=" + maskCfg.srcH);
+        }
+        if (appCropPreview != null) appCropPreview.invalidate();
         updateAppCropRatio();
     }
 
     private int clamp(int v, int lo, int hi) {
         return v < lo ? lo : (v > hi ? hi : v);
-    }
-
-    /** 滑块变动：写回 maskCfg，切到手动模式，刷新比例 */
-    private void onAppCropChanged() {
-        if (appCropSbX == null || appCropInit) return;
-        /* progress 是偏移量，读值要加回 min（W/H 的 min=16） */
-        maskCfg.srcX = appCropSbX.getProgress() + 0;
-        maskCfg.srcY = appCropSbY.getProgress() + 0;
-        maskCfg.srcW = appCropSbW.getProgress() + 16;
-        maskCfg.srcH = appCropSbH.getProgress() + 16;
-        if (appCropFollowMode) setAppCropMode(false);
-        updateAppCropRatio();
     }
 
     /** 刷新比例提示（对比仪表比例） */
@@ -1148,7 +1534,7 @@ public class MainActivity extends Activity {
         int w = maskCfg.srcW > 0 ? maskCfg.srcW : 1;
         int h = maskCfg.srcH > 0 ? maskCfg.srcH : 1;
         double r = (double) w / h;
-        double target = (double) MirrorController.OUT_W_PUBLIC / MirrorController.OUT_H_PUBLIC;
+        double target = (double) MirrorController.getOutputW() / MirrorController.getOutputH();
         boolean ok = Math.abs(r - target) < 0.15;
         appCropRatio.setText(String.format("比例 %.2f : 1  %s  仪表 %.2f : 1",
                 r, ok ? "✓" : "⚠", target));
@@ -1157,7 +1543,18 @@ public class MainActivity extends Activity {
     }
 
     /** 跟随窗口 / 手动 切换 */
+    /**
+     * 跟随窗口 / 手动 切换（用户主动点击时用）。
+     * 跟随模式会读目标 App 窗口 —— 这是用户明确要求的动作，
+     * 允许触发（内部在后台线程跑）。
+     */
     private void setAppCropMode(boolean follow) {
+        setAppCropModeVisual(follow);
+        if (follow) readTargetWindow();
+    }
+
+    /** 只改按钮外观与模式标志，不触发任何 adb 动作（初始化时用） */
+    private void setAppCropModeVisual(boolean follow) {
         appCropFollowMode = follow;
         if (appCropFollow != null) {
             appCropFollow.setBackgroundResource(follow
@@ -1167,8 +1564,6 @@ public class MainActivity extends Activity {
             appCropManual.setBackgroundResource(follow
                     ? R.drawable.btn_secondary : R.drawable.btn_selected);
         }
-        /* 跟随模式：立刻去读目标 App 的窗口，填进滑块 */
-        if (follow) readTargetWindow();
     }
 
     /** 适配方式：0=等比居中 1=裁满铺（影响 fit 字段，进而在 recompute_dst 生效） */
@@ -1205,15 +1600,238 @@ public class MainActivity extends Activity {
                     setStatus("状态：读不到窗口（App 可能没在前台）");
                     return;
                 }
-                appCropSbX.setProgress(clamp(rr[0], 0, 2560));
-                appCropSbY.setProgress(clamp(rr[1], 0, 1440));
-                appCropSbW.setProgress(clamp(rr[2], 16, 2560));
-                appCropSbH.setProgress(clamp(rr[3], 16, 1440));
-                onAppCropChanged();
+                appCropPreview.setTargetWindow(rr);
+                maskCfg.srcX = rr[0];
+                maskCfg.srcY = rr[1];
+                maskCfg.srcW = rr[2];
+                maskCfg.srcH = rr[3];
+                maskCfg.sanitizeCrop(mirror.getScreenPxSafe()[0], mirror.getScreenPxSafe()[1]);
+                setAppCropMode(false);
+                updateAppCropTexts();
                 appendLog("读取窗口 → " + rr[2] + "×" + rr[3] + " @(" + rr[0] + "," + rr[1] + ")");
                 setStatus("状态：已读取窗口 " + rr[2] + "×" + rr[3]);
             });
         }, "read-window").start();
+    }
+
+    /**
+     * 是否启用「App 页面截取」。
+     *
+     * 关（默认）= 不裁，抓整个窗口 → 铺满遮罩。
+     * 开 = 按 srcX/Y/W/H 只抓框选的那块。
+     *
+     * 这个开关最终影响 MirrorController.applyMapCrop 里的判定 ——
+     * 那边会读同一个 prefs key，避免两处状态不一致。
+     */
+    static boolean isAppCropEnabled(android.content.Context c) {
+        return c.getSharedPreferences(PREF, MODE_PRIVATE)
+                .getBoolean("app_crop_enabled", false);
+    }
+
+    /** 把截取区恢复成「整屏」= 不裁（等同于关闭截取时的行为） */
+    private void resetAppCropToFull() {
+        int[] scr = mirror.getScreenPxSafe();
+        maskCfg.srcX = 0;
+        maskCfg.srcY = 0;
+        maskCfg.srcW = scr[0] > 0 ? scr[0] : 2560;
+        maskCfg.srcH = scr[1] > 0 ? scr[1] : 1600;
+        maskCfg.sanitizeCrop(scr[0], scr[1]);
+        updateAppCropTexts();
+        appendLog("截取区 → 铺满整个屏幕 " + maskCfg.srcW + "×" + maskCfg.srcH);
+    }
+
+    /** 截取开关变化后，刷新正文区的可用性（关了就把拖框置灰） */
+    private void updateAppCropEnableState() {
+        boolean on = appCropEnableBox != null && appCropEnableBox.isChecked();
+        float alpha = on ? 1f : 0.4f;
+        if (appCropPreview != null) {
+            appCropPreview.setEnabled(on);
+            appCropPreview.setAlpha(alpha);
+        }
+        /* 关的时候顺手把正文折叠起来，界面更干净 */
+        if (!on) {
+            setStatus("状态：页面截取已关闭（投屏将铺满遮罩）");
+        }
+    }
+
+    /**
+     * 【方案 C】截当前屏幕当预览底图。
+     *
+     * ══════════════════════════════════════════════════════════════
+     * 为什么不能直接 `screencap -p | base64 -w0`
+     * ══════════════════════════════════════════════════════════════
+     * 2560×1600 的 PNG 约 2~4 MB，base64 后 3~6 MB 的字符串。
+     * AdbShell.exec 是给短命令设计的（一次性读完、有 soTimeout），
+     * 拿它读几兆的字符串有三个坑：
+     *   · 超时（socket soTimeout 15s，大文件传输可能不够）
+     *   · ByteArrayOutputStream 反复扩容，内存峰值到 25 MB+
+     *   · busybox 的 base64 不一定支持 -w0（不同版本行为不一致）
+     *
+     * 改成**分块读取**：先把 PNG 落到 /sdcard，再按 64KB 一块
+     * `dd | base64` 拉回来，每块只有几十 KB，稳。
+     *
+     * 同时**降采样**：预览区只有 420dp 高，不需要原分辨率。
+     * inSampleSize=2 → 1280×800，位图从 16 MB 降到 4 MB。
+     */
+    private void refreshBackgroundShot() {
+        /*
+         * ══════════════════════════════════════════════════════════════
+         * **先把目标 App 拉到前台再截屏**（2026-11-03 修复）
+         * ══════════════════════════════════════════════════════════════
+         *
+         * 原来直接 `screencap` —— 但用户点这个按钮时，
+         * **前台是 dashcast 自己**（不然他看不到按钮）。
+         * 于是截回来的是 dashcast 的界面，不是目标 App 的画面。
+         * 用户反馈"刷新底图不是对应投屏 App 的内容"就是这个。
+         *
+         * 正确顺序：
+         *   ① 记下自己是不是前台
+         *   ② am start 把目标 App 拉到前台（display 0）
+         *   ③ 等 1.5 秒让它渲染完
+         *   ④ screencap
+         *   ⑤ 再把 dashcast 拉回前台（否则用户回不到设置界面）
+         *
+         * 注意：如果用户没选目标 App，就跳过拉起，直接截当前屏幕。
+         */
+        if (targetPkg == null) {
+            setStatus("状态：请先「选择投屏 App」再刷新底图");
+            return;
+        }
+        setStatus("状态：正在切到目标 App 并截屏…");
+        final String pkg = targetPkg;
+        final String cls = targetCls;
+        new Thread(() -> {
+            android.graphics.Bitmap bmp = null;
+            String tmp = "/sdcard/dc_shot.png";
+            boolean pulled = false;
+            try {
+                /* ① 把目标 App 拉到前台，**并确认真的到位了**再截 */
+                String comp = (cls != null && !cls.isEmpty()) ? (pkg + "/" + cls) : pkg;
+                boolean fgOk = false;
+                for (int attempt = 0; attempt < 3 && !fgOk; attempt++) {
+                    try {
+                        AdbShell.exec("am start --display 0 -n " + comp, 6000);
+                        pulled = true;
+                        /*
+                         * 光 am start 不够：车机负载高时首帧要一两秒，
+                         * 有时 Activity 起得来但窗口还没画完 ——
+                         * 那时截到的还是旧界面（用户看到"底图不是目标 App"）。
+                         * 所以**回读前台包名**确认，没到位就再等再试。
+                         */
+                        for (int wait = 0; wait < 6; wait++) {
+                            Thread.sleep(500);
+                            String fg = mirror.foregroundPkgPublic();
+                            if (pkg.equals(fg)) {
+                                fgOk = true;
+                                /* 前台对了再多等一拍，等它把内容画出来 */
+                                Thread.sleep(700);
+                                break;
+                            }
+                        }
+                    } catch (Throwable t) {
+                        Log.w(TAG, "拉目标 App 前台失败（第 " + (attempt + 1) + " 次）: " + t);
+                    }
+                }
+                if (!fgOk) {
+                    Log.w(TAG, "没能把 " + pkg + " 拉到前台，底图可能不是它的画面");
+                }
+
+                /* ② 截屏落盘 */
+                AdbShell.exec("screencap -p " + tmp, 20000);
+
+                /* ③ 问大小 */
+                String sz = AdbShell.exec("stat -c %s " + tmp, 4000);
+                long size = 0;
+                if (sz != null) {
+                    try {
+                        size = Long.parseLong(sz.trim().replaceAll("[^0-9]", ""));
+                    } catch (Throwable ignored) {
+                    }
+                }
+                if (size <= 0) {
+                    String ls = AdbShell.exec("ls -l " + tmp, 4000);
+                    if (ls != null) {
+                        String[] parts = ls.trim().split("\\s+");
+                        if (parts.length >= 5) {
+                            try {
+                                size = Long.parseLong(parts[4]);
+                            } catch (Throwable ignored) {
+                            }
+                        }
+                    }
+                }
+                if (size <= 0 || size > 12L * 1024 * 1024) {
+                    throw new java.io.IOException("截图大小异常: " + size);
+                }
+
+                /* ④ 分块拉取（每块 64KB） */
+                final int CHUNK_BYTES = 65536;
+                int chunks = (int) ((size + CHUNK_BYTES - 1) / CHUNK_BYTES);
+                java.io.ByteArrayOutputStream all =
+                        new java.io.ByteArrayOutputStream((int) size);
+                for (int i = 0; i < chunks; i++) {
+                    String b64 = AdbShell.exec(
+                            "dd if=" + tmp + " bs=" + CHUNK_BYTES
+                                    + " skip=" + i + " count=1 2>/dev/null | base64",
+                            8000);
+                    if (b64 == null) continue;
+                    b64 = b64.replaceAll("\\s", "");
+                    if (b64.isEmpty()) continue;
+                    try {
+                        byte[] dec = android.util.Base64.decode(
+                                b64, android.util.Base64.DEFAULT);
+                        all.write(dec, 0, dec.length);
+                    } catch (Throwable ignored) {
+                    }
+                }
+
+                /* ⑤ 解码（降采样一半） */
+                byte[] png = all.toByteArray();
+                android.graphics.BitmapFactory.Options opt =
+                        new android.graphics.BitmapFactory.Options();
+                opt.inSampleSize = 2;
+                bmp = android.graphics.BitmapFactory.decodeByteArray(png, 0, png.length, opt);
+                all.close();
+
+                try {
+                    AdbShell.exec("rm -f " + tmp, 3000);
+                } catch (Throwable ignored) {
+                }
+            } catch (Throwable t) {
+                Log.w(TAG, "截屏失败: " + t);
+                try {
+                    AdbShell.exec("rm -f " + tmp, 3000);
+                } catch (Throwable ignored) {
+                }
+            } finally {
+                /*
+                 * ⑥ **无论如何都把 dashcast 拉回前台**。
+                 * 否则用户截完图就停在目标 App 里，回不到设置界面 ——
+                 * 那比"底图不对"更让人困惑。
+                 */
+                if (pulled) {
+                    try {
+                        AdbShell.exec("am start -n com.hermes.dashcast/.MainActivity", 6000);
+                    } catch (Throwable ignored) {
+                    }
+                }
+            }
+
+            final android.graphics.Bitmap fb = bmp;
+            mainHandler.post(() -> {
+                if (appCropPreview == null) return;
+                if (fb == null) {
+                    setStatus("状态：截屏失败（可继续用网格框选）");
+                    appendLog("截屏失败");
+                    return;
+                }
+                appCropPreview.setBackgroundShot(fb);
+                setStatus("状态：已载入底图 " + fb.getWidth() + "×" + fb.getHeight()
+                        + "（" + (targetLabel == null ? targetPkg : targetLabel) + "）");
+                appendLog("底图已更新 " + fb.getWidth() + "×" + fb.getHeight()
+                        + " · " + (targetLabel == null ? targetPkg : targetLabel));
+            });
+        }, "shot-bg").start();
     }
 
     /** 应用截取区并开始投屏（会先按 App 存历史值） */
@@ -1223,20 +1841,96 @@ public class MainActivity extends Activity {
             return;
         }
         maskCfg.saveAppRect(this, targetPkg);   /* 按 App 记住 */
+        /* 画布先对齐仪表真实分辨率（"铺满网格却铺不满仪表"的根因在这里） */
+        syncCanvasToOutput();
+
+        /*
+         * **必须置 enabled=true**（2026-11-03 排查出的第 9 个 bug）。
+         *
+         * applyFully() 里同步 CP 图层矩形的条件是：
+         *     if (cp != null && sCasting && enabled && w > 0 && h > 0)
+         *                                         ^^^^^^^
+         * enabled 只在「保存并应用」（saveMask）里被设 true，
+         * 而「应用并投屏」这条路从来没设 —— 于是：
+         *   · dcapd2.layer 写了（dcapd2 按新参数抓帧）
+         *   · 但 CP 的 layer 99 destination **没变**
+         *   · 结果图层还是旧尺寸，画面被拉伸/裁掉
+         * 用户看到的就是"截取区不生效"。
+         */
+        maskCfg.enabled = true;
+
+        /*
+         * **落盘前强制同步一次遮罩比例**。
+         *
+         * 拖拽时虽然每帧都在同步（LayerPreviewView.syncMaskAspectToCrop），
+         * 但「读取窗口」这条路是直接改 srcX/Y/W/H 再刷新的 ——
+         * 如果那条路径没同步，这里落盘的遮罩比例就和截取区不一致，
+         * dcapd2 会把画面拉伸变形（实测 24% 横压）。
+         * 多调一次成本几乎为零，但能彻底堵死这个漏洞。
+         */
+        if (appCropPreview != null) appCropPreview.syncMaskAspectNow();
+
         setStatus("状态：正在应用截取区并投屏…");
         appendLog("应用截取区 " + maskCfg.srcW + "×" + maskCfg.srcH
                 + " @(" + maskCfg.srcX + "," + maskCfg.srcY + ")");
 
         final LayerConfig snap = maskCfg;
         final android.content.Context appCtx = getApplicationContext();
+        final boolean casting = MirrorController.isMirroring();
         new Thread(() -> {
             try {
-                /* 写配置文件（含 src_app_pkg / src_x / src_y / src_w / src_h） */
+                /* ① 写配置文件（含 src_app_pkg / src_x / src_y / src_w / src_h）
+                   ② 写 prefs（launchDaemon 从 prefs 读 src_*） */
                 snap.applyFully(appCtx);
+
+                /*
+                 * ③ 分两种情况：
+                 *
+                 *  A. 正在投屏 → **必须重拉 dcapd2**。
+                 *     loop() 拉起它的条件是 `fgIsTarget && !daemonAlive()`，
+                 *     进程活着就不会重起 —— 参数永远是旧的，
+                 *     用户看到"截取页面不生效"（实测就是这个根因）。
+                 *
+                 *  B. 没在投屏 → 交给 startCast() 起全新进程，参数自然是新的。
+                 */
+                if (casting) {
+                    /*
+                     * 重拉之后 CP 是新会话（layer 99 被重建），
+                     * destination region 也跟着消失了 —— 必须立刻补一次，
+                     * 否则仪表上图层回到默认位置/尺寸，
+                     * 表现又是"截取区不生效"（只是换了个原因）。
+                     */
+                    boolean restarted = mirror.restartDaemonNow();
+                    if (restarted) {
+                        LayerConfig.setCasting(true);
+                        int[] dest = LayerGeometry.destinationFor(
+                                MirrorController.getCodec(),
+                                new int[]{snap.x, snap.y, snap.w, snap.h},
+                                MirrorController.getOutputW(),
+                                MirrorController.getOutputH());
+                        cpManager.setLayerRect(dest[0], dest[1], dest[2], dest[3]);
+                        /* 新进程没有旧像素，请求一次整屏全量 */
+                        AdbShell.exec("touch /data/local/tmp/dc_force", 2000);
+                        Log.i(TAG, "截取区已生效并重建图层：" + dest[0] + ","
+                                + dest[1] + " " + dest[2] + "x" + dest[3]);
+                    } else {
+                        Log.w(TAG, "重拉 dcapd2 失败（截取区可能仍按旧参数）");
+                    }
+                }
             } catch (Throwable t) {
                 Log.w(TAG, "写截取配置失败: " + t);
             }
-            mainHandler.post(this::startCast);
+            mainHandler.post(() -> {
+                if (!casting) {
+                    startCast();   /* 没在投 → 起一场新投屏 */
+                } else {
+                    setStatus("状态：截取区已应用（" + maskCfg.srcW + "×"
+                            + maskCfg.srcH + " @(" + maskCfg.srcX + ","
+                            + maskCfg.srcY + ")）");
+                    setDotColor(R.color.state_ok);
+                    appendLog("截取区已生效");
+                }
+            });
         }, "app-crop-apply").start();
     }
 
@@ -1324,8 +2018,29 @@ public class MainActivity extends Activity {
 
     private void refreshMaskInfo() {
         if (maskInfo == null) return;
-        maskInfo.setText(LayerPreviewView.geometryText(maskCfg)
-                + "  ·  " + LayerConfig.SHAPE_NAMES[maskCfg.shape]);
+        /*
+         * 显示遮罩尺寸时标注当前编码档下的**实际下发尺寸**。
+         *
+         * 因为两种档位对尺寸的处理不同（2026-11-03 方案 B）：
+         *   · BGRA  → 用户原始尺寸，1:1 零损失
+         *   · H.264 → 对齐到 16 倍数（硬编要求），会矮/窄几个像素
+         *
+         * 用户拖滑块时看到的数字是「自己设的值」，但实际生效的可能是
+         * 对齐后的值 —— 不标出来会让人困惑"为什么画面比设的小一点"。
+         */
+        int codec = MirrorController.getCodec();
+        int[] rr = maskCfg.rectForCodec(codec);
+        boolean aligned = (rr[2] != maskCfg.w) || (rr[3] != maskCfg.h);
+
+        String txt = LayerPreviewView.geometryText(maskCfg)
+                + "  ·  " + LayerConfig.SHAPE_NAMES[maskCfg.shape];
+
+        if (codec == 2) {
+            txt += aligned
+                    ? "  ·  H.264 实际 " + rr[2] + "×" + rr[3] + "（16对齐）"
+                    : "  ·  ✓16对齐";
+        }
+        maskInfo.setText(txt);
     }
 
     private void syncMaskControls() {
@@ -1384,6 +2099,8 @@ public class MainActivity extends Activity {
     }
 
     private void saveMask() {
+        /* 落盘前把画布对齐到仪表真实分辨率，否则"铺满"只是铺满了一块错的画布 */
+        syncCanvasToOutput();
         maskCfg.enabled = true;
         maskCfg.saveToPrefs(this);
         final int fps = maskFps;
@@ -1422,7 +2139,7 @@ public class MainActivity extends Activity {
                     int[] dest = LayerGeometry.destinationFor(
                             MirrorController.getCodec(),
                             new int[]{maskCfg.x, maskCfg.y, maskCfg.w, maskCfg.h},
-                            1920, 532);
+                            MirrorController.getOutputW(), MirrorController.getOutputH());
                     cpManager.setLayerRect(dest[0], dest[1], dest[2], dest[3]);
                 } catch (Throwable ignored) {}
             }
@@ -1582,6 +2299,53 @@ public class MainActivity extends Activity {
         refreshCodecButtons();
         setStatus("状态：编码档位已切换 · "
                 + (want == MirrorController.CODEC_H264 ? "H.264" : "BGRA+LZ4"));
+
+        /*
+         * **切档后必须立刻重新下发配置**（2026-11-03 修复）。
+         *
+         * 两种档位对「图层矩形」的要求完全相反：
+         *   BGRA  → destination = 整屏 (0,0,1920,532)，画布遮罩外靠 alpha 透明
+         *   H.264 → destination = 遮罩矩形 (x,y,w,h)，图层本身缩进那块
+         *
+         * 原来切档后只写了 dc_codec 让 dcapd2 自行换编码器，
+         * **没有重写 dcapd2.layer、也没有重设 CP 图层** ——
+         * CP 还留着上一个档位的 destination：
+         *   BGRA → H.264 时，图层仍是"整屏"，
+         *   H.264 无 alpha，就把原厂仪表整块盖住了。
+         *
+         * 用户必须手动点一次「保存并应用」才会走 applyFully()
+         * 把 destinationFor(新档位) 下发下去 —— 正是反馈的现象。
+         *
+         * 这里直接补上：切完档就 applyFully()，一步到位。
+         * 顺便把 maskCfg 按新档位重新对齐（H.264 要 16 对齐）。
+         */
+        final LayerConfig snap = maskCfg;
+        final android.content.Context appCtx = getApplicationContext();
+        final int newCodec = want;
+        new Thread(() -> {
+            try {
+                /*
+                 * **先等 dcapd2 真正切完编码档，再下发图层矩形**（2026-11-03）。
+                 *
+                 * 原来 setCodec 只写了个数字文件，dcapd2 500ms 后才轮询到；
+                 * 这边立刻按新档位算 destination 下发，两条路赛跑 ——
+                 * CP 已把图层缩到遮罩矩形，dcapd2 还在吐整块画布，
+                 * 结果位置和大小全错。用户看到"切 H.264 后不按遮罩位置投屏，
+                 * 要点一次保存并应用才刷新"。
+                 *
+                 * 现在等切换落地再下发，一次就对。
+                 */
+                MirrorController.awaitCodecSwitched(3000);
+                snap.applyFully(appCtx);
+                Log.i(TAG, "编码档切换后已重新下发配置（codec=" + newCodec + "）");
+            } catch (Throwable ex) {
+                Log.w(TAG, "切档后下发失败: " + ex);
+            }
+        }, "codec-reapply").start();
+
+        /* 遮罩容量提示、形状可用性也跟着档位变 */
+        refreshMaskInfo();
+        applyAlphaDependentAvailability(want == MirrorController.CODEC_H264);
     }
 
     /** 刷新二选一按钮的选中态（选中的用青绿实底 + 深字） */
@@ -1590,7 +2354,92 @@ public class MainActivity extends Activity {
             boolean h264 = MirrorController.getCodec() == MirrorController.CODEC_H264;
             applyCodecStyle(btnCodecBgra, !h264);
             applyCodecStyle(btnCodecH264, h264);
+            /* 编码档一变，依赖 alpha 的控件可用性也跟着变 */
+            applyAlphaDependentAvailability(h264);
         });
+    }
+
+    /**
+     * **按编码档启用/禁用「依赖 alpha」的控件**（2026-11-03）。
+     *
+     * 哪些功能依赖 alpha（读 layer_mask.c 确认）：
+     *   · 形状 圆角矩形 / 梯形 / 椭圆（shape=1/2/3）
+     *   · 四角圆角 r_tl / r_tr / r_bl / r_br
+     *   · 梯形上沿 / 下沿
+     *   · 羽化 feather
+     *   · 边框 border（a==254 标记）
+     *
+     * 它们都靠 dc_layer_apply() 写画布的 **alpha 通道**实现，
+     * 而 H.264 是 YUV420 —— 编码时 alpha 直接被丢掉，
+     * 拖了完全没反应。置灰 + 提示，别让用户白试。
+     *
+     * 注意：**矩形（shape=0）不需要 alpha**，永远可用。
+     * 铺满模式也不需要 alpha，所以 fit 按钮保留。
+     */
+    private void applyAlphaDependentAvailability(boolean h264) {
+        if (maskAlphaWarn == null) return;
+
+        if (h264) {
+            maskAlphaWarn.setText(
+                    "⚠ 当前 H.264 档不支持下列功能（编码无 alpha 通道）：\n"
+                            + "    圆角矩形 / 梯形 / 椭圆 / 四角圆角 / 梯形上下 / 羽化 / 边框\n"
+                            + "  这些控件已置灰。要用请切到「BGRA+LZ4」档。\n"
+                            + "  （矩形遮罩 + 铺满 在 H.264 下正常）");
+            maskAlphaWarn.setVisibility(View.VISIBLE);
+        } else {
+            maskAlphaWarn.setText("✓ BGRA+LZ4 档：形状/圆角/羽化/边框 全部可用");
+            maskAlphaWarn.setTextColor(getColor(R.color.content_tertiary));
+            maskAlphaWarn.setVisibility(View.VISIBLE);
+        }
+        if (h264) maskAlphaWarn.setTextColor(getColor(R.color.state_warn));
+
+        float alpha = h264 ? 0.42f : 1f;
+
+        /* 形状按钮：H.264 下只能停在「矩形」，直接不让切 */
+        if (maskBtnShape != null) {
+            maskBtnShape.setEnabled(!h264);
+            maskBtnShape.setAlpha(alpha);
+        }
+
+        /*
+         * 「等比 / 铺满」在 H.264 下也无效 —— dcapd2.c 第 372 行硬编码：
+         *     if (g_codec == DASHCAST_CODEC_H264 || (g_mask_ready && !fit)) {
+         *         dw = boxW; dh = boxH;      // 永远铺满
+         *     }
+         * 等比会留黑边，而 H.264 无 alpha 填不了透明，只能铺满。
+         * 所以这个按钮在 H.264 档下点了也没反应，一并置灰。
+         */
+        if (maskBtnFit != null) {
+            maskBtnFit.setEnabled(!h264);
+            maskBtnFit.setAlpha(alpha);
+        }
+        /* 圆角 / 梯形 / 羽化 / 边框 滑块 */
+        disable(maskSbBorder, alpha, h264);
+        disable(maskSbFeather, alpha, h264);
+        disable(maskSbTl, alpha, h264);
+        disable(maskSbTr, alpha, h264);
+        disable(maskSbBl, alpha, h264);
+        disable(maskSbBr, alpha, h264);
+        disable(maskSbTrapTop, alpha, h264);
+        disable(maskSbTrapBot, alpha, h264);
+
+        /*
+         * H.264 下把形状强制回矩形 —— 否则用户可能带着上次设的圆角，
+         * 看到一块"直角黑块"，反而更困惑。
+         */
+        if (h264 && maskCfg.shape != LayerConfig.SHAPE_RECT) {
+            maskCfg.shape = LayerConfig.SHAPE_RECT;
+            if (maskBtnShape != null) {
+                ((TextView) maskBtnShape.getChildAt(0)).setText(shapeLabel());
+            }
+            refreshMask();
+        }
+    }
+
+    private void disable(android.widget.SeekBar sb, float alpha, boolean off) {
+        if (sb == null) return;
+        sb.setEnabled(!off);
+        sb.setAlpha(alpha);
     }
 
     private void applyCodecStyle(LinearLayout b, boolean selected) {
@@ -2085,7 +2934,24 @@ public class MainActivity extends Activity {
 
                 // 先确认 CP 上有可执行的 dashcastd（被「停止服务」删过就自动重推），再启动
                 ok = cpManager.ensureDashcastd() && cpManager.startDashcastd();
-                if (ok) size = cpManager.queryScreenSize();   // 按 CP 真实分辨率建屏
+                if (ok) {
+                    size = cpManager.queryScreenSize();   // 按 CP 真实分辨率建屏
+                    /*
+                     * **把真实分辨率定下来**（2026-11-03）。
+                     *
+                     * 画布/抓帧/图层/遮罩全按这个尺寸算。原来写死 1920×532，
+                     * 只要 CP 屏不是这个数，图层就只盖住一截 ——
+                     * 用户看到的就是"遮罩铺满网格，仪表上却铺不满"。
+                     */
+                    if (size != null && size[0] >= 640 && size[1] >= 320) {
+                        MirrorController.setOutputSize(getApplicationContext(),
+                                size[0], size[1]);
+                    } else {
+                        int[] cached = {MirrorController.getOutputW(),
+                                        MirrorController.getOutputH()};
+                        size = cached;
+                    }
+                }
             } catch (Throwable e) {
                 // 必须 catch Throwable：这里如果漏出的是 Error（OOM / 链接错误），
                 // 线程一死整个进程就闪退 —— 用户看到的就是"点开始投屏直接退出"。
@@ -2708,7 +3574,7 @@ public class MainActivity extends Activity {
     private void applyViewMode(int view) {
         int prefsView = view;
 
-        maskCfg.applyView(prefsView, 1920, 532);
+        maskCfg.applyView(prefsView, MirrorController.getOutputW(), MirrorController.getOutputH());
 
         /* 记住选择，下次进来还是这档 */
         getSharedPreferences(PREF, MODE_PRIVATE).edit()

@@ -710,7 +710,11 @@ public class CpManager {
     public boolean setLayerRect(int x, int y, int w, int h) {
         try {
             int lid = LAYER_ID_CAST;
-            if (w <= 0 || h <= 0) { x = 0; y = 0; w = 1920; h = 532; }
+            if (w <= 0 || h <= 0) {
+                x = 0; y = 0;
+                w = MirrorController.getOutputW();
+                h = MirrorController.getOutputH();
+            }
 
             /* 必须先探到真实的 WAYLAND_DISPLAY，猜错就打在别的合成器上。
              * 用 raw() 一条命令里把探测+设置+回读全做完，只开一次 Channel。 */

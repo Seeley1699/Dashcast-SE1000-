@@ -53,6 +53,9 @@ public class VdMirror {
     private static final int PROXY_PORT = 8450;
     private static final int MAGIC = 0x56444631;   /* 'VDF1' */
     private static final int CMD_BG = 0x47424344;  /* 'DCBG'：立刻停抓主屏 */
+    /* 'DCVP'：告诉 dcapd2「虚拟屏里只取这么一块」（后台跟随时的截取区） */
+    private static final int CMD_VCROP = 0x50564344;
+
     private static final long MIN_INTERVAL = 33;   // 30fps 上限，省 CPU（dcapd2 还会再限一次）
 
     /** flags 的取舍见 DashcastSenderService.createVirtualDisplay 的注释：
@@ -160,9 +163,17 @@ public class VdMirror {
             // 从 App 闪一下黑再到 App。armed 把这段窗口焊死。
             armed = true;
 
+            /*
+             * **把截取框也带给 dcapd2**（2026-11-03 修复"按 HOME 截取失效"）。
+             *
+             * 虚拟屏建好后 vdW×vdH 是已知的，截取框（屏幕坐标）可以按
+             * 窗口→虚拟屏的比例换算。换算结果交给 dcapd2，它在 VD 分支里
+             * 按这个源矩形 blit，而不是整块。
+             */
+            sendVdCrop();
+
             state("App 已转后台（虚拟屏 " + displayId + "），仪表实时跟随", true);
-            return true;
-        } catch (Throwable t) {
+            return true;        } catch (Throwable t) {
             Log.e(TAG, "start 失败", t);
             sending = false;
             closeSocket();
@@ -179,6 +190,85 @@ public class VdMirror {
             teardownDisplay();
         }
     }
+
+    /**
+     * 设置后台跟随时的截取框（**屏幕坐标**，和「截取 App 页面」里的 src_* 一致）。
+     *
+     * 传 null = 取整块虚拟屏。
+     *
+     * 虚拟屏里装的是目标 App 的窗口，所以换算必须知道**窗口在屏幕上的位置**：
+     *   虚拟屏的 (0,0) 对应窗口左上角，不是屏幕左上角。
+     *   截取框 (srcX,srcY) 是屏幕坐标 → 相对窗口 = (srcX-winX, srcY-winY)。
+     *
+     * @param crop 截取框 {x,y,w,h}（屏幕坐标；null/全 0 = 整块）
+     * @param win  目标窗口矩形 {x,y,w,h}（屏幕坐标；null = 未知，按整屏处理）
+     */
+    public void setCropRect(int[] crop, int[] win) {
+        sCrop = crop;
+        sWin = win;
+        /*
+         * 只有在虚拟屏已经建好、帧已经在喂的时候才真的发 ——
+         * 否则 vdW/vdH 还是上一次的（甚至是初值），换算出来的框是错的。
+         * start() 末尾 armed=true 之后会再调一次 sendVdCrop()，那时尺寸才是准的。
+         */
+        if (sending && armed && vd != null) sendVdCrop();
+        else sPendingCrop = true;
+    }
+
+    private static volatile int[] sCrop = null;
+    private static volatile int[] sWin = null;
+
+    /** 把 sCrop（屏幕坐标）换算成虚拟屏坐标并下发 */
+    private void sendVdCrop() {
+        try {
+            int cx = 0, cy = 0, cw = vdW, ch = vdH;
+            int[] c = sCrop;
+            int[] w = sWin;
+            if (c != null && c.length >= 4 && c[2] > 0 && c[3] > 0
+                    && w != null && w.length >= 4 && w[2] > 0 && w[3] > 0) {
+                /* 相对窗口的偏移（截取框是屏幕坐标，虚拟屏原点是窗口左上角） */
+                int relX = c[0] - w[0];
+                int relY = c[1] - w[1];
+                /* 窗口 → 虚拟屏 的缩放比 */
+                double kx = (double) vdW / (double) w[2];
+                double ky = (double) vdH / (double) w[3];
+                cx = (int) Math.round(relX * kx);
+                cy = (int) Math.round(relY * ky);
+                cw = (int) Math.round(c[2] * kx);
+                ch = (int) Math.round(c[3] * ky);
+                if (cx < 0) cx = 0;
+                if (cy < 0) cy = 0;
+                if (cw < 16) cw = 16;
+                if (ch < 16) ch = 16;
+                if (cw > vdW) cw = vdW;
+                if (ch > vdH) ch = vdH;
+                if (cx + cw > vdW) cx = Math.max(0, vdW - cw);
+                if (cy + ch > vdH) cy = Math.max(0, vdH - ch);
+            }
+            OutputStream o = out;
+            if (o == null) {
+                /* 连接还没挂上：start() 里 armed=true 之后会再调一次 */
+                sPendingCrop = true;
+                return;
+            }
+            ByteBuffer b = ByteBuffer.allocate(20).order(ByteOrder.LITTLE_ENDIAN);
+            b.putInt(CMD_VCROP);
+            b.putInt(cx);
+            b.putInt(cy);
+            b.putInt(cw);
+            b.putInt(ch);
+            o.write(b.array(), 0, 20);
+            o.flush();
+            sPendingCrop = false;
+            Log.i(TAG, "后台跟随截取区 → 虚拟屏 " + cw + "×" + ch
+                    + " @(" + cx + "," + cy + ")（虚拟屏 " + vdW + "×" + vdH + "）");
+        } catch (Throwable t) {
+            Log.w(TAG, "下发 VD 截取框失败: " + t);
+            closeSocket();
+        }
+    }
+
+    private volatile boolean sPendingCrop = false;
 
     // ============================== 建屏 ==============================
 
@@ -490,6 +580,11 @@ public class VdMirror {
             connectFailCount = 0;
             nextConnectAllowedMs = 0;
             Log.i(TAG, "已连 dcapd2 帧源 127.0.0.1:" + PROXY_PORT);
+            /*
+             * 重连之后 dcapd2 是新进程（裁剪框回到默认的整块），
+             * 已有的截取框必须补发一次，否则"中途断过一次就又整块了"。
+             */
+            if (sCrop != null || sPendingCrop) sendVdCrop();
             return true;
         } catch (Throwable t) {
             if (connectFailCount < 10) connectFailCount++;

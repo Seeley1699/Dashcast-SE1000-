@@ -80,6 +80,25 @@ using namespace android;
 #define PROXY_PORT 8450
 #define VDFRAME_MAGIC 0x56444631u   /* 'VDF1'：App 侧 VD 帧的包头 */
 #define CMD_BG        0x47424344u   /* 'DCBG'：4 字节控制命令 —— 立刻停抓主屏 */
+#define CMD_VCROP     0x50564344u   /* 'DCVP'：后台跟随时的源裁剪框（16 字节） */
+
+/*
+ * 后台跟随（VD 源）时的裁剪框 —— 2026-11-03 修「按 HOME 回桌面后截取失效」。
+ *
+ * 现象：用户在「截取 App 页面」里框了一块，App 在前台时画面正常；
+ *       一按 HOME 进后台跟随，整块窗口都上了仪表，截取框形同没有。
+ *
+ * 根因：主屏路径走 captureScreen(crop = srcX/Y/W/H)，裁剪在那条路上生效；
+ *       而 VD 分支是从虚拟屏整块 ImageReader 读帧，直接
+ *            blit(0,0,g_px_w,g_px_h → dst)
+ *       ——压根没有"只取一块"的概念。
+ *
+ * 修法：App 把截取框换算成虚拟屏坐标，用 'DCVP' 命令下发；这里存起来，
+ *       VD 分支按这个源矩形 blit（blit_bilinear 本来就支持源子矩形）。
+ *       w/h = 0 表示取整块（老行为）。
+ */
+static int g_vd_crop_x = 0, g_vd_crop_y = 0, g_vd_crop_w = 0, g_vd_crop_h = 0;
+
 
 static int g_proxy_active = 0;      /* 收到 BG 命令或帧之后才算真正接管 */
 
@@ -644,6 +663,30 @@ static int proxy_read_msg(void)
         dump_ppm("/data/local/tmp/dc_canvas.ppm", g_canvas, g_outW, g_outH, g_outW * 4);
         return 2;
     }
+
+    /*
+     * 'DCVP' + x,y,w,h（16 字节，虚拟屏坐标）—— 后台跟随时的源裁剪框。
+     *
+     * 见 g_vd_crop_* 的注释：主屏路径的 captureScreen 带 crop，
+     * 但 VD 分支原来整块 blit，所以"按 HOME 之后截取失效"。
+     */
+    if (w4 == CMD_VCROP) {
+        uint32_t c[4];
+        if (read_full(g_proxy_fd, c, sizeof(c)) != 0) return 0;
+        g_vd_crop_x = (int) c[0];
+        g_vd_crop_y = (int) c[1];
+        g_vd_crop_w = (int) c[2];
+        g_vd_crop_h = (int) c[3];
+        if (g_vd_crop_x < 0) g_vd_crop_x = 0;
+        if (g_vd_crop_y < 0) g_vd_crop_y = 0;
+        LOGI("VD 截取区 → %d,%d %d×%d（虚拟屏帧 %dx%d）",
+             g_vd_crop_x, g_vd_crop_y, g_vd_crop_w, g_vd_crop_h,
+             g_px_w, g_px_h);
+        g_vd_live = 0;      /* 换了裁剪框，重新等一帧真画面 */
+        g_vd_blank = 0;
+        return 2;
+    }
+
     if (w4 != VDFRAME_MAGIC) return -1;
 
     uint32_t rest[3];
@@ -1555,8 +1598,25 @@ int main(int argc, char **argv)
                         }
                         g_vd_live = 1;
                         last_push = now_ms();
+                        /*
+                         * **按 App 下发的裁剪框取源**（2026-11-03）。
+                         *
+                         * 原来固定 0,0,g_px_w,g_px_h = 整块虚拟屏，
+                         * 于是"设了截取框，一按 HOME 回桌面就失效"。
+                         * g_vd_crop_w/h 为 0 时保持老行为（整块）。
+                         */
+                        int vx = 0, vy = 0, vw = g_px_w, vh = g_px_h;
+                        if (g_vd_crop_w > 0 && g_vd_crop_h > 0) {
+                            vx = g_vd_crop_x;
+                            vy = g_vd_crop_y;
+                            vw = g_vd_crop_w;
+                            vh = g_vd_crop_h;
+                            if (vx + vw > g_px_w) vw = g_px_w - vx;
+                            if (vy + vh > g_px_h) vh = g_px_h - vy;
+                            if (vw < 4 || vh < 4) { vx = 0; vy = 0; vw = g_px_w; vh = g_px_h; }
+                        }
                         blit_bilinear(g_px_buf, g_px_stride, g_px_w, g_px_h,
-                                      0, 0, g_px_w, g_px_h, canvas, outW,
+                                      vx, vy, vw, vh, canvas, outW,
                                       g_dst_x, g_dst_y, g_dst_w, g_dst_h);
                         applied++;
                         do_push = 1;
