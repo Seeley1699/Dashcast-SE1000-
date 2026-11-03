@@ -1395,6 +1395,32 @@ public class MainActivity extends Activity {
                     setAppCropMode(false);
                     setStatus("状态：截取区已恢复整页（铺满遮罩）");
                     appendLog("恢复整页");
+
+                    /*
+                     * **必须落盘 + 重启抓帧**（2026-11-03 修复 Bug E）。
+                     *
+                     * 原来 resetAppCropToFull() 只改了内存里的 src*，
+                     * prefs 和 dcapd2.layer 全是旧值：
+                     *   界面显示 X=0 Y=0 W=2560 H=1600（看着生效了）
+                     *   实际 dcapd2 还在按旧框抓 → 用户以为按钮没用
+                     *
+                     * 和「勾开关」「切档」「点比例」是同一类错误，
+                     * 统一解法：立刻 applyFully + restartDaemonNow。
+                     */
+                    if (MirrorController.isMirroring()) {
+                        maskCfg.enabled = true;
+                        final LayerConfig snap = maskCfg;
+                        final android.content.Context appCtx = getApplicationContext();
+                        new Thread(() -> {
+                            try {
+                                snap.applyFully(appCtx);
+                                mirror.restartDaemonNow();
+                                Log.i(TAG, "恢复整页已下发");
+                            } catch (Throwable ex) {
+                                Log.w(TAG, "恢复整页下发失败: " + ex);
+                            }
+                        }, "reset-apply").start();
+                    }
                 });
         resetRow.addView(btnReset, rowLp(1f));
         body.addView(resetRow);
@@ -1431,6 +1457,32 @@ public class MainActivity extends Activity {
                 updateAppCropTexts();
                 appendLog("按比例框选 → " + LayerPreviewView.RATIO_NAMES[idx]
                         + "  " + maskCfg.srcW + "×" + maskCfg.srcH);
+
+                /*
+                 * **点比例后立刻落盘 + 重启抓帧**（2026-11-03 修复）。
+                 *
+                 * 原来只改了内存（cfg.src*）和预览显示 ——
+                 * 界面文案变了，但 prefs / dcapd2.layer 全是旧值，
+                 * 用户以为设置成功，实际抓的还是旧区域。
+                 *
+                 * 这和「勾开关」「切编码档」是同一类错误：
+                 * 改状态却没触发下发。统一处理：走 applyFully + 重拉。
+                 */
+                if (MirrorController.isMirroring()) {
+                    maskCfg.enabled = true;
+                    if (appCropPreview != null) appCropPreview.syncMaskAspectNow();
+                    final LayerConfig snap = maskCfg;
+                    final android.content.Context appCtx = getApplicationContext();
+                    new Thread(() -> {
+                        try {
+                            snap.applyFully(appCtx);
+                            mirror.restartDaemonNow();
+                            Log.i(TAG, "按比例框选已下发");
+                        } catch (Throwable ex) {
+                            Log.w(TAG, "按比例框选下发失败: " + ex);
+                        }
+                    }, "ratio-apply").start();
+                }
             });
             if (ratioRow != null) ratioRow.addView(b, rowLp(1f));
         }
@@ -1545,12 +1597,46 @@ public class MainActivity extends Activity {
         int w = maskCfg.srcW > 0 ? maskCfg.srcW : 1;
         int h = maskCfg.srcH > 0 ? maskCfg.srcH : 1;
         double r = (double) w / h;
-        double target = (double) MirrorController.getOutputW() / MirrorController.getOutputH();
-        boolean ok = Math.abs(r - target) < 0.15;
-        appCropRatio.setText(String.format("比例 %.2f : 1  %s  仪表 %.2f : 1",
-                r, ok ? "✓" : "⚠", target));
-        appCropRatio.setTextColor(getColor(ok
-                ? R.color.content_secondary : R.color.state_warn));
+
+        /*
+         * 按编码档给出不同的判据（2026-11-03）。
+         *
+         * H.264：必须等于**遮罩**比例（dcapd2 会铺满遮罩，不一致就变形）
+         *         —— 拖框时已自动锁定，这里显示"已锁定"给用户信心
+         * BGRA ：不要求等于遮罩比例，只要不极端就行（有 alpha 可留边）
+         *         这里改成和**仪表**比例对照，仅供参考
+         */
+        boolean h264 = MirrorController.getCodec() == MirrorController.CODEC_H264;
+
+        if (h264) {
+            /*
+             * 用**画布坐标**的遮罩宽高算比例（2026-11-03 修正）。
+             *
+             * maskCfg.w/h 就是画布系（1920×532）里的遮罩矩形，
+             * 也就是 CP 的 destination region —— dcapd2 会把这个比例的内容
+             * 铺满这块，所以比例必须和它一致。
+             *
+             * 之前看不出问题是因为 "遮罩" 和 "仪表" 两个数容易混：
+             *   遮罩 592×432 = 1.37     ← 用户设的那块
+             *   仪表 1920×532 = 3.61    ← 整块屏
+             * 如果误用后者就会给出误导性的"已匹配"提示。
+             */
+            double boxAspect = (maskCfg.h > 0)
+                    ? (double) maskCfg.w / maskCfg.h
+                    : (double) MirrorController.getOutputW() / MirrorController.getOutputH();
+            boolean ok = Math.abs(r - boxAspect) / boxAspect < 0.02;
+            appCropRatio.setText(String.format(
+                    "截取 %.2f : 1  %s  遮罩 %d×%d (%.2f : 1)  H.264 已锁定",
+                    r, ok ? "✓" : "⚠", maskCfg.w, maskCfg.h, boxAspect));
+            appCropRatio.setTextColor(getColor(ok
+                    ? R.color.content_secondary : R.color.state_warn));
+        } else {
+            double dash = (double) MirrorController.getOutputW() / MirrorController.getOutputH();
+            appCropRatio.setText(String.format(
+                    "比例 %.2f : 1  仪表 %.2f : 1  （BGRA 可自由框选，留黑边不变形）",
+                    r, dash));
+            appCropRatio.setTextColor(getColor(R.color.content_secondary));
+        }
     }
 
     /** 跟随窗口 / 手动 切换 */
@@ -2452,17 +2538,51 @@ public class MainActivity extends Activity {
         disable(maskSbTrapBot, alpha, h264);
 
         /*
-         * H.264 下把形状强制回矩形 —— 否则用户可能带着上次设的圆角，
-         * 看到一块"直角黑块"，反而更困惑。
+         * ══════════════════════════════════════════════════════════════
+         * H.264 下形状强制回矩形，切回 BGRA 时**还原用户原来的形状**
+         * ══════════════════════════════════════════════════════════════
+         *
+         * H.264 没有 alpha，圆角/梯形/椭圆都无效，所以进 H.264 时
+         * 把 shape 压成矩形是对的（否则用户看到"直角黑块"更困惑）。
+         *
+         * 但原来的写法只压不还 —— 切回 BGRA 后 shape 仍是 0，
+         * 而圆角参数 65/65/65/65 还好好地在 prefs 里，白白浪费：
+         *   用户反馈"切回 LZ4 圆角不见了，得重新设一遍"（Bug D）。
+         *
+         * 修法：进 H.264 前把用户形状记到 sShapeBeforeH264，
+         *      切回 BGRA 时还原它。用一个字段跨越切换周期。
          */
-        if (h264 && maskCfg.shape != LayerConfig.SHAPE_RECT) {
-            maskCfg.shape = LayerConfig.SHAPE_RECT;
-            if (maskBtnShape != null) {
-                ((TextView) maskBtnShape.getChildAt(0)).setText(shapeLabel());
+        if (h264) {
+            if (maskCfg.shape != LayerConfig.SHAPE_RECT) {
+                sShapeBeforeH264 = maskCfg.shape;   /* 记住用户的形状 */
+                maskCfg.shape = LayerConfig.SHAPE_RECT;
+                if (maskBtnShape != null) {
+                    ((TextView) maskBtnShape.getChildAt(0)).setText(shapeLabel());
+                }
+                refreshMask();
+                Log.i(TAG, "H.264：形状压成矩形，已记住原形状=" + sShapeBeforeH264);
             }
-            refreshMask();
+        } else {
+            /*
+             * 切回 BGRA：如果之前被压成矩形、但记着别的形状，就还原。
+             * 只在"当前是矩形 + 有记忆 + 记忆非矩形"时才动，
+             * 避免把用户手动选的矩形又改回去。
+             */
+            if (maskCfg.shape == LayerConfig.SHAPE_RECT
+                    && sShapeBeforeH264 != LayerConfig.SHAPE_RECT) {
+                maskCfg.shape = sShapeBeforeH264;
+                sShapeBeforeH264 = LayerConfig.SHAPE_RECT;   /* 用完清掉，只还原一次 */
+                if (maskBtnShape != null) {
+                    ((TextView) maskBtnShape.getChildAt(0)).setText(shapeLabel());
+                }
+                refreshMask();
+                Log.i(TAG, "BGRA：已还原形状=" + maskCfg.shape);
+            }
         }
     }
+
+    /** 进 H.264 时被压掉的用户形状（切回 BGRA 时还原，只还原一次） */
+    private int sShapeBeforeH264 = LayerConfig.SHAPE_RECT;
 
     private void disable(android.widget.SeekBar sb, float alpha, boolean off) {
         if (sb == null) return;

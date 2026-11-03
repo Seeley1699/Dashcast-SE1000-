@@ -693,7 +693,20 @@ public class LayerPreviewView extends View {
                  * 同步策略：保住遮罩的"面积/位置"感觉，只调宽高比例，
                  * 且贴在画布内。这样用户拖框时仪表上的成品永远不变形。
                  */
-                syncMaskAspectToCrop();
+                /*
+                 * **H.264 下不要反过来改遮罩**（2026-11-03 修正）。
+                 *
+                 * lockCropAspect() 已经让"截取区跟随遮罩比例"，遮罩是主动方。
+                 * 这里若再让遮罩跟随截取区，两个方向互相拉扯 ——
+                 * 拖一下框，遮罩从 608×416 变 608×610（1.46→1.00），
+                 * 整个仪表布局跟着变，用户完全无法控制（实测踩到）。
+                 *
+                 * 所以 H.264 档拖拽时不碰遮罩，只让截取区适配遮罩。
+                 * BGRA 档保持原行为（有 alpha，不变形）。
+                 */
+                if (MirrorController.getCodec() != MirrorController.CODEC_H264) {
+                    syncMaskAspectToCrop();
+                }
                 invalidate();
                 notifyChanged();
                 return true;
@@ -737,19 +750,25 @@ public class LayerPreviewView extends View {
      */
     private void syncMaskAspectToCrop() {
         /*
-         * **默认不同步** —— 尊重用户已经调好的遮罩（2026-11-03 修正）。
+         * ══════════════════════════════════════════════════════════════
+         * **H.264 下必须强制同步**（2026-11-03）
+         * ══════════════════════════════════════════════════════════════
          *
-         * 上一版无条件同步，结果用户的遮罩被悄悄改掉：
-         *   调好 1440×400 @ (240,66) → 拖了个 4.71:1 的截取框
-         *   → 遮罩被改成 1647×350，位置和大小全变
-         *   而且没有恢复入口，用户只能重新拖一遍。
+         * 用户关掉「同步遮罩比例」时，截取区与遮罩比例可以不一致 ——
+         * BGRA 还能靠"等比留黑边"补救（有 alpha 通道填透明）。
          *
-         * 现在改成可选：
-         *   · 勾选「同步遮罩比例」→ 遮罩自动匹配，画面永不变形（推荐）
-         *   · 取消勾选 → 保留自己的遮罩，但比例不匹配时会变形
-         * 界面上会明确提示当前会不会变形。
+         * 但 H.264 **没有 alpha**，dcapd2 里是硬编码：
+         *     if (g_codec == H264 || !fit) { dw = boxW; dh = boxH; }
+         * 即：无条件把截取画面**拉满遮罩**。比例不一致就是肉眼可见的压扁。
+         *
+         * 实测：截取 2071×1275 (1.62:1) 投到遮罩 608×416 (1.46:1)
+         *       → 横向压缩 11%，用户报"H.264 下拖选的页面跟投屏的不一致，
+         *         LZ4 倒是一模一样"。
+         *
+         * 所以 H.264 档**无视用户开关**，一律同步。
          */
-        if (!syncAspectEnabled) return;
+        boolean h264 = MirrorController.getCodec() == MirrorController.CODEC_H264;
+        if (!syncAspectEnabled && !h264) return;
         if (cfg.srcW <= 0 || cfg.srcH <= 0) return;
 
         double want = (double) cfg.srcW / cfg.srcH;      /* 截取区比例 */
@@ -1017,6 +1036,108 @@ public class LayerPreviewView extends View {
 
         cfg.srcX = l;
         cfg.srcY = t;
+        cfg.srcW = w;
+        cfg.srcH = h;
+
+        /*
+         * ══════════════════════════════════════════════════════════════
+         * **拖框时锁定遮罩比例**（2026-11-03 方案 B）
+         * ══════════════════════════════════════════════════════════════
+         *
+         * 问题：用户框 2071×1275（1.624:1），遮罩是 608×416（1.462:1）。
+         * H.264 下 dcapd2 硬编码 `dw=boxW, dh=boxH`（必须铺满遮罩），
+         * 比例不一致就只能二选一：
+         *   · 让画面变形（压扁 11%）
+         *   · 或偷偷把框扩大去凑比例（用户发现"多抓了一圈"）
+         *
+         * 两种都让人困惑。根子在于**框选时就该知道最终比例**。
+         *
+         * 所以拖拽过程中直接按遮罩比例约束框的宽高：
+         *   · 拖角/拖边：先算出用户想改的那一维，另一维按比例跟随
+         *   · 拖框内平移：尺寸不变，天然满足
+         *   · 新建框：以拖出的宽度为准，高按比例算
+         *
+         * 这样松手时框的比例就已经等于遮罩比例，投出来分毫不差，
+         * 用户看到的就是最终效果 —— 所见即所得。
+         *
+         * 注意：锁定用**遮罩的原始比例**（cfg.w/cfg.h），不是编码对齐后的，
+         * 因为 D 端最终是按遮罩矩形铺满的。
+         */
+        lockCropAspect();
+    }
+
+    /**
+     * 把当前截取框的宽高约束成遮罩比例（保持中心与主导维）。
+     *
+     * 保留哪个维度由"谁变化更大"决定太玄学，这里用简单规则：
+     *   · 新建框（aMode==10）→ 以宽度为准
+     *   · 拖上/下边（aMode 6,7）→ 以高度为准
+     *   · 其余（角、左/右边）→ 以宽度为准
+     * 这样手感稳定，不会某一帧突然换成另一维。
+     */
+    private void lockCropAspect() {
+        /*
+         * **只有 H.264 档需要锁比例**（2026-11-03）。
+         *
+         * 为什么只有它：
+         *   · H.264 无 alpha，dcapd2 硬编码 `dw=boxW, dh=boxH`
+         *     （无条件把画面拉满遮罩）→ 比例不一致就是可见的压扁/拉宽
+         *   · BGRA/LZ4 有 alpha，可以等比缩放后留透明黑边，
+         *     比例不一致顶多是加边，画面不变形 —— 用户也就不需要被限制
+         *
+         * 所以在 BGRA 下 `lockCropAspect` 直接返回，拖框完全自由。
+         */
+        if (MirrorController.getCodec() != MirrorController.CODEC_H264) return;
+
+        if (cfg.w <= 0 || cfg.h <= 0) return;
+        if (cfg.srcW <= 0 || cfg.srcH <= 0) return;
+
+        double maskAspect = (double) cfg.w / cfg.h;
+
+        int cx = cfg.srcX + cfg.srcW / 2;
+        int cy = cfg.srcY + cfg.srcH / 2;
+
+        int w = cfg.srcW;
+        int h = cfg.srcH;
+
+        /* 以高度为准的两种手势：拖上下边 */
+        boolean useHeight = (aMode == 6 || aMode == 7);
+
+        if (useHeight) {
+            w = (int) Math.round(h * maskAspect);
+        } else {
+            h = (int) Math.round(w / maskAspect);
+        }
+
+        /* 16 对齐（H.264 硬编要求，顺手做了对 BGRA 无害） */
+        if (w >= 16) w = (int) Math.round(w / 16.0) * 16;
+        if (h >= 16) h = (int) Math.round(h / 16.0) * 16;
+        if (w < 16) w = 16;
+        if (h < 16) h = 16;
+
+        /* 超出屏幕就往回收 */
+        if (w > screenW) {
+            w = (screenW / 16) * 16;
+            if (!useHeight) h = (int) Math.round(w / maskAspect);
+            if (h >= 16) h = (int) Math.round(h / 16.0) * 16;
+        }
+        if (h > screenH) {
+            h = (screenH / 16) * 16;
+            if (useHeight) w = (int) Math.round(h * maskAspect);
+            if (w >= 16) w = (int) Math.round(w / 16.0) * 16;
+        }
+        if (w > screenW) w = (screenW / 16) * 16;
+        if (h > screenH) h = (screenH / 16) * 16;
+
+        int x = cx - w / 2;
+        int y = cy - h / 2;
+        if (x < 0) x = 0;
+        if (y < 0) y = 0;
+        if (x + w > screenW) x = Math.max(0, screenW - w);
+        if (y + h > screenH) y = Math.max(0, screenH - h);
+
+        cfg.srcX = x;
+        cfg.srcY = y;
         cfg.srcW = w;
         cfg.srcH = h;
     }

@@ -1222,6 +1222,33 @@ public class MirrorController {
             int scrH = scr[1] > 0 ? scr[1] : 1600;
 
             /*
+             * **比例不一致时只记日志，不再擅自改框**（2026-11-03 方案 B）。
+             *
+             * 上一版在这里按遮罩比例反算截取区宽高 —— 结果用户的
+             * 2071×1275 被悄悄扩成 2080×1424（上下多抓 149px），
+             * 用户发现"投出来的比框选的大一圈"，反而更困惑。
+             *
+             * 方案 B 把约束提前到**拖拽时**（LayerPreviewView.lockCropAspect），
+             * 松手时框的比例就已经等于遮罩比例。
+             * 所以这里不该再改，只在比例真的对不上时留一条日志便于排查
+             * （对不上通常意味着用户手改过 prefs 或换了遮罩）。
+             */
+            if (MirrorController.getCodec() == CODEC_H264) {
+                LayerConfig lcs = LayerConfig.loadFromPrefs(ctx, getOutputW(), getOutputH());
+                if (lcs != null && lcs.w > 0 && lcs.h > 0) {
+                    double boxAspect = (double) lcs.w / lcs.h;
+                    double srcAspect = (double) sw / sh;
+                    double drift = Math.abs(srcAspect - boxAspect) / boxAspect;
+                    if (drift > 0.01) {
+                        Log.w(TAG, "H.264 截取比例与遮罩不一致 "
+                                + String.format(java.util.Locale.US,
+                                        "src=%.3f box=%.3f 偏差 %.1f%%", srcAspect, boxAspect, drift * 100)
+                                + " —— 画面会被拉伸（拖框时应已锁定比例，可能是旧配置）");
+                    }
+                }
+            }
+
+            /*
              * ⚠ **顺序很关键**：先夹到屏幕 → 再 16 对齐 → 对齐后可能
              * 又超出去，所以要**再夹一次**。
              *
@@ -1626,6 +1653,24 @@ public class MirrorController {
      *
      * 必须在后台线程调用（AdbShell.exec 会开 socket）。
      */
+    /**
+     * **重拉 dcapd2**（按当前配置重新起进程）。
+     *
+     * ══════════════════════════════════════════════════════════════
+     * **VD 模式下还要重发截取框**（2026-11-03 画面撕裂根因）
+     * ══════════════════════════════════════════════════════════════
+     *
+     * 现象：App 转后台（VD 模式）后改截取区 → 仪表出现"左边头像
+     *      右边模糊条纹"的撕裂画面。
+     *
+     * 根因：dcapd2 重启后按新 src 重算了 g_dst（画布落点），
+     *      但 g_vd_crop_*（虚拟屏裁剪框）还是**上一轮的旧值** ——
+     *      它是靠 'DCVP' 命令单独下发的，重拉进程时没人再发。
+     *      于是：裁剪框 240×176 × 画布落点 976×272 → 错位拉伸。
+     *
+     * 修法：重拉前后都把 setCropRect 再调一次（内部会换算成
+     *      虚拟屏坐标并下发 'DCVP'）。
+     */
     public boolean restartDaemonNow() {
         MirrorController c = sActive;
         if (c == null || !c.running) {
@@ -1637,7 +1682,34 @@ public class MirrorController {
             c.ensureBinary();
             int[] rect = c.lastRect != null ? c.lastRect : new int[]{0, 0, getOutputW(), getOutputH()};
             Log.i(TAG, "按新配置重拉 dcapd2（用 sActive 实例）");
-            return c.launchDaemon(rect);
+            boolean ok = c.launchDaemon(rect);
+
+            /*
+             * 重拉后立刻把截取框同步给 VD（如果有虚拟屏）。
+             * 放在 launchDaemon 之后：新进程已经连上、代理通道已建，
+             * 这时发 'DCVP' 才会被正确接收。
+             */
+            c.republishVdCrop();
+            return ok;
+        }
+    }
+
+    /** 把当前截取框重新下发给虚拟屏（VD 未激活时是空操作） */
+    private void republishVdCrop() {
+        try {
+            if (!bgMode) return;   /* 主屏模式不需要 */
+            LayerConfig lc = LayerConfig.loadFromPrefs(ctx, getOutputW(), getOutputH());
+            if (lc != null && lc.srcW > 0 && lc.srcH > 0) {
+                int[] crop = {lc.srcX, lc.srcY, lc.srcW, lc.srcH};
+                vd.setCropRect(crop, lastRect);
+                Log.i(TAG, "VD 截取框已重发 → " + lc.srcW + "×" + lc.srcH
+                        + " @(" + lc.srcX + "," + lc.srcY + ")");
+            } else {
+                vd.setCropRect(null, null);
+                Log.i(TAG, "VD 截取框已清空（取整块虚拟屏）");
+            }
+        } catch (Throwable t) {
+            Log.w(TAG, "重发 VD 截取框失败: " + t);
         }
     }
 
@@ -1785,6 +1857,9 @@ public class MirrorController {
     }
 
     /** 读 dcapd2 的 STAT 行：帧率 / 图块 / 带宽 */
+    /** VD 无帧计数：连续几次采样 capture=0 就认为虚拟屏没在喂帧 */
+    private int vdDeadStreak = 0;
+
     private void readStats() {
         try {
             String out = AdbShell.exec("tail -3 " + LOGF, 4000);
@@ -1793,16 +1868,60 @@ public class MirrorController {
             Matcher m = Pattern.compile(
                     "STAT fps=(\\d+) capture=(\\d+) tiles=(\\d+) kbps=(\\d+)").matcher(out);
             String last = null;
-            int f = 0, t = 0, k = 0;
+            int f = 0, t = 0, k = 0, cap = 0;
+            String src = "";
             while (m.find()) {
                 last = m.group(0);
                 f = Integer.parseInt(m.group(1));
+                cap = Integer.parseInt(m.group(2));
                 t = Integer.parseInt(m.group(3));
                 k = Integer.parseInt(m.group(4));
+                /* 抓行尾的 src=VD / src=SCREEN 标记 */
+                int i2 = out.indexOf(m.group(0));
+                if (i2 >= 0) {
+                    int eol = out.indexOf('\n', i2);
+                    String line = eol > 0 ? out.substring(i2, eol) : out.substring(i2);
+                    if (line.contains("src=VD")) src = "VD";
+                    else if (line.contains("src=SCREEN")) src = "SCREEN";
+                }
             }
             if (last == null) return;
 
             if (listener != null) listener.onStats(f, k, t);
+
+            /*
+             * ══════════════════════════════════════════════════════════════
+             * **虚拟屏无帧检测**（2026-11-03 黑屏根因修复）
+             * ══════════════════════════════════════════════════════════════
+             *
+             * 现象：App 转后台 → enterBg 建虚拟屏 → 但虚拟屏 state=OFF
+             * （dumpsys display 实测 owner 是别的进程、state OFF）
+             * → dcapd2 收到 DCBG 切到 VD 模式，却一帧都收不到
+             * → STAT 显示 src=VD capture=0 fps=0 → **仪表纯黑**
+             *
+             * enterBg 当时只校验 vd.start() 的返回值，没校验"真的出帧"。
+             * 这里补上：VD 模式下连续 3 次采样 capture=0（≈3 秒），
+             * 判定虚拟屏死了 → 退出 bgMode，回到主屏抓取（至少还有画面）。
+             *
+             * 为什么退回主屏而不是重试虚拟屏：
+             *   App 已经在后台，主屏抓的就是桌面 —— 画面不理想，
+             *   但**比纯黑好**，而且用户可以立刻看到"跟随失败"的状态提示。
+             */
+            if ("VD".equals(src) && cap == 0) {
+                vdDeadStreak++;
+                if (vdDeadStreak >= 3 && bgMode) {
+                    Log.w(TAG, "虚拟屏连续 " + vdDeadStreak + " 次无帧，退回主屏抓取");
+                    vdDeadStreak = 0;
+                    state("后台跟随失败（虚拟屏无帧）—— 已退回主屏", true);
+                    try {
+                        exitBg();
+                    } catch (Throwable ex) {
+                        Log.w(TAG, "退出后台跟随失败: " + ex);
+                    }
+                }
+            } else {
+                vdDeadStreak = 0;
+            }
 
             // 有整帧要发却一个字节都没发出去 → 基本是 CP 端把连接关了。
             // 把 dashcastd 的日志拉回来，省得靠猜。
