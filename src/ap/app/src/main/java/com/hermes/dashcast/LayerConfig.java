@@ -562,9 +562,33 @@ public final class LayerConfig {
         boolean ok = push();                 /* ① 写 dcapd2.layer */
         if (ctx != null) saveToPrefs(ctx);   /* ② 写 prefs */
 
-        /* ③ 同步 CP 图层矩形（只有投屏中才有 layer 99） */
+        /*
+         * ③ 同步 CP 图层矩形。
+         *
+         * ══════════════════════════════════════════════════════════════
+         * **把 enabled 从条件里去掉**（2026-11-03 关键修复）
+         * ══════════════════════════════════════════════════════════════
+         *
+         * 原条件：if (cp != null && sCasting && enabled && w > 0 && h > 0)
+         *                                          ^^^^^^^
+         *
+         * enabled 只有点过「保存并应用」才会被置 true。
+         * 用户若只点「预设」、或刚切档、从没保存过 —— enabled 仍是 false
+         * → 这里直接跳过，CP 图层保持旧值。
+         *
+         * 为什么 LZ4 看不出来、H.264 立刻暴露：
+         *   · LZ4   destination = 整屏，靠画布 alpha 挖洞，
+         *           **不依赖 setLayerRect 也能正确**
+         *   · H.264 destination = 遮罩矩形，**完全依赖 setLayerRect**
+         *           把 ivi 图层本身缩到那块
+         *   → 一旦跳过，图层还是"整屏"，无 alpha 就把原厂仪表整块盖住，
+         *     表现为"预设的遮罩位置应用不上"
+         *
+         * 只要 w/h 有效就该下发 —— 用户设了尺寸就是"要它生效"，
+         * 不该因为一个内部标志位没被翻过就悄无声息地跳过。
+         */
         CpManager cp = sCp;
-        if (cp != null && sCasting && enabled && w > 0 && h > 0) {
+        if (cp != null && sCasting && w > 0 && h > 0) {
             try {
                 /*
                  * **用按编码档对齐后的矩形**，不是原始 w/h。
@@ -581,10 +605,21 @@ public final class LayerConfig {
                         MirrorController.getCodec(),
                         new int[]{rr[0], rr[1], rr[2], rr[3]},
                         canvasW, canvasH);
-                cp.setLayerRect(dest[0], dest[1], dest[2], dest[3]);
+                boolean rc = cp.setLayerRect(dest[0], dest[1], dest[2], dest[3]);
+                Log.i(TAG, "图层矩形下发 → " + dest[0] + "," + dest[1] + " "
+                        + dest[2] + "x" + dest[3]
+                        + "（codec=" + MirrorController.getCodec()
+                        + " 遮罩=" + rr[2] + "x" + rr[3] + "）rc=" + rc);
             } catch (Throwable t) {
                 Log.w(TAG, "预设同步图层矩形失败: " + t);
             }
+        } else {
+            /*
+             * 走不到下发分支时把原因记下来 —— 这个条件以前静默跳过，
+             * 排查"预设位置应用不上"时完全没有线索。
+             */
+            Log.i(TAG, "图层矩形**跳过**：cp=" + (cp != null)
+                    + " casting=" + sCasting + " w=" + w + " h=" + h);
         }
         return ok;
     }
