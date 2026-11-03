@@ -936,7 +936,18 @@ public class MainActivity extends Activity {
 
         r1.addView(chipButton("放大", v -> maskPreview.setZoomed(
                 !maskPreview.isZoomed())), rowLp(1f));
-        r1.addView(chipButton("帧率 " + maskFps, v -> {
+        col.addView(r1);
+
+        /*
+         * 帧率单独一行（2026-11-03）。
+         *
+         * r1 原来塞了 5 个按钮（矩形/铺满/铺满仪表/放大/帧率），
+         * 706dp 宽均分后每个只剩 141dp —— 中文标签开始截断。
+         * 把帧率拿出来独立成窄条，r1 回到 4 个按钮的舒适宽度。
+         */
+        LinearLayout fpsRow = new LinearLayout(this);
+        fpsRow.setOrientation(LinearLayout.HORIZONTAL);
+        fpsRow.addView(chipButton("帧率 " + maskFps, v -> {
             int[] ch = MirrorController.FPS_CHOICES;
             int nx = ch[0];
             for (int i = 0; i < ch.length; i++) {
@@ -947,7 +958,7 @@ public class MainActivity extends Activity {
                     .setText("帧率 " + maskFps);
             refreshMask();
         }), rowLp(1f));
-        col.addView(r1);
+        col.addView(fpsRow);
 
         /*
          * ══════════════════════════════════════════════════════════════
@@ -1843,6 +1854,23 @@ public class MainActivity extends Activity {
         maskCfg.saveAppRect(this, targetPkg);   /* 按 App 记住 */
         /* 画布先对齐仪表真实分辨率（"铺满网格却铺不满仪表"的根因在这里） */
         syncCanvasToOutput();
+
+        /*
+         * **「应用并投屏」必须顺手把总开关打开**（2026-11-03 第 3 个根因）。
+         *
+         * 「启用页面截取」默认关闭，而关着时 applyMapCrop **完全不裁**，
+         * 抓整个窗口铺满遮罩 —— 用户框好了、点了「应用并投屏」，
+         * 画面却还是整窗口，看着就是"截取尺寸无法生效"。
+         *
+         * 用户点这个按钮的意图很明确："按我框的那块投"，所以这里替他打开，
+         * 并把勾选框的 UI 同步过来（否则界面显示未勾选、实际已生效，更困惑）。
+         */
+        getSharedPreferences(PREF, MODE_PRIVATE).edit()
+                .putBoolean("app_crop_enabled", true).apply();
+        if (appCropEnableBox != null && !appCropEnableBox.isChecked()) {
+            appCropEnableBox.setChecked(true);   /* 触发器里会再下发一次，无妨 */
+        }
+        updateAppCropEnableState();
 
         /*
          * **必须置 enabled=true**（2026-11-03 排查出的第 9 个 bug）。
