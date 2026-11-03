@@ -66,6 +66,26 @@ public final class LayerConfig {
      */
     public int srcX = 0, srcY = 0, srcH = 0;
 
+    /*
+     * ===== App 页面截取区（2026-11-03 新增）=====
+     *
+     * 和遮罩**完全独立**的两套坐标：
+     *   遮罩 (x,y,w,h)          = 画布 1920×532 上的位置
+     *                            → 决定内容投到仪表哪一块
+     *   截取 (srcX,srcY,srcW,srcH) = 屏幕 2560×1600 上的位置
+     *                            → 决定抓 App 的哪一块像素
+     *
+     * 这样用户可以"只抓 App 的某一块画面，投到仪表的某个位置"。
+     *
+     * srcW 是独立字段（不像地图模式那样由 srcH 反推宽度）：
+     * App 页面的比例千奇百怪，必须让用户直接给 W。
+     *
+     * srcAppPkg 记录这条尺寸属于哪个 App；
+     * 换 App 时 UI 会去查该 App 的历史值，命中就自动套用。
+     */
+    public int srcW = 0;
+    public String srcAppPkg = null;
+
     /* ============================ 持久化 ============================ */
 
     /** 生成 key=value 文本（格式必须与 dcapd2 的 dc_layer_parse 对齐） */
@@ -90,7 +110,25 @@ public final class LayerConfig {
         sb.append("trap_top=").append(trapTop).append('\n');
         sb.append("trap_bot=").append(trapBot).append('\n');
         sb.append("feather=").append(feather).append('\n');
-        sb.append("fit=").append(fit).append("\n");
+        sb.append("fit=").append(fit).append('\n');
+
+        /*
+         * ── App 页面截取尺寸（2026-11-03 新增）──
+         *
+         * 和遮罩共用同一个配置文件 /data/local/tmp/dcapd2.layer：
+         *   · dcapd2 的解析器按 key 逐个 kv_get_int 查，多出未知键不影响它
+         *   · App 侧自己读写这几个键
+         *
+         * src_app_pkg 记这条尺寸属于哪个 App；
+         * 换 App 时 UI 会去 prefs 查该 App 的历史尺寸，命中就自动套用。
+         */
+        if (srcAppPkg != null && !srcAppPkg.isEmpty()) {
+            sb.append("src_app_pkg=").append(srcAppPkg).append('\n');
+        }
+        sb.append("src_x=").append(srcX).append('\n');
+        sb.append("src_y=").append(srcY).append('\n');
+        sb.append("src_w=").append(srcW).append('\n');
+        sb.append("src_h=").append(srcH).append('\n');
         return sb.toString();
     }
 
@@ -250,7 +288,70 @@ public final class LayerConfig {
         e.putInt("layer_src_x", srcX);
         e.putInt("layer_src_y", srcY);
         e.putInt("layer_src_h", srcH);
+        e.putInt("layer_src_w", srcW);
         e.apply();
+    }
+
+    /* ============ 按 App 记忆截取尺寸（2026-11-03 新增）============ */
+
+    /*
+     * 每个 App 单独记一套截取尺寸，存在同一个 prefs 里：
+     *   app_rect_<pkg>.x / .y / .w / .h
+     *
+     * 用 prefs 而不是另开文件，理由：
+     *   · 和遮罩配置同源（用户要求"跟遮罩尺寸是同个配置文件"）
+     *   · prefs 本身是 XML，键值天然按 App 分槽，不需要自己管文件格式
+     *   · 读写不涉及 adb，主线程也能安全调用（配置文本落盘才需要后台线程）
+     */
+    public static boolean hasAppRect(Context ctx, String pkg) {
+        if (pkg == null || pkg.isEmpty()) return false;
+        android.content.SharedPreferences p = ctx.getApplicationContext()
+                .getSharedPreferences(PREF, Context.MODE_PRIVATE);
+        return p.contains("app_rect_" + pkg + ".w");
+    }
+
+    /** 读某个 App 的截取尺寸，返回 {x,y,w,h}；没存过返回 null */
+    public static int[] loadAppRect(Context ctx, String pkg) {
+        if (pkg == null || pkg.isEmpty()) return null;
+        android.content.SharedPreferences p = ctx.getApplicationContext()
+                .getSharedPreferences(PREF, Context.MODE_PRIVATE);
+        String k = "app_rect_" + pkg + ".";
+        if (!p.contains(k + "w")) return null;
+        return new int[]{
+                p.getInt(k + "x", 0),
+                p.getInt(k + "y", 0),
+                p.getInt(k + "w", 0),
+                p.getInt(k + "h", 0)
+        };
+    }
+
+    /** 存某个 App 的截取尺寸 */
+    public void saveAppRect(Context ctx, String pkg) {
+        if (pkg == null || pkg.isEmpty()) return;
+        String k = "app_rect_" + pkg + ".";
+        ctx.getApplicationContext()
+                .getSharedPreferences(PREF, Context.MODE_PRIVATE)
+                .edit()
+                .putInt(k + "x", srcX)
+                .putInt(k + "y", srcY)
+                .putInt(k + "w", srcW)
+                .putInt(k + "h", srcH)
+                .apply();
+        this.srcAppPkg = pkg;
+        LocalStore.log(ctx, "记住 " + pkg + " 的截取区 "
+                + srcW + "×" + srcH + " @(" + srcX + "," + srcY + ")");
+    }
+
+    /** 套用某个 App 的历史截取尺寸；没有就返回 false（保持当前值） */
+    public boolean applyAppRect(Context ctx, String pkg) {
+        int[] r = loadAppRect(ctx, pkg);
+        if (r == null) return false;
+        srcX = r[0];
+        srcY = r[1];
+        srcW = r[2];
+        srcH = r[3];
+        srcAppPkg = pkg;
+        return true;
     }
 
     public static LayerConfig loadFromPrefs(Context ctx, int canvasW, int canvasH) {
@@ -283,6 +384,7 @@ public final class LayerConfig {
         c.srcX       = p.getInt("layer_src_x", 0);
         c.srcY       = p.getInt("layer_src_y", 0);
         c.srcH       = p.getInt("layer_src_h", 0);
+        c.srcW       = p.getInt("layer_src_w", 0);
 
         c.sanitize();
         return c;

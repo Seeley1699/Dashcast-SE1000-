@@ -49,6 +49,10 @@ public class MirrorController {
     private static final int OUT_W = 1920;
     private static final int OUT_H = 532;
 
+    /** 仪表输出尺寸（供 UI 计算比例提示用，只读） */
+    public static final int OUT_W_PUBLIC = OUT_W;
+    public static final int OUT_H_PUBLIC = OUT_H;
+
     /** 分片推送时每片的 base64 字符数（adbd 单条命令别太长） */
     private static final int CHUNK = 3000;
 
@@ -1089,6 +1093,37 @@ public class MirrorController {
      * mapMode 关闭时原样返回 —— 普通 App 投屏行为不变。
      */
     private int[] applyMapCrop(int[] win) {
+        /*
+         * ⚠ 先处理「App 页面截取区」，**它不受 mapMode 约束**。
+         *
+         * 原来第一行就是 `if (!mapMode) return win;` —— 于是用户在
+         * 「截取 App 页面」里设了 X/Y/W/H 却完全不生效：
+         * 配置写进 dcapd2.layer 了（src_x=320 src_y=854 src_w=2560 src_h=533），
+         * 但 dcapd2 拿到的还是旧的全屏 0,0 2560×1440。
+         * 实测就是这个现象。
+         *
+         * 两套坐标的定位不同：
+         *   地图模式的显式区（srcH 反推宽度）→ 只在地图模式有意义
+         *   App 截取区（srcW 显式给全）      → 任何 App 投屏都该生效
+         * 所以把 App 截取区提到 mapMode 判断之前。
+         */
+        LayerConfig lc0 = LayerConfig.loadFromPrefs(ctx, OUT_W, OUT_H);
+        if (lc0 != null && lc0.srcW > 0 && lc0.srcH > 0) {
+            int sw = ((lc0.srcW + 15) / 16) * 16;   /* 16 对齐（H.264 硬编要求） */
+            int sh = ((lc0.srcH + 15) / 16) * 16;
+            int sx = lc0.srcX;
+            int sy = lc0.srcY;
+            /* 夹住，别出屏幕 */
+            if (sx + sw > win[0] + win[2]) sx = win[0] + win[2] - sw;
+            if (sy + sh > win[1] + win[3]) sy = win[1] + win[3] - sh;
+            if (sx < win[0]) sx = win[0];
+            if (sy < win[1]) sy = win[1];
+            if (sx < 0) sx = 0;
+            if (sy < 0) sy = 0;
+            Log.i(TAG, "App 截取区生效：源 " + sw + "×" + sh + " @(" + sx + "," + sy + ")");
+            return new int[]{sx, sy, sw, sh};
+        }
+
         if (!mapMode) return win;
 
         LayerConfig lc = LayerConfig.loadFromPrefs(ctx, OUT_W, OUT_H);
@@ -1098,7 +1133,7 @@ public class MirrorController {
         }
 
         /*
-         * 优先用**显式指定的抓取源区域**（layer_src_x / _y / _h）。
+         * ② 地图模式的显式抓取区（layer_src_x / _y / _h）。
          *
          * 为什么需要：下面那套"按遮罩比例居中适配"只能居中，
          * 没法指定纵向起点。实测遮罩 1440×400 时居中算出抓 y=364–1075，
@@ -1290,6 +1325,11 @@ public class MirrorController {
     // ============================== 设备查询 ==============================
 
     /** 读目标 App 的窗口矩形。优先 mAppBounds（排除底部导航条）。 */
+    /** 供 UI 读取目标 App 窗口矩形（「读取窗口」按钮用） */
+    public int[] readWindowRectPublic(String pkg) {
+        return windowRect(pkg);
+    }
+
     private int[] windowRect(String pkg) {
         try {
             String cmd = "dumpsys window windows | awk '/Window\\{/{b=($0 ~ /" + pkg

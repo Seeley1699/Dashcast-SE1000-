@@ -665,6 +665,15 @@ public class MainActivity extends Activity {
     private LinearLayout[] maskPresetBtns;      /* 三个预设按钮 */
     private TextView maskLastSliderVal;
 
+    /* ── App 页面截取区控件（2026-11-03 新增）── */
+    private SeekBar appCropSbX, appCropSbY, appCropSbW, appCropSbH;
+    private LinearLayout appCropFollow, appCropManual;
+    private LinearLayout appCropFitCenter, appCropFitFill;
+    private TextView appCropHint, appCropRatio;
+    private boolean appCropFollowMode = true;
+    /** 初始化滑块时抑制回调，避免 setProgress 触发 onAppCropChanged 递归 */
+    private boolean appCropInit = false;
+
     /** 遮罩面板：预览 + 参数滑块 + 保存/取消，全部内嵌在首页右栏 */
     private void buildMaskPanel(LinearLayout col) {
         maskCfg = LayerConfig.loadFromPrefs(this, 1920, 532);
@@ -697,11 +706,11 @@ public class MainActivity extends Activity {
         head.addView(btnFull);
         col.addView(head);
 
-        /* 预览区（占 1 份高度，可拖拽） */
+        /* 预览区（可拖拽；高度 360 —— 新增「截取 App 页面」区块后要给它腾地方） */
         FrameLayout pvBox = new FrameLayout(this);
         pvBox.setBackgroundColor(getColor(R.color.surface_deep));
         LinearLayout.LayoutParams pvLp = new LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT, dp(520));
+                LinearLayout.LayoutParams.MATCH_PARENT, dp(360));
         pvLp.setMargins(0, dp(8), 0, 0);
         pvBox.setLayoutParams(pvLp);
 
@@ -719,6 +728,9 @@ public class MainActivity extends Activity {
         maskInfo.setTextColor(getColor(R.color.content_tertiary));
         maskInfo.setPadding(dp(2), dp(5), 0, dp(8));
         col.addView(maskInfo);
+
+        /* ★ 新增：App 页面截取区（可折叠，默认收起） */
+        buildAppCropSection(col);
 
         /* ── 三个预设槽：点=应用，长按=保存当前，再长按=清空 ── */
         LinearLayout presetRow = new LinearLayout(this);
@@ -950,6 +962,286 @@ public class MainActivity extends Activity {
     }
 
     /** 面板里的小胶囊按钮（单文字，无图标） */
+    /* ══════════════════════════════════════════════════════════════
+     * App 页面截取区（2026-11-03 新增）
+     * ══════════════════════════════════════════════════════════════
+     *
+     * 和「遮罩」完全独立的两套坐标：
+     *   遮罩 (x,y,w,h)             = 画布 1920×532 → 内容投到仪表哪一块
+     *   截取 (srcX,srcY,srcW,srcH) = 屏幕 2560×1600 → 抓 App 的哪一块像素
+     *
+     * 设计要点：
+     *   · **默认折叠**，只占一行标题 —— 右栏已经很满，
+     *     展开后把下面的控件推下去，靠 ScrollView 滚动可达，
+     *     "保存并应用" 不会被永久挤出屏幕。
+     *   · **按 App 记忆**：每个 App 的截取区尺寸单独存
+     *     （prefs 里 app_rect_<pkg>.x/.y/.w/.h），
+     *     换 App 时自动套用；没存过就用默认值。
+     *   · **写入同一个配置文件**：src_x/src_y/src_w/src_h/src_app_pkg
+     *     和遮罩的 x/y/w/h 一起写进 /data/local/tmp/dcapd2.layer，
+     *     dcapd2 的解析器按 key 逐个查，多出未知键不影响它。
+     */
+    private void buildAppCropSection(LinearLayout parent) {
+        LinearLayout card = card();
+        card.setPadding(dp(10), dp(8), dp(10), dp(10));
+
+        /* ── 标题行：点整行切换折叠 ── */
+        LinearLayout head = new LinearLayout(this);
+        head.setOrientation(LinearLayout.HORIZONTAL);
+        head.setGravity(Gravity.CENTER_VERTICAL);
+
+        TextView title = new TextView(this);
+        title.setText("▸ 截取 App 页面");
+        title.setTextSize(14);
+        title.setTextColor(getColor(R.color.content_accent));
+        title.setTypeface(Typeface.DEFAULT_BOLD);
+        head.addView(title, new LinearLayout.LayoutParams(0,
+                LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
+
+        TextView hint = new TextView(this);
+        hint.setText("点标题展开");
+        hint.setTextSize(12);
+        hint.setTextColor(getColor(R.color.content_tertiary));
+        head.addView(hint);
+
+        card.addView(head);
+
+        /* ── 可折叠的正文 ── */
+        LinearLayout body = new LinearLayout(this);
+        body.setOrientation(LinearLayout.VERTICAL);
+        body.setVisibility(View.GONE);
+        body.setPadding(0, dp(8), 0, 0);
+
+        /* 模式切换：跟随窗口 / 手动 */
+        LinearLayout modeRow = new LinearLayout(this);
+        modeRow.setOrientation(LinearLayout.HORIZONTAL);
+        appCropFollow = chipButton("跟随窗口", v -> setAppCropMode(true));
+        appCropManual = chipButton("手动", v -> setAppCropMode(false));
+        modeRow.addView(appCropFollow, rowLp(1f));
+        modeRow.addView(appCropManual, rowLp(1f));
+        body.addView(modeRow);
+
+        /* 两个 App 历史提示 */
+        appCropHint = new TextView(this);
+        appCropHint.setTextSize(12);
+        appCropHint.setTextColor(getColor(R.color.content_tertiary));
+        appCropHint.setPadding(dp(4), dp(6), 0, 0);
+        body.addView(appCropHint);
+
+        /* 四滑块（两列布局，省高度） */
+        LinearLayout row1 = new LinearLayout(this);
+        row1.setOrientation(LinearLayout.HORIZONTAL);
+        appCropSbX = addMaskSlider(row1, "X", 0, 2560, 0, "", v -> onAppCropChanged());
+        appCropSbY = addMaskSlider(row1, "Y", 0, 1440, 0, "", v -> onAppCropChanged());
+        body.addView(row1);
+
+        LinearLayout row2 = new LinearLayout(this);
+        row2.setOrientation(LinearLayout.HORIZONTAL);
+        appCropSbW = addMaskSlider(row2, "W", 16, 2560, 2560, "", v -> onAppCropChanged());
+        appCropSbH = addMaskSlider(row2, "H", 16, 1440, 1440, "", v -> onAppCropChanged());
+        body.addView(row2);
+
+        /* 比例提示 */
+        appCropRatio = new TextView(this);
+        appCropRatio.setTextSize(12);
+        appCropRatio.setTextColor(getColor(R.color.content_secondary));
+        appCropRatio.setPadding(dp(4), dp(6), 0, dp(4));
+        body.addView(appCropRatio);
+
+        /* 适配方式：等比居中 / 裁满铺 */
+        LinearLayout fitRow = new LinearLayout(this);
+        fitRow.setOrientation(LinearLayout.HORIZONTAL);
+        appCropFitCenter = chipButton("等比居中", v -> setAppCropFit(0));
+        appCropFitFill = chipButton("裁满铺", v -> setAppCropFit(1));
+        fitRow.addView(appCropFitCenter, rowLp(1f));
+        fitRow.addView(appCropFitFill, rowLp(1f));
+        body.addView(fitRow);
+
+        /* 操作：读取窗口 / 应用并投屏 */
+        LinearLayout actRow = new LinearLayout(this);
+        actRow.setOrientation(LinearLayout.HORIZONTAL);
+        LinearLayout btnRead = iconButton("读取窗口", "⬇",
+                R.drawable.btn_secondary, R.color.content_primary,
+                v -> readTargetWindow());
+        LinearLayout btnApply = iconButton("应用并投屏", "✓",
+                R.drawable.btn_selected, R.color.accent_on,
+                v -> applyAppCropAndCast());
+        actRow.addView(btnRead, rowLp(1f));
+        actRow.addView(btnApply, rowLp(1f));
+        body.addView(actRow);
+
+        card.addView(body);
+
+        /* 点标题切换折叠 */
+        head.setOnClickListener(v -> {
+            boolean opening = body.getVisibility() != View.VISIBLE;
+            body.setVisibility(opening ? View.VISIBLE : View.GONE);
+            title.setText((opening ? "▾ " : "▸ ") + "截取 App 页面");
+            hint.setText(opening ? "点标题收起" : "点标题展开");
+            if (opening) syncAppCropFromConfig();
+        });
+
+        parent.addView(card);
+
+        syncAppCropFromConfig();
+        setAppCropMode(true);
+    }
+
+    /** 从配置里把截取区读进滑块（并按当前目标 App 套用历史值） */
+    private void syncAppCropFromConfig() {
+        if (appCropSbX == null) return;
+
+        /* 先看当前目标 App 有没有历史尺寸 */
+        boolean applied = false;
+        if (targetPkg != null) {
+            applied = maskCfg.applyAppRect(this, targetPkg);
+        }
+
+        /* 没历史值：用配置里的（可能来自别的 App 或默认） */
+        if (!applied) {
+            maskCfg.srcW = maskCfg.srcW > 0 ? maskCfg.srcW : 2560;
+            maskCfg.srcH = maskCfg.srcH > 0 ? maskCfg.srcH : 1440;
+        }
+
+        /*
+         * addMaskSlider 的 progress 是**偏移量**（`min + p`），
+         * 所以写回时要减掉 min：
+         *   X/Y 的 min=0   → 直接 setProgress
+         *   W/H 的 min=16  → setProgress(v - 16)
+         * 读出来时反过来加。这一点不注意就会"设 2560 显示 2576"。
+         */
+        appCropInit = true;
+        appCropSbX.setProgress(clamp(maskCfg.srcX, 0, 2560) - 0);
+        appCropSbY.setProgress(clamp(maskCfg.srcY, 0, 1440) - 0);
+        appCropSbW.setProgress(clamp(maskCfg.srcW, 16, 2560) - 16);
+        appCropSbH.setProgress(clamp(maskCfg.srcH, 16, 1440) - 16);
+        appCropInit = false;
+
+        if (appCropHint != null) {
+            String pkg = targetPkg == null ? "（未选 App）" : targetPkg;
+            appCropHint.setText(applied
+                    ? "✓ 已套用该 App 的历史尺寸：" + pkg
+                    : "该 App 无历史尺寸，使用当前值 · " + pkg);
+        }
+        updateAppCropRatio();
+    }
+
+    private int clamp(int v, int lo, int hi) {
+        return v < lo ? lo : (v > hi ? hi : v);
+    }
+
+    /** 滑块变动：写回 maskCfg，切到手动模式，刷新比例 */
+    private void onAppCropChanged() {
+        if (appCropSbX == null || appCropInit) return;
+        /* progress 是偏移量，读值要加回 min（W/H 的 min=16） */
+        maskCfg.srcX = appCropSbX.getProgress() + 0;
+        maskCfg.srcY = appCropSbY.getProgress() + 0;
+        maskCfg.srcW = appCropSbW.getProgress() + 16;
+        maskCfg.srcH = appCropSbH.getProgress() + 16;
+        if (appCropFollowMode) setAppCropMode(false);
+        updateAppCropRatio();
+    }
+
+    /** 刷新比例提示（对比仪表比例） */
+    private void updateAppCropRatio() {
+        if (appCropRatio == null) return;
+        int w = maskCfg.srcW > 0 ? maskCfg.srcW : 1;
+        int h = maskCfg.srcH > 0 ? maskCfg.srcH : 1;
+        double r = (double) w / h;
+        double target = (double) MirrorController.OUT_W_PUBLIC / MirrorController.OUT_H_PUBLIC;
+        boolean ok = Math.abs(r - target) < 0.15;
+        appCropRatio.setText(String.format("比例 %.2f : 1  %s  仪表 %.2f : 1",
+                r, ok ? "✓" : "⚠", target));
+        appCropRatio.setTextColor(getColor(ok
+                ? R.color.content_secondary : R.color.state_warn));
+    }
+
+    /** 跟随窗口 / 手动 切换 */
+    private void setAppCropMode(boolean follow) {
+        appCropFollowMode = follow;
+        if (appCropFollow != null) {
+            appCropFollow.setBackgroundResource(follow
+                    ? R.drawable.btn_selected : R.drawable.btn_secondary);
+        }
+        if (appCropManual != null) {
+            appCropManual.setBackgroundResource(follow
+                    ? R.drawable.btn_secondary : R.drawable.btn_selected);
+        }
+        /* 跟随模式：立刻去读目标 App 的窗口，填进滑块 */
+        if (follow) readTargetWindow();
+    }
+
+    /** 适配方式：0=等比居中 1=裁满铺（影响 fit 字段，进而在 recompute_dst 生效） */
+    private void setAppCropFit(int mode) {
+        maskCfg.fit = mode;
+        if (appCropFitCenter != null) {
+            appCropFitCenter.setBackgroundResource(mode == 0
+                    ? R.drawable.btn_selected : R.drawable.btn_secondary);
+        }
+        if (appCropFitFill != null) {
+            appCropFitFill.setBackgroundResource(mode == 1
+                    ? R.drawable.btn_selected : R.drawable.btn_secondary);
+        }
+        appendLog("App 适配方式 → " + (mode == 0 ? "等比居中" : "裁满铺"));
+    }
+
+    /** 读目标 App 的窗口矩形，填进四个滑块 */
+    private void readTargetWindow() {
+        if (targetPkg == null) {
+            setStatus("状态：请先「选择投屏 App」");
+            return;
+        }
+        setStatus("状态：正在读取 " + (targetLabel == null ? targetPkg : targetLabel) + " 的窗口…");
+        new Thread(() -> {
+            int[] r = null;
+            try {
+                r = mirror.readWindowRectPublic(targetPkg);
+            } catch (Throwable t) {
+                Log.w(TAG, "读窗口失败: " + t);
+            }
+            final int[] rr = r;
+            mainHandler.post(() -> {
+                if (rr == null || rr[2] <= 0 || rr[3] <= 0) {
+                    setStatus("状态：读不到窗口（App 可能没在前台）");
+                    return;
+                }
+                appCropSbX.setProgress(clamp(rr[0], 0, 2560));
+                appCropSbY.setProgress(clamp(rr[1], 0, 1440));
+                appCropSbW.setProgress(clamp(rr[2], 16, 2560));
+                appCropSbH.setProgress(clamp(rr[3], 16, 1440));
+                onAppCropChanged();
+                appendLog("读取窗口 → " + rr[2] + "×" + rr[3] + " @(" + rr[0] + "," + rr[1] + ")");
+                setStatus("状态：已读取窗口 " + rr[2] + "×" + rr[3]);
+            });
+        }, "read-window").start();
+    }
+
+    /** 应用截取区并开始投屏（会先按 App 存历史值） */
+    private void applyAppCropAndCast() {
+        if (targetPkg == null) {
+            setStatus("状态：请先「选择投屏 App」");
+            return;
+        }
+        maskCfg.saveAppRect(this, targetPkg);   /* 按 App 记住 */
+        setStatus("状态：正在应用截取区并投屏…");
+        appendLog("应用截取区 " + maskCfg.srcW + "×" + maskCfg.srcH
+                + " @(" + maskCfg.srcX + "," + maskCfg.srcY + ")");
+
+        final LayerConfig snap = maskCfg;
+        final android.content.Context appCtx = getApplicationContext();
+        new Thread(() -> {
+            try {
+                /* 写配置文件（含 src_app_pkg / src_x / src_y / src_w / src_h） */
+                snap.applyFully(appCtx);
+            } catch (Throwable t) {
+                Log.w(TAG, "写截取配置失败: " + t);
+            }
+            mainHandler.post(this::startCast);
+        }, "app-crop-apply").start();
+    }
+
+    /* ══════════════════════════ 通用控件 ══════════════════════════ */
+
     private LinearLayout chipButton(String text, View.OnClickListener l) {
         LinearLayout b = new LinearLayout(this);
         b.setOrientation(LinearLayout.HORIZONTAL);
