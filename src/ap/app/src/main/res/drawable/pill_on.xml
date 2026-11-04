@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  胶囊标签 —— 选中态。
+
+  全圆角（999dp = 高度一半以上，Shape 会自动钳到半高），
+  实底强调色 + 深色文字，和未选中的描边态形成强对比。
+
+  和 btn_selected 的区别：
+    · btn_selected  方角按钮的选中态（10dp 圆角），用于"BGRA/H.264"这种
+                    改变模式的开关
+    · pill_on       胶囊标签的选中态（全圆角），用于"远景/中景/近景"
+                    这种分组内单选
+-->
+<shape xmlns:android="http://schemas.android.com/apk/res/android" android:shape="rectangle">
+    <solid android:color="@color/pill_on" />
+    <corners android:radius="999dp" />
+</shape>

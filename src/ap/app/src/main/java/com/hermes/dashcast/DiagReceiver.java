@@ -46,7 +46,7 @@ public class DiagReceiver extends BroadcastReceiver {
          * 其余一律拒绝。
          */
         if (ACTION_CPCMD.equals(action) && !isTrustedCaller(context)) {
-            Log.w(TAG, "拒绝不可信调用方的 CPCMD 广播（uid 校验失败）");
+            DashLog.w(TAG, "拒绝不可信调用方的 CPCMD 广播（uid 校验失败）");
             try {
                 // 仍然把拒绝原因写进输出文件，方便排查"为什么命令没执行"
                 java.io.File priv = new java.io.File(context.getFilesDir(), "cpcmd.out");
@@ -112,7 +112,7 @@ public class DiagReceiver extends BroadcastReceiver {
                         fo.close();
                     } catch (Throwable ignored) {
                     }
-                    Log.w(TAG, "CPCMD done, " + out.length() + " chars");
+                    DashLog.w(TAG, "CPCMD done, " + out.length() + " chars");
                 } finally {
                     pr.finish();
                 }
@@ -125,26 +125,26 @@ public class DiagReceiver extends BroadcastReceiver {
                 Context app = context.getApplicationContext();
                 CpManager cp = new CpManager(app);
 
-                Log.w(TAG, "================ CP 诊断 ================");
-                Log.w(TAG, "SSH 连通: " + cp.ping());
-                Log.w(TAG, "dashcastd 版本一致: " + cp.checkDashcastd());
+                DashLog.w(TAG, "================ CP 诊断 ================");
+                DashLog.w(TAG, "SSH 连通: " + cp.ping());
+                DashLog.w(TAG, "dashcastd 版本一致: " + cp.checkDashcastd());
                 int[] sz = cp.queryScreenSize();
-                Log.w(TAG, "CP 屏幕: " + (sz == null ? "解析失败" : sz[0] + "x" + sz[1]));
+                DashLog.w(TAG, "CP 屏幕: " + (sz == null ? "解析失败" : sz[0] + "x" + sz[1]));
                 String log = cp.tailLog(80);
-                for (String line : log.split("\n")) Log.w(TAG, "| " + line);
+                for (String line : log.split("\n")) DashLog.w(TAG, "| " + line);
 
-                Log.w(TAG, "================ AP 诊断 ================");
+                DashLog.w(TAG, "================ AP 诊断 ================");
                 for (String line : AdbShell.exec(
                         "echo '--- dcapd2 ---'; pidof dcapd2 || echo NOT_RUNNING; "
                         + "ls -la /data/local/tmp/dcapd2.pause 2>/dev/null || echo '(无暂停文件)'; "
                         + "echo '--- dcapd2.log ---'; tail -12 /data/local/tmp/dcapd2.log 2>/dev/null; "
                         + "echo '--- focus ---'; dumpsys window | grep mCurrentFocus | tail -1",
                         15000).split("\n")) {
-                    Log.w(TAG, "| " + line);
+                    DashLog.w(TAG, "| " + line);
                 }
-                Log.w(TAG, "================ 诊断结束 ================");
+                DashLog.w(TAG, "================ 诊断结束 ================");
             } catch (Throwable t) {
-                Log.e(TAG, "诊断失败", t);
+                DashLog.e(TAG, "诊断失败", t);
             } finally {
                 pr.finish();
             }
@@ -186,7 +186,7 @@ public class DiagReceiver extends BroadcastReceiver {
 
             if (uid < 0) {
                 /* 拿不到发送方信息：交给 signature 权限把关 */
-                Log.w(TAG, "无法取调用方 uid（返回 " + uid + "），依赖 signature 权限放行");
+                DashLog.w(TAG, "无法取调用方 uid（返回 " + uid + "），依赖 signature 权限放行");
                 return true;
             }
             if (uid == myUid) return true;
@@ -194,10 +194,10 @@ public class DiagReceiver extends BroadcastReceiver {
             if (uid == android.os.Process.SHELL_UID) return true;     /* 标准 adb shell */
             if (uid == 1000) return true;                             /* system_server */
 
-            Log.w(TAG, "拒绝 uid=" + uid + " 的 CPCMD（不是本 App / root / shell）");
+            DashLog.w(TAG, "拒绝 uid=" + uid + " 的 CPCMD（不是本 App / root / shell）");
             return false;
         } catch (Throwable t) {
-            Log.w(TAG, "校验调用方失败，依赖 signature 权限放行: " + t);
+            DashLog.w(TAG, "校验调用方失败，依赖 signature 权限放行: " + t);
             return true;
         }
     }

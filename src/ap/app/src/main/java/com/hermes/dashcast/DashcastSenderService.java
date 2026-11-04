@@ -154,7 +154,7 @@ public class DashcastSenderService extends Service {
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
         if (intent != null && ACTION_STOP.equals(intent.getAction())) {
-            Log.i(TAG, "收到停止指令，释放虚拟屏");
+            DashLog.i(TAG, "收到停止指令，释放虚拟屏");
             stopEverything();
             stopSelf();
             return START_NOT_STICKY;
@@ -164,13 +164,13 @@ public class DashcastSenderService extends Service {
             start();
         } else if (virtualDisplay != null) {
             // 已经在投了：把现有的 displayId 再报一次给 UI，别让调用方干等回调
-            Log.i(TAG, "服务已在运行，重发 displayId=" + sDisplayId);
+            DashLog.i(TAG, "服务已在运行，重发 displayId=" + sDisplayId);
             if (displayReadyListener != null) {
                 displayReadyListener.onDisplayReady(sDisplayId);
             }
         } else {
             // 状态不一致（标志还在、屏没了），重建一次
-            Log.w(TAG, "状态不一致：sRunning=true 但没有虚拟屏，重新建屏");
+            DashLog.w(TAG, "状态不一致：sRunning=true 但没有虚拟屏，重新建屏");
             startIntent = intent;
             start();
         }
@@ -190,7 +190,7 @@ public class DashcastSenderService extends Service {
             try {
                 virtualDisplay.release();
             } catch (Throwable t) {
-                Log.w(TAG, "release 虚拟屏失败: " + t);
+                DashLog.w(TAG, "release 虚拟屏失败: " + t);
             }
             virtualDisplay = null;
         }
@@ -198,7 +198,7 @@ public class DashcastSenderService extends Service {
             try {
                 mediaProjection.stop();
             } catch (Throwable t) {
-                Log.w(TAG, "stop projection 失败: " + t);
+                DashLog.w(TAG, "stop projection 失败: " + t);
             }
             mediaProjection = null;
         }
@@ -227,20 +227,20 @@ public class DashcastSenderService extends Service {
             if (w >= 640 && h >= 320) {
                 virtW = w;
                 virtH = h;
-                Log.i(TAG, "采用 CP 实测尺寸 " + virtW + "x" + virtH);
+                DashLog.i(TAG, "采用 CP 实测尺寸 " + virtW + "x" + virtH);
             } else {
-                Log.i(TAG, "没有 CP 尺寸，用默认 " + virtW + "x" + virtH);
+                DashLog.i(TAG, "没有 CP 尺寸，用默认 " + virtW + "x" + virtH);
             }
         }
 
         // 防御：上一场的屏如果还挂着，先收掉再建。否则会同时存在两个 DashcastVirtual，
         // 一个空的一个有画面的，排查时非常误导。
         if (virtualDisplay != null) {
-            Log.w(TAG, "检测到残留虚拟屏，先释放");
+            DashLog.w(TAG, "检测到残留虚拟屏，先释放");
             try {
                 virtualDisplay.release();
             } catch (Throwable t) {
-                Log.w(TAG, "释放残留屏失败: " + t);
+                DashLog.w(TAG, "释放残留屏失败: " + t);
             }
             virtualDisplay = null;
         }
@@ -263,7 +263,7 @@ public class DashcastSenderService extends Service {
         // LZ4 编码器 ↔ CP 解码器 往返自检（一次性，几毫秒）
         int st = DcapNative.selfTest();
         if (st != 0) {
-            Log.e(TAG, "LZ4 自检失败，用例数 " + st + "（投出去的图块 CP 会解不开）");
+            DashLog.e(TAG, "LZ4 自检失败，用例数 " + st + "（投出去的图块 CP 会解不开）");
             sLastError = "LZ4 自检失败";
         }
 
@@ -287,7 +287,7 @@ public class DashcastSenderService extends Service {
         sDisplayId = displayId;
         sRunning = true;
 
-        Log.i(TAG, "虚拟屏 id=" + displayId + " 状态=" + (disp == null ? "null" : disp.getState())
+        DashLog.i(TAG, "虚拟屏 id=" + displayId + " 状态=" + (disp == null ? "null" : disp.getState())
                 + " " + virtW + "x" + virtH + "@" + VIRT_DPI);
 
         if (displayReadyListener != null) {
@@ -313,17 +313,17 @@ public class DashcastSenderService extends Service {
         int code = startIntent.getIntExtra(EXTRA_PROJECTION_CODE, Integer.MIN_VALUE);
         Intent data = startIntent.getParcelableExtra(EXTRA_PROJECTION_DATA);
         if (code == Integer.MIN_VALUE || data == null) {
-            Log.i(TAG, "无 MediaProjection token，尝试直接建屏（需要 CAPTURE_VIDEO_OUTPUT）");
+            DashLog.i(TAG, "无 MediaProjection token，尝试直接建屏（需要 CAPTURE_VIDEO_OUTPUT）");
             return null;
         }
         try {
             MediaProjectionManager mpm = (MediaProjectionManager)
                     getSystemService(Context.MEDIA_PROJECTION_SERVICE);
             MediaProjection mp = mpm.getMediaProjection(code, data);
-            Log.i(TAG, mp != null ? "已取得 MediaProjection token" : "getMediaProjection 返回 null");
+            DashLog.i(TAG, mp != null ? "已取得 MediaProjection token" : "getMediaProjection 返回 null");
             return mp;
         } catch (Throwable t) {
-            Log.e(TAG, "getMediaProjection 失败: " + t);
+            DashLog.e(TAG, "getMediaProjection 失败: " + t);
             sLastError = "MediaProjection: " + t.getMessage();
             return null;
         }
@@ -355,7 +355,7 @@ public class DashcastSenderService extends Service {
         for (int flags : candidates) {
             VirtualDisplay vd = tryCreate(flags);
             if (vd != null) {
-                Log.i(TAG, "建屏成功 flags=0x" + Integer.toHexString(flags)
+                DashLog.i(TAG, "建屏成功 flags=0x" + Integer.toHexString(flags)
                         + (mediaProjection != null ? "（projection 路径）" : "（免授权路径）"));
                 return vd;
             }
@@ -374,7 +374,7 @@ public class DashcastSenderService extends Service {
                     virtW, virtH, VIRT_DPI, imageReader.getSurface(), flags);
         } catch (Throwable t) {
             String msg = String.valueOf(t.getMessage());
-            Log.w(TAG, "createVirtualDisplay(flags=0x" + Integer.toHexString(flags)
+            DashLog.w(TAG, "createVirtualDisplay(flags=0x" + Integer.toHexString(flags)
                     + ") 抛 " + t.getClass().getSimpleName() + ": " + msg);
             sLastError = t.getClass().getSimpleName() + ": " + msg;
             if (msg.contains("CAPTURE_VIDEO_OUTPUT")
@@ -386,7 +386,7 @@ public class DashcastSenderService extends Service {
     }
 
     private void fail(String why) {
-        Log.e(TAG, why);
+        DashLog.e(TAG, why);
         sLastError = why;
         sRunning = false;
         if (displayReadyListener != null) {
@@ -441,14 +441,14 @@ public class DashcastSenderService extends Service {
                 bytesMark = 0;
                 cpLogDumped = false;
                 connectedAt = SystemClock.elapsedRealtime();
-                Log.i(TAG, "已连 CP " + CP_HOST + ":" + CP_PORT + "（握手 OK）");
+                DashLog.i(TAG, "已连 CP " + CP_HOST + ":" + CP_PORT + "（握手 OK）");
             }
 
             Image image = null;
             try {
                 image = imageReader.acquireLatestImage();
             } catch (Throwable t) {
-                Log.w(TAG, "acquireLatestImage 异常: " + t);
+                DashLog.w(TAG, "acquireLatestImage 异常: " + t);
                 sleepQuiet(20);
                 continue;
             }
@@ -476,7 +476,7 @@ public class DashcastSenderService extends Service {
                     pushCount++;
 
                     if (tiles < 0) {
-                        Log.w(TAG, "发送失败，断开重连");
+                        DashLog.w(TAG, "发送失败，断开重连");
                         DcapNative.disconnect(nativeCtx);
                         connected = false;
                         connectedAt = 0;
@@ -515,7 +515,7 @@ public class DashcastSenderService extends Service {
                 }
                 if (fps > 0 || acqThisWindow > 0) {
                     long avgMs = pushCount > 0 ? pushMsSum / pushCount : 0;
-                    Log.i(TAG, "acq=" + acqThisWindow + " fps=" + fps + " kbps=" + kbps
+                    DashLog.i(TAG, "acq=" + acqThisWindow + " fps=" + fps + " kbps=" + kbps
                             + " tiles=" + stat[0] + " bytes=" + stat[1]
                             + " push=" + avgMs + "ms"
                             + " totalKB=" + (total / 1024));
@@ -537,7 +537,7 @@ public class DashcastSenderService extends Service {
         }
 
         if (connected) DcapNative.disconnect(nativeCtx);
-        Log.i(TAG, "推流线程退出");
+        DashLog.i(TAG, "推流线程退出");
     }
 
     /** 把一帧 Image 交给 native；返回 native 的图块数 */
@@ -592,10 +592,10 @@ public class DashcastSenderService extends Service {
             if (cpManager == null) cpManager = new CpManager(this);
             String s = cpManager.tailLog(30);
             for (String line : s.split("\n")) {
-                Log.i(TAG + "/CP", line);
+                DashLog.i(TAG + "/CP", line);
             }
         } catch (Throwable t) {
-            Log.w(TAG, "取 CP 日志失败: " + t);
+            DashLog.w(TAG, "取 CP 日志失败: " + t);
         }
     }
 
@@ -622,12 +622,12 @@ public class DashcastSenderService extends Service {
             } else {
                 // 线程可能还卡在 native connect 里，这时候 free 会 use-after-free。
                 // 宁可漏这一块（几 MB，进程退出就回收），也不要崩。
-                Log.w(TAG, "推流线程未在 2s 内退出，跳过 native 释放");
+                DashLog.w(TAG, "推流线程未在 2s 内退出，跳过 native 释放");
             }
             nativeCtx = 0;
         }
 
-        Log.i(TAG, "服务停止");
+        DashLog.i(TAG, "服务停止");
         super.onDestroy();
     }
 }

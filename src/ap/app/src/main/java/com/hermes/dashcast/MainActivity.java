@@ -70,9 +70,8 @@ public class MainActivity extends Activity {
     private LinearLayout btnStart, btnStop;    /* 主操作按钮（状态切换时改样式） */
     private TextView statusBadge;              /* 右上角状态徽标 */
     private LinearLayout statusCardView;       /* 状态卡（左侧有状态色条） */
-    private TextView linkInfo;                 /* 右侧链路信息（CP 地址 + 分辨率） */
     private TextView logView;                  /* 运行日志显示区 */
-    private TextView upstream, tilesView;      /* 状态卡里的上行 / 图块指标 */
+    private TextView upstream;                 /* 状态卡里的上行指标（图块已删） */
     private final java.util.ArrayDeque<String> logLines =
             new java.util.ArrayDeque<>();       /* 最近 12 条事件，环形 */
     private static final int LOG_MAX = 12;
@@ -110,7 +109,19 @@ public class MainActivity extends Activity {
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
-
+        /*
+         * ══════════════════════════════════════════════════════════════
+         * **DashLog 必须先初始化**（2026-11-05）
+         * ══════════════════════════════════════════════════════════════
+         *
+         * DashLog 把技术日志双写到 logcat + Download/Dashcast/dashcast.log。
+         * 它需要 Context 才能定位文件 —— 没 init 之前写文件全部静默跳过，
+         * 那样 dashcast.log 就是空的，等于白改。
+         *
+         * 放在 onCreate 最前面（super.onCreate 之后），
+         * 保证后面所有 DashLog.xxx 都能落盘。
+         */
+        DashLog.init(this);
         /* 沉浸式的调用点在 setContentView 之后（见下方），
          * 因为 onCreate 一进来 DecorView 还没建，getInsetsController() 会是 null ——
          * 在那种地方调直接 NPE 闪退。 */
@@ -137,7 +148,6 @@ public class MainActivity extends Activity {
                 mainHandler.post(() -> {
                     if (metrics != null) metrics.setText(String.valueOf(fps));
                     if (upstream != null) upstream.setText(String.valueOf(kbps));
-                    if (tilesView != null) tilesView.setText(String.valueOf(tiles));
                 }));
 
         /* ══════════════════════════════════════════════════════════
@@ -155,7 +165,31 @@ public class MainActivity extends Activity {
          * 右栏（剩余）：遮罩编辑（预览 + 参数 + 保存），原来要跳页面
          * ══════════════════════════════════════════════════════════════ */
 
+        /*
+         * ══════════════════════════════════════════════════════════════
+         * **整个页面要避开状态栏**（2026-11-04 修复"截取 App 页面看不见"）
+         * ══════════════════════════════════════════════════════════════
+         *
+         * applyImmersive() 里调了 `setDecorFitsSystemWindows(false)`：
+         * 让内容延伸到状态栏下方（沉浸式）。但**没有任何地方补顶部留白**，
+         * 于是所有内容从 y=0 开始画 —— 车机顶部那条状态栏（时间/4G/天气）
+         * 高约 70px，正好把「▸ 截取 App 页面」这一行（y=46..70）整个盖住。
+         *
+         * 用户反馈"截取 app 页面在车机查看消失"，就是这个原因 ——
+         * 不是控件没创建，是被状态栏遮住了。
+         *
+         * 修法：读系统状态栏高度（WindowInsets），作为 page 的顶部 padding。
+         * 用 insets 而不是写死 70dp，是为了兼容不同车机的状态栏高度差异。
+         */
         LinearLayout page = new LinearLayout(this);
+        page.setOrientation(LinearLayout.HORIZONTAL);
+        page.setBackgroundColor(getColor(R.color.surface_root));
+        /* 状态栏高度延迟到 attach 之后才读得到，所以挂在 post 里 */
+        page.setOnApplyWindowInsetsListener((v, insets) -> {
+            int top = insets.getInsets(WindowInsets.Type.statusBars()).top;
+            v.setPadding(0, top, 0, insets.getInsets(WindowInsets.Type.navigationBars()).bottom);
+            return WindowInsets.CONSUMED;
+        });
         page.setOrientation(LinearLayout.HORIZONTAL);
         page.setBackgroundColor(getColor(R.color.surface_root));
 
@@ -178,8 +212,13 @@ public class MainActivity extends Activity {
 
         TextView title = new TextView(this);
         title.setText("Dashcast");
-        title.setTextSize(32);
-        title.setTextColor(getColor(android.R.color.white));
+        title.setTextSize(36);
+        /*
+         * 标题文字用 content_primary（浅色 UI 是深色字）
+         * 原来是写死的 android.R.color.white —— 深色底上没问题，
+         * 换成 #F5F5F5 页面后白字完全看不见。
+         */
+        title.setTextColor(getColor(R.color.content_primary));
         title.setTypeface(Typeface.DEFAULT_BOLD);
         title.setLetterSpacing(-0.02f);
         title.setIncludeFontPadding(false);
@@ -187,13 +226,13 @@ public class MainActivity extends Activity {
 
         TextView subtitle = new TextView(this);
         subtitle.setText("车机中控 → 仪表投屏");
-        subtitle.setTextSize(15);
+        subtitle.setTextSize(16);
         subtitle.setTextColor(getColor(R.color.content_secondary));
         titleCol.addView(subtitle);
 
         statusBadge = new TextView(this);
         statusBadge.setText("未运行");
-        statusBadge.setTextSize(14);
+        statusBadge.setTextSize(16);
         statusBadge.setTextColor(getColor(R.color.content_secondary));
         statusBadge.setTypeface(Typeface.DEFAULT_BOLD);
         statusBadge.setPadding(dp(12), dp(5), dp(12), dp(5));
@@ -205,7 +244,21 @@ public class MainActivity extends Activity {
         LinearLayout statusCard = new LinearLayout(this);
         statusCardView = statusCard;
         statusCard.setOrientation(LinearLayout.VERTICAL);
-        statusCard.setBackgroundResource(R.drawable.status_card);
+        /*
+         * 状态卡改用 StatusCardDrawable（2026-11-04）。
+         *
+         * 原来是 status_card.xml（layer-list：squircle 卡片 + 5dp 竖条）。
+         * 但 XML 的竖条用 topLeftRadius/bottomLeftRadius 是**标准圆弧**，
+         * 现在卡片主体是超椭圆曲线，两者曲率对不上 —— 放大能看到豁口。
+         *
+         * StatusCardDrawable 一次画完：squircle 路径 + clipPath 裁出色条，
+         * 曲率完全一致，且支持 setBarColor 动态改色。
+         */
+        statusCard.setBackground(new StatusCardDrawable(
+                getColor(R.color.surface_card),
+                getColor(R.color.surface_border),
+                getColor(R.color.state_idle),
+                dpFloat(Squircle.R_CARD), dpFloat(5)));
         statusCard.setPadding(dp(24), dp(14), dp(20), dp(14));
         LinearLayout.LayoutParams scLp = new LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT,
@@ -226,28 +279,60 @@ public class MainActivity extends Activity {
 
         status = new TextView(this);
         status.setText("状态：未运行");
-        status.setTextSize(22);
+        /*
+         * ══════════════════════════════════════════════════════════
+         * **状态文字必须限行**（2026-11-05）
+         * ══════════════════════════════════════════════════════════
+         *
+         * 实测：投屏失败时状态文案变成三行（含包名 + 建议），
+         * 状态卡从 84dp 撑到 200dp+，把下面「服务部署」「投屏控制」
+         * 整块往下推了 160px —— 按钮位置全变，用户点空。
+         *
+         * 修法：限 2 行 + 尾部省略号。
+         *   2 行足够显示「状态：投屏失败 —— com.xxx 起不到前台」这一半，
+         *   完整原因在下方「运行日志」里能看到（日志不截断）。
+         */
+        status.setTextSize(28);
+        status.setMaxLines(2);
+        status.setEllipsize(android.text.TextUtils.TruncateAt.END);
+        status.setLineSpacing(0f, 1.05f);
         status.setTextColor(getColor(R.color.content_primary));
         status.setTypeface(Typeface.DEFAULT_BOLD);
         statusRow.addView(status);
         statusCard.addView(statusRow);
 
+        /*
+         * 指标区重新布局（2026-11-04）。
+         *
+         * 删掉「图块」后只剩 fps 和上行两格 —— 原来三格均分时
+         * 每格占 1/3 宽度刚好；现在两格各占 1/2，数字会离得很开、
+         * 中间大片空白，看着散。
+         *
+         * 改成：两格各自固定宽度（200dp），整体左对齐，
+         * 数字紧凑排在一起，右侧留空 —— 视觉上是一组数据而不是散落的。
+         */
         LinearLayout statGrid = new LinearLayout(this);
         statGrid.setOrientation(LinearLayout.HORIZONTAL);
+        statGrid.setGravity(Gravity.START);
+        /*
+         * 高度 64 → 84dp（2026-11-04 修复标签被裁）。
+         *
+         * 内部实际需要：
+         *   数值 36sp ≈ 44px
+         *   标签 15sp ≈ 20px + 上边距 3px
+         *   = 67px > 64px  → 标签底部被裁掉半行，
+         *   用户看到的就是"上行 KB/s"那几个字被切了一半。
+         *
+         * 给到 84dp：留出 17px 余量，任何字体缩放都不会裁。
+         */
         LinearLayout.LayoutParams sgLp = new LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT, dp(64));
+                LinearLayout.LayoutParams.MATCH_PARENT, dp(84));
         sgLp.setMargins(0, dp(10), 0, 0);
         statGrid.setLayoutParams(sgLp);
-        metrics   = statCell(statGrid, "fps",  "—");
-        upstream  = statCell(statGrid, "上行 KB/s", "—");
-        tilesView = statCell(statGrid, "图块", "—");
+        metrics   = statCellFixed(statGrid, "fps",  "—");
+        upstream  = statCellFixed(statGrid, "上行 KB/s", "—");
         statusCard.addView(statGrid);
 
-        linkInfo = new TextView(this);
-        linkInfo.setText("CP 198.18.34.2:8444  ·  SSH 22");
-        linkInfo.setTextSize(13);
-        linkInfo.setTextColor(getColor(R.color.content_tertiary));
-        statusCard.addView(linkInfo);
         left.addView(statusCard);
 
         /* ── 服务部署 ── */
@@ -256,7 +341,7 @@ public class MainActivity extends Activity {
         deployRow.setOrientation(LinearLayout.HORIZONTAL);
         deployRow.addView(iconButton("部署", "↓", R.drawable.btn_primary,
                 android.R.color.white, v -> deployService()), rowLp(1f));
-        deployRow.addView(iconButton("停止", "■", R.drawable.btn_secondary,
+        deployRow.addView(iconButton("停止", "■", R.drawable.btn_danger,
                 R.color.state_error, v -> stopCpService()), rowLp(1f));
         left.addView(deployRow);
 
@@ -264,7 +349,16 @@ public class MainActivity extends Activity {
         left.addView(sectionLabel("投屏控制"));
         LinearLayout castCard = new LinearLayout(this);
         castCard.setOrientation(LinearLayout.VERTICAL);
-        castCard.setBackgroundResource(R.drawable.card_focus);
+        /*
+         * 投屏控制卡改用 squircle（2026-11-04）。
+         *
+         * 原来用 card_focus.xml（XML 方角 + 描边，无阴影）。
+         * 在浅色 UI 上，白卡片浮在灰底上**唯一的分层线索是阴影** ——
+         * 没有阴影时卡片和背景几乎融在一起，整片看起来"一片白"。
+         *
+         * 改用 Squircle.of(this).card()：squircle 圆角 + 1dp 描边 + 阴影。
+         */
+        castCard.setBackground(Squircle.of(this).card(R.color.surface_card));
         castCard.setPadding(dp(12), dp(10), dp(12), dp(10));
         LinearLayout.LayoutParams ccLp = new LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT,
@@ -272,7 +366,7 @@ public class MainActivity extends Activity {
         castCard.setLayoutParams(ccLp);
 
         targetHint = new TextView(this);
-        targetHint.setTextSize(14);
+        targetHint.setTextSize(16);
         targetHint.setTextColor(getColor(R.color.content_secondary));
         targetHint.setGravity(Gravity.CENTER);
         targetHint.setPadding(dp(10), dp(6), dp(10), dp(6));
@@ -292,8 +386,8 @@ public class MainActivity extends Activity {
         btnStart = iconButton("开始投屏", "▶", R.drawable.btn_primary,
                 android.R.color.white, v -> startCast());
         castMainRow.addView(btnStart, rowLp(1.5f));
-        btnStop = iconButton("停止", "■", R.drawable.btn_secondary,
-                R.color.content_secondary, v -> stopCastOnly());
+        btnStop = iconButton("停止", "■", R.drawable.btn_danger,
+                R.color.state_error, v -> stopCastOnly());
         castMainRow.addView(btnStop, rowLp(1f));
         castCard.addView(castMainRow);
 
@@ -421,14 +515,14 @@ public class MainActivity extends Activity {
 
         TextView logTitle = new TextView(this);
         logTitle.setText("最近事件");
-        logTitle.setTextSize(12);
+        logTitle.setTextSize(13);
         logTitle.setTextColor(getColor(R.color.content_tertiary));
         logHead.addView(logTitle, new LinearLayout.LayoutParams(
                 0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
 
         Button btnClearLog = new Button(this);
         btnClearLog.setText("清空");
-        btnClearLog.setTextSize(12);
+        btnClearLog.setTextSize(13);
         btnClearLog.setTextColor(getColor(R.color.content_tertiary));
         btnClearLog.setBackgroundResource(R.drawable.btn_secondary);
         btnClearLog.setAllCaps(false);
@@ -443,9 +537,28 @@ public class MainActivity extends Activity {
         logHead.addView(btnClearLog);
         logCard.addView(logHead);
 
+        /*
+         * 启动时**读回历史事件**（2026-11-05 方案 B）。
+         *
+         * 事件现在存 prefs（不落 events.log），所以 App 重启后
+         * 还能看到上次做了什么 —— 之前是纯内存，重启就空了。
+         */
+        for (String ev : LocalStore.readEvents(this)) {
+            logLines.addLast(ev);
+            while (logLines.size() > LOG_MAX) logLines.removeFirst();
+        }
         logView = new TextView(this);
-        logView.setText(LOG_EMPTY_HINT);
-        logView.setTextSize(13);
+        if (logLines.isEmpty()) {
+            logView.setText(LOG_EMPTY_HINT);
+        } else {
+            StringBuilder sb0 = new StringBuilder();
+            for (String l0 : logLines) {
+                if (sb0.length() > 0) sb0.append((char) 10);
+                sb0.append(l0);
+            }
+            logView.setText(sb0.toString());
+        }
+        logView.setTextSize(15);
         logView.setTextColor(getColor(R.color.content_tertiary));
         logView.setTypeface(Typeface.MONOSPACE);
         logView.setLineSpacing(0f, 1.5f);
@@ -459,11 +572,33 @@ public class MainActivity extends Activity {
         /* ══ 右栏：遮罩编辑（内容较高，套 ScrollView 防挤压）══ */
         ScrollView rightScroll = new ScrollView(this);
         rightScroll.setFillViewport(true);
+        rightScrollRef = rightScroll;
         page.addView(rightScroll, new LinearLayout.LayoutParams(0,
                 LinearLayout.LayoutParams.MATCH_PARENT, 1f));
 
         LinearLayout right = new LinearLayout(this);
         right.setOrientation(LinearLayout.VERTICAL);
+        /*
+         * 顶部留白 14 → 32dp（2026-11-04）。
+         *
+         * 「截取 App 页面」移到右栏最顶部后，uiautomator 实测标题落在
+         * y=32..53 —— 车机顶部有状态栏（时间/4G/温度），32px 正好压在
+         * 状态栏底下，视觉上像"这个区块不存在"。
+         *
+         * 原来的 14dp 是按"最上面是「图层遮罩」标题"设计的
+         * （标题自带 12dp padding，合计 26dp 够用）；
+         * 现在最上面是折叠卡片（card() 只有 10dp 上边距），不够。
+         * 加到 32dp，和左栏视觉起线对齐，也不压状态栏。
+         */
+        /*
+         * 顶部留白 32 → 14dp（2026-11-04）。
+         *
+         * 32dp 是按"最上面是卡片"设计的，但实测叠加后：
+         *   right padding 32 + card margin 10 + card padding 8 = 50dp
+         * 车机屏上就是标题上方一条明显空白带（用户反馈"顶部有什么东西"）。
+         *
+         * 回到 14dp：heading 文字本身有行高，14dp 足够不贴状态栏。
+         */
         right.setPadding(dp(12), dp(14), dp(20), dp(14));
         rightScroll.addView(right, new ScrollView.LayoutParams(
                 ScrollView.LayoutParams.MATCH_PARENT,
@@ -483,6 +618,20 @@ public class MainActivity extends Activity {
 
         setDotColor(R.color.content_secondary);
         refreshCodecButtons();
+        /*
+         * 切档后刷新形状/适配按钮的**文案**（2026-11-04）。
+         *
+         * 这两个按钮在 H.264 下会显示「矩形（H264 固定）」「铺满（固定）」，
+         * 切回 BGRA 要还原成正常文案。
+         * 原来只有 applyAlphaDependentAvailability() 改它们的 enabled/alpha，
+         * 没改 text —— 切档后按钮虽然可点了，文案却还留着「（固定）」后缀。
+         */
+        if (maskBtnShape != null) {
+            ((TextView) maskBtnShape.getChildAt(0)).setText(shapeLabel());
+        }
+        if (maskBtnFit != null) {
+            ((TextView) maskBtnFit.getChildAt(0)).setText(fitLabel());
+        }
         mirror.setMapMode(this, MirrorController.loadMapMode(this));
         updateMapModeBtn();
 
@@ -503,9 +652,37 @@ public class MainActivity extends Activity {
         }
         updateTargetHint();
         refreshCodecButtons();
+        /*
+         * 切档后刷新形状/适配按钮的**文案**（2026-11-04）。
+         *
+         * 这两个按钮在 H.264 下会显示「矩形（H264 固定）」「铺满（固定）」，
+         * 切回 BGRA 要还原成正常文案。
+         * 原来只有 applyAlphaDependentAvailability() 改它们的 enabled/alpha，
+         * 没改 text —— 切档后按钮虽然可点了，文案却还留着「（固定）」后缀。
+         */
+        if (maskBtnShape != null) {
+            ((TextView) maskBtnShape.getChildAt(0)).setText(shapeLabel());
+        }
+        if (maskBtnFit != null) {
+            ((TextView) maskBtnFit.getChildAt(0)).setText(fitLabel());
+        }
 
         setDotColor(R.color.content_secondary);
         refreshCodecButtons();
+        /*
+         * 切档后刷新形状/适配按钮的**文案**（2026-11-04）。
+         *
+         * 这两个按钮在 H.264 下会显示「矩形（H264 固定）」「铺满（固定）」，
+         * 切回 BGRA 要还原成正常文案。
+         * 原来只有 applyAlphaDependentAvailability() 改它们的 enabled/alpha，
+         * 没改 text —— 切档后按钮虽然可点了，文案却还留着「（固定）」后缀。
+         */
+        if (maskBtnShape != null) {
+            ((TextView) maskBtnShape.getChildAt(0)).setText(shapeLabel());
+        }
+        if (maskBtnFit != null) {
+            ((TextView) maskBtnFit.getChildAt(0)).setText(fitLabel());
+        }
         loadTargetPref();
         updateTargetHint();
 
@@ -523,6 +700,20 @@ public class MainActivity extends Activity {
          */
         MirrorController.loadCodec(this);
         refreshCodecButtons();
+        /*
+         * 切档后刷新形状/适配按钮的**文案**（2026-11-04）。
+         *
+         * 这两个按钮在 H.264 下会显示「矩形（H264 固定）」「铺满（固定）」，
+         * 切回 BGRA 要还原成正常文案。
+         * 原来只有 applyAlphaDependentAvailability() 改它们的 enabled/alpha，
+         * 没改 text —— 切档后按钮虽然可点了，文案却还留着「（固定）」后缀。
+         */
+        if (maskBtnShape != null) {
+            ((TextView) maskBtnShape.getChildAt(0)).setText(shapeLabel());
+        }
+        if (maskBtnFit != null) {
+            ((TextView) maskBtnFit.getChildAt(0)).setText(fitLabel());
+        }
 
         if (MirrorController.isMirroring()) {
             running = true;
@@ -549,6 +740,20 @@ public class MainActivity extends Activity {
         updateMapModeBtn();
         updateTargetHint();
         refreshCodecButtons();
+        /*
+         * 切档后刷新形状/适配按钮的**文案**（2026-11-04）。
+         *
+         * 这两个按钮在 H.264 下会显示「矩形（H264 固定）」「铺满（固定）」，
+         * 切回 BGRA 要还原成正常文案。
+         * 原来只有 applyAlphaDependentAvailability() 改它们的 enabled/alpha，
+         * 没改 text —— 切档后按钮虽然可点了，文案却还留着「（固定）」后缀。
+         */
+        if (maskBtnShape != null) {
+            ((TextView) maskBtnShape.getChildAt(0)).setText(shapeLabel());
+        }
+        if (maskBtnFit != null) {
+            ((TextView) maskBtnFit.getChildAt(0)).setText(fitLabel());
+        }
     }
 
     /**
@@ -610,7 +815,6 @@ public class MainActivity extends Activity {
                     if (metrics == null) return;
                     metrics.setText(String.valueOf(fps));
                     if (upstream != null) upstream.setText(String.valueOf(kbps));
-                    if (tilesView != null) tilesView.setText(String.valueOf(tiles));
                 });
             }
 
@@ -622,7 +826,6 @@ public class MainActivity extends Activity {
                     setDotColor(R.color.content_secondary);
                     if (metrics != null) metrics.setText("—");
                     if (upstream != null) upstream.setText("—");
-                    if (tilesView != null) tilesView.setText("—");
                 });
             }
         };
@@ -635,7 +838,7 @@ public class MainActivity extends Activity {
         targetCls = p.getString(K_CLS, null);
         targetLabel = p.getString(K_LABEL, null);
         if (targetPkg != null && targetCls != null) {
-            Log.i(TAG, "记住的投屏目标: " + targetPkg + "/" + targetCls);
+            DashLog.i(TAG, "记住的投屏目标: " + targetPkg + "/" + targetCls);
         }
     }
 
@@ -648,14 +851,25 @@ public class MainActivity extends Activity {
     }
 
     /** 建一个圆角卡片容器 */
+    /**
+     * 卡片容器（MiUIX Card 规范 + squircle 圆角）。
+     *
+     * 圆角从 XML 的 card_bg（标准 16dp 圆弧）换成 SquircleDrawable：
+     *   MiUIX Card.kt 用的是 squircleSurface，不是标准圆角。
+     *   差别在于转角"拉长"到 1.1 倍半径 + 贝塞尔过渡，
+     *   曲率连续，视觉上和 HyperOS 卡片一致。
+     *
+     * 填充色 = MiUIX surfaceContainer (#242424)，和页面底同色；
+     * 只用 1dp outline (#404040) 描边来划分卡片边界 —— 这是 MiUIX 的分层方式。
+     */
     private LinearLayout card() {
         LinearLayout c = new LinearLayout(this);
         c.setOrientation(LinearLayout.VERTICAL);
-        c.setBackgroundResource(R.drawable.card_bg);
+        c.setBackground(Squircle.of(this).card(R.color.surface_card));
         LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT,
                 LinearLayout.LayoutParams.WRAP_CONTENT);
-        lp.setMargins(0, dp(10), 0, dp(4));
+        lp.setMargins(0, dp(8), 0, dp(4));
         c.setLayoutParams(lp);
         return c;
     }
@@ -666,11 +880,15 @@ public class MainActivity extends Activity {
     private LayerConfig maskCfg;
     private LayerPreviewView maskPreview;
     private TextView maskInfo;
-    private SeekBar maskSbGrid, maskSbDpi, maskSbBorder, maskSbTl, maskSbTr,
+    private SeekBar maskSbGrid, maskSbBorder, maskSbTl, maskSbTr,
                     maskSbBl, maskSbBr, maskSbTrapTop, maskSbTrapBot, maskSbFeather;
-    private TextView maskTvGrid, maskTvDpi, maskTvBorder, maskTvTl, maskTvTr,
+    private TextView maskTvGrid, maskTvBorder, maskTvTl, maskTvTr,
                      maskTvBl, maskTvBr, maskTvTrapTop, maskTvTrapBot, maskTvFeather;
     private LinearLayout maskBtnShape, maskBtnFit;
+    /** 四角圆角"同步"勾选框（勾上 = 四角联动） */
+    private android.widget.CheckBox cornerLockBox;
+    /** 防重入标志：批量同步四角时不要递归回调 */
+    private boolean cornerSyncing = false;
     private int maskFps = 30;
     private LinearLayout[] maskPresetBtns;      /* 三个预设按钮 */
     private TextView maskLastSliderVal;
@@ -718,6 +936,20 @@ public class MainActivity extends Activity {
         /* 载入时先把画布尺寸对齐一次（CP 分辨率可能变过） */
         syncCanvasToOutput();
 
+        /*
+         * 「截取 App 页面」放在最顶部（2026-11-04 布局调整）。
+         *
+         * 两套坐标的语义关系：
+         *   截取区 srcX/Y/W/H = 抓屏幕哪一块   ← 输入
+         *   遮罩   x/y/w/h    = 投到仪表哪一块 ← 输出
+         *
+         * 输入逻辑上先于输出，所以放最前。原来夹在「预览区」和
+         * 「预设槽」中间 —— 用户调遮罩调到一半碰到它，操作流被打断。
+         *
+         * 折叠时只占 44dp；展开时正是用户在操作它的时候。
+         */
+        buildAppCropSection(col);
+
         /* 标题 */
         LinearLayout head = new LinearLayout(this);
         head.setOrientation(LinearLayout.HORIZONTAL);
@@ -725,31 +957,43 @@ public class MainActivity extends Activity {
 
         TextView t = new TextView(this);
         t.setText("图层遮罩");
-        t.setTextSize(19);
+        t.setTextSize(20);
         t.setTextColor(getColor(R.color.content_primary));
         t.setTypeface(Typeface.DEFAULT_BOLD);
         head.addView(t, new LinearLayout.LayoutParams(
                 0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
 
-        Button btnFull = new Button(this);
-        btnFull.setText("展开编辑");
-        btnFull.setTextSize(13);
-        btnFull.setTextColor(getColor(R.color.accent_soft));
-        btnFull.setBackgroundResource(R.drawable.btn_secondary);
-        btnFull.setAllCaps(false);
-        btnFull.setPadding(dp(10), 0, dp(10), 0);
-        btnFull.setLayoutParams(new LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.WRAP_CONTENT, dp(38)));
-        btnFull.setOnClickListener(v -> startActivity(
-                new android.content.Intent(this, LayerEditorActivity.class)));
-        head.addView(btnFull);
+        /*
+         * 「展开编辑」按钮已删除（2026-11-04）。
+         *
+         * 它跳转到 LayerEditorActivity —— 一个独立的可视化布局编辑器，
+         * 内容（形状/网格/边框圆角/梯形羽化/恢复全屏/取消保存）
+         * 和首页右栏**完全重复**，只是排布更松散。
+         *
+         * 两套编辑入口容易让人困惑"改哪个才生效"，而且独立页面的
+         * 实时预览不跟随投屏状态。既然首页已经够用，直接去掉。
+         *
+         * （LayerEditorActivity.java 本身保留 —— 万一以后要恢复入口，
+         *   文件还在。它不再被任何代码引用。）
+         */
         col.addView(head);
 
         /* 预览区（可拖拽；高度 360 —— 新增「截取 App 页面」区块后要给它腾地方） */
         FrameLayout pvBox = new FrameLayout(this);
-        pvBox.setBackgroundColor(getColor(R.color.surface_deep));
+        /*
+         * 预览容器改成 squircle（2026-11-04）。
+         *
+         * 原来直接 setBackgroundColor 纯色 → 直角矩形，
+         * 和周围 16dp squircle 卡片放在一起显得"方"。
+         *
+         * 现在用 SquircleDrawable：填充 #000000（MiUIX surface），
+         * 16dp 超椭圆圆角，和卡片一致的曲率。
+         * 描边 1dp outline，让预览区和页面底分开。
+         */
+        pvBox.setBackground(Squircle.of(this).border(
+                R.color.surface_deep, R.color.surface_border, 1f, Squircle.R_TAB));
         LinearLayout.LayoutParams pvLp = new LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT, dp(360));
+                LinearLayout.LayoutParams.MATCH_PARENT, dp(320));
         pvLp.setMargins(0, dp(8), 0, 0);
         pvBox.setLayoutParams(pvLp);
 
@@ -757,19 +1001,24 @@ public class MainActivity extends Activity {
         maskPreview.setOnGeometryChanged(c -> refreshMaskInfo());
         /* 地图模式开的时候，预览上叠一块"实际抓取区"虚线框 */
         maskPreview.setMapMode(mirror.isMapMode(), 2560, 1600);
+        /*
+         * 补应用「吸附网格」偏好。
+         * buildAppCropSection 在 maskPreview 创建之前就跑了（它在右栏顶部），
+         * 那次调用被 null 判断跳过。这里 maskPreview 已就绪，补一次。
+         */
+        maskPreview.setSnapEnabled(getSharedPreferences(PREF, MODE_PRIVATE)
+                .getBoolean("layer_snap_grid", true));
+
         pvBox.addView(maskPreview, new FrameLayout.LayoutParams(
                 FrameLayout.LayoutParams.MATCH_PARENT,
                 FrameLayout.LayoutParams.MATCH_PARENT));
         col.addView(pvBox);
 
         maskInfo = new TextView(this);
-        maskInfo.setTextSize(13);
+        maskInfo.setTextSize(15);
         maskInfo.setTextColor(getColor(R.color.content_tertiary));
         maskInfo.setPadding(dp(2), dp(5), 0, dp(8));
         col.addView(maskInfo);
-
-        /* ★ 新增：App 页面截取区（可折叠，默认收起） */
-        buildAppCropSection(col);
 
         /* ── 三个预设槽：点=应用，长按=保存当前，再长按=清空 ── */
         LinearLayout presetRow = new LinearLayout(this);
@@ -823,10 +1072,10 @@ public class MainActivity extends Activity {
                     new Thread(() -> {
                         try {
                             snap.applyFully(appCtx);
-                            Log.i("DashcastMask", "预设 " + (s + 1) + " 已完整下发"
+                            DashLog.i("DashcastMask", "预设 " + (s + 1) + " 已完整下发"
                                     + (casting ? "（含图层矩形）" : "（未投屏，仅落盘）"));
                         } catch (Throwable ex) {
-                            Log.w("DashcastMask", "预设下发失败: " + ex);
+                            DashLog.w("DashcastMask", "预设下发失败: " + ex);
                         }
                     }, "preset-apply").start();
                 }
@@ -859,7 +1108,7 @@ public class MainActivity extends Activity {
 
         TextView presetHint = new TextView(this);
         presetHint.setText("点预设=应用 · 长按=保存/清空");
-        presetHint.setTextSize(12);
+        presetHint.setTextSize(13);
         presetHint.setTextColor(getColor(R.color.content_tertiary));
         presetHint.setPadding(dp(4), 0, 0, dp(8));
         col.addView(presetHint);
@@ -929,13 +1178,22 @@ public class MainActivity extends Activity {
                 try {
                     snap.applyFully(appCtx);
                 } catch (Throwable ex) {
-                    Log.w(TAG, "铺满仪表下发失败: " + ex);
+                    DashLog.w(TAG, "铺满仪表下发失败: " + ex);
                 }
             }, "fill-dash").start();
         }), rowLp(1f));
 
-        r1.addView(chipButton("放大", v -> maskPreview.setZoomed(
-                !maskPreview.isZoomed())), rowLp(1f));
+        /*
+         * 「放大」按钮已删除（2026-11-04）。
+         *
+         * 它原本是「预览画布 2 倍放大」，号称给精确拖框用。
+         * 但实现有缺陷：computeScale() 里 ox/oy 按放大后的尺寸算，
+         * 2 倍后画布必然超出预览区，offset 变成负值 ——
+         * 画布中心可见，四周被裁且无法平移查看，反而更难操作。
+         *
+         * 功能不完整，直接去掉。精确拖框靠下面的「拖拽吸附」开关
+         * （关掉后就是像素级）已经够用。
+         */
         col.addView(r1);
 
         /*
@@ -954,7 +1212,18 @@ public class MainActivity extends Activity {
                 if (ch[i] == maskFps) { nx = ch[(i + 1) % ch.length]; break; }
             }
             maskFps = nx;
-            ((TextView) ((LinearLayout) v.getParent()).getChildAt(0))
+            /*
+             * **不能 v.getParent()**（2026-11-04 修复闪退）。
+             *
+             * chipButton 返回的 LinearLayout 是**按钮本身**，
+             * 它的第 0 个子 View 才是文字 TextView。
+             *
+             * 原代码多绕了一层 getParent()：v 已经是按钮，
+             * v.getParent() 拿到的是 fpsRow（LinearLayout），
+             * getChildAt(0) 取到的还是那个按钮 container，
+             * 强转 TextView 直接 ClassCastException → 崩溃。
+             */
+            ((TextView) ((LinearLayout) v).getChildAt(0))
                     .setText("帧率 " + maskFps);
             refreshMask();
         }), rowLp(1f));
@@ -976,65 +1245,133 @@ public class MainActivity extends Activity {
          * 方案：置灰 + 醒目提示。诚实说明比让人白试好。
          */
         maskAlphaWarn = new TextView(this);
-        maskAlphaWarn.setTextSize(12);
+        maskAlphaWarn.setTextSize(13);
         maskAlphaWarn.setTextColor(getColor(R.color.state_warn));
         maskAlphaWarn.setPadding(dp(4), dp(6), dp(4), dp(2));
         maskAlphaWarn.setLineSpacing(0, 1.15f);
         col.addView(maskAlphaWarn);
 
-        /* 参数滑块（两列网格） */
-        col.addView(maskSection("网格与 DPI"));
-        /* 参数滑块：3 列 × 4 行（10 个参数） */
-        col.addView(maskSection("网格 · DPI · 边框"));
-        col.addView(maskSection("网格 · DPI · 边框 · 羽化"));
+        /*
+         * 参数滑块区（两列网格）。
+         *
+         * 原来这里堆了三个重复的小标题：
+         *   "网格与 DPI" / "网格 · DPI · 边框" / "网格 · DPI · 边框 · 羽化"
+         * 是历史迭代留下的残骸，占 78dp 纯浪费。
+         * 现在只留一个「遮罩参数」，把 4 个滑块合在一组。
+         */
+        col.addView(maskSection("遮罩参数"));
         LinearLayout g0 = grid2();
         maskSbGrid = addMaskSlider(g0, "网格", 4, 128, maskCfg.grid, "px",
                 v -> { maskCfg.grid = v; refreshMask(); });
         maskTvGrid = maskLastSliderVal;
         /*
-         * DPI —— **纯预留参数，不影响任何实际输出**（2026-11-03 排查确认）。
+         * **DPI 滑块已删除**（2026-11-04）。
          *
-         * 它会被解析进 LayerConfig、写进 dcapd2.layer，但 **dcapd2 和
-         * layer_mask.c 里没有任何地方读它**（grep 全项目只有 parse 那一行）。
+         * 排查确认：这个参数被解析进 LayerConfig、写进 dcapd2.layer，
+         * 但 **dcapd2 和 layer_mask.c 里没有任何地方读它**
+         * （grep 全项目只有 parse 那一行）。
          * 真正决定画面尺寸的是：抓取区 srcW×srcH + 遮罩 w×h。
          *
-         * 保留控件（档案里记载它是协议预留字段，以后若做密度相关缩放会用），
-         * 但置灰并改文案，避免用户以为"调 DPI 能改大小"。
+         * 之前保留它并置灰，想着"协议预留字段，以后可能用"。
+         * 但它拖不动、也不生效，在界面上只是个坏的滑块 ——
+         * 用户会反复尝试拖动它。
+         *
+         * 直接去掉。LayerConfig.dpi 字段和 dcapd2.layer 的 dpi= 键
+         * 都保留（协议兼容），只是不再有 UI 入口。
          */
-        maskSbDpi = addMaskSlider(g0, "DPI（预留）", 80, 480, maskCfg.dpi, "",
-                v -> { maskCfg.dpi = v; refreshMask(); });
-        maskTvDpi = maskLastSliderVal;
-        maskSbDpi.setEnabled(false);
-        maskSbDpi.setAlpha(0.42f);
+        /*
+         * ══════════════════════════════════════════════════════════
+         * **遮罩参数改成 3 列**（2026-11-04）
+         * ══════════════════════════════════════════════════════════
+         *
+         * 原来 4 个滑块排成 2×2 —— 每行两个各占一半宽度，
+         * 在右栏约 1300dp 的可用宽度下，单个滑块有 650dp，
+         * 但右侧还留着一大片空白（数值文字只占最右 60dp）。
+         *
+         * 改成 3 列后：
+         *   网格 | DPI | 边框      ← 第 1 行三个
+         *   羽化 |                 ← 第 2 行一个
+         *
+         * 滑块缩短到约 430dp —— 对 4~128 的整数区间，
+         * 430px 足够拖出每个整数（约 3.4px/单位），手感没有损失。
+         */
+        maskSbBorder = addMaskSlider(g0, "边框", 0, 40, maskCfg.border, "",
+                v -> { maskCfg.border = v; refreshMask(); });
+        maskTvBorder = maskLastSliderVal;
         col.addView(g0);
 
         LinearLayout g1 = grid2();
-        maskSbBorder = addMaskSlider(g1, "边框", 0, 40, maskCfg.border, "",
-                v -> { maskCfg.border = v; refreshMask(); });
-        maskTvBorder = maskLastSliderVal;
         maskSbFeather = addMaskSlider(g1, "羽化", 0, 96, maskCfg.feather, "",
                 v -> { maskCfg.feather = v; refreshMask(); });
         maskTvFeather = maskLastSliderVal;
         col.addView(g1);
 
-        col.addView(maskSection("四角圆角"));
+
+        /* ══════════════════════════════════════════════════════════════
+         * **四角圆角锁定**（2026-11-05 用户要求）
+         * ══════════════════════════════════════════════════════════════
+         *
+         * "四角圆角添加个同步打勾按钮，左上 右上 左下 右下 捆绑在一起一起拖动"
+         *
+         * 交互：
+         *   · 勾上 → 拖任意一个角，另外三个跟着变（四个值始终相等）
+         *   · 取消 → 各角独立（可以只圆一个角，做出不对称形状）
+         *
+         * 为什么默认勾上：绝大多数场景就是"四角统一圆角"，
+         * 分别调四个值是少数派需求。默认联动少拖三次。
+         *
+         * 状态存 prefs（"corner_locked"），重启后保持。
+         */
+        LinearLayout cornerHead = new LinearLayout(this);
+        cornerHead.setOrientation(LinearLayout.HORIZONTAL);
+        cornerHead.setGravity(Gravity.CENTER_VERTICAL);
+
+        TextView cornerTitle = new TextView(this);
+        cornerTitle.setText("四角圆角");
+        cornerTitle.setTextSize(15);
+        cornerTitle.setTextColor(getColor(R.color.accent));
+        cornerTitle.setPadding(dp(4), dp(10), 0, dp(4));
+        cornerHead.addView(cornerTitle, new LinearLayout.LayoutParams(
+                0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
+
+        cornerLockBox = new android.widget.CheckBox(this);
+        tintCheckBox(cornerLockBox);
+        cornerLockBox.setText("同步");
+        cornerLockBox.setTextSize(15);
+        cornerLockBox.setTextColor(getColor(R.color.content_secondary));
+        cornerLockBox.setPadding(dp(6), dp(4), 0, dp(4));
+        cornerLockBox.setMinHeight(dp(40));
+        cornerLockBox.setChecked(getSharedPreferences(PREF, MODE_PRIVATE)
+                .getBoolean("corner_locked", true));
+        cornerLockBox.setOnCheckedChangeListener((b, checked) -> {
+            getSharedPreferences(PREF, MODE_PRIVATE).edit()
+                    .putBoolean("corner_locked", checked).apply();
+            applyCornerLockStyle();
+            appendLog("四角圆角 " + (checked ? "已同步" : "已独立"));
+        });
+        cornerHead.addView(cornerLockBox, new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT));
+        col.addView(cornerHead);
+
         LinearLayout g2 = grid2();
         maskSbTl = addMaskSlider(g2, "左上圆角", 0, 120, maskCfg.rTl, "°",
-                v -> { maskCfg.rTl = v; refreshMask(); });
+                v -> setCorner(0, v));
         maskTvTl = maskLastSliderVal;
         maskSbTr = addMaskSlider(g2, "右上圆角", 0, 120, maskCfg.rTr, "°",
-                v -> { maskCfg.rTr = v; refreshMask(); });
+                v -> setCorner(1, v));
         maskTvTr = maskLastSliderVal;
         col.addView(g2);
 
         LinearLayout g3 = grid2();
         maskSbBl = addMaskSlider(g3, "左下圆角", 0, 120, maskCfg.rBl, "°",
-                v -> { maskCfg.rBl = v; refreshMask(); });
+                v -> setCorner(2, v));
         maskTvBl = maskLastSliderVal;
         maskSbBr = addMaskSlider(g3, "右下圆角", 0, 120, maskCfg.rBr, "°",
-                v -> { maskCfg.rBr = v; refreshMask(); });
+                v -> setCorner(3, v));
         maskTvBr = maskLastSliderVal;
         col.addView(g3);
+
+        applyCornerLockStyle();
 
         col.addView(maskSection("梯形"));
         LinearLayout g4 = grid2();
@@ -1077,17 +1414,40 @@ public class MainActivity extends Activity {
                 MirrorController.getCodec() == MirrorController.CODEC_H264);
     }
 
+    /**
+     * 形状按钮的文案。
+     *
+     * H.264 档下按钮是置灰的（dcapd2.c 第 391 行硬编码 dw=boxW，
+     * 只认矩形），但原来的文案仍显示「矩形」—— 用户看到灰按钮写着
+     * 「矩形」，会以为"这个功能坏了"，而不是"当前档位锁死在这个值"。
+     *
+     * 所以 H.264 时加个后缀说明原因，灰得明明白白。
+     */
     private String shapeLabel() {
-        int s = maskCfg.shape;
-        if (s < 0 || s >= LayerConfig.SHAPE_NAMES.length) s = 0;
-        return LayerConfig.SHAPE_NAMES[s];
+        int sg = maskCfg.shape;
+        if (sg < 0 || sg >= LayerConfig.SHAPE_NAMES.length) sg = 0;
+        /* H.264 档：形状固定矩形，文案标注避免误解 */
+        if (MirrorController.getCodec() == MirrorController.CODEC_H264) {
+            return "矩形(固定)";
+        }
+        return LayerConfig.SHAPE_NAMES[sg];
     }
-
+    /**
+     * 适配方式按钮的文案。
+     *
+     * 原本文案「铺满 ✓ / 等比（留边）」直接说明后果 —— 这很好，
+     * 保留。但 H.264 档下按钮是置灰的（dcapd2.c 第 391 行
+     * `g_codec == H264` 短路前面那个条件，fit 被完全忽略），
+     * 灰按钮写着「等比（留边）」同样让人以为功能坏了。
+     *
+     * H.264 时统一显示「铺满(固定)」—— 文案要短，
+     * 因为按钮宽度由 rowLp 均分（约 200dp），「铺满（固定）」
+     * 带全角括号会被挤成两行。
+     */
     private String fitLabel() {
-        /*
-         * 文案直接说明后果 —— 用户反馈"遮罩铺满了仪表却不满"，
-         * 就是因为选了「等比」却不知道它会留黑边。
-         */
+        if (MirrorController.getCodec() == MirrorController.CODEC_H264) {
+            return "铺满(固定)";
+        }
         return maskCfg.fit == 0 ? "铺满 ✓" : "等比（留边）";
     }
 
@@ -1096,7 +1456,7 @@ public class MainActivity extends Activity {
         l.setOrientation(LinearLayout.VERTICAL);
         TextView tv = new TextView(this);
         tv.setText(text);
-        tv.setTextSize(13);
+        tv.setTextSize(15);
         tv.setTextColor(getColor(R.color.accent));
         tv.setPadding(dp(4), dp(10), 0, dp(4));
         l.addView(tv);
@@ -1129,30 +1489,114 @@ public class MainActivity extends Activity {
      *     和遮罩的 x/y/w/h 一起写进 /data/local/tmp/dcapd2.layer，
      *     dcapd2 的解析器按 key 逐个查，多出未知键不影响它。
      */
+    /** 右栏外层 ScrollView（展开截取区后要滚到它顶部） */
+    private ScrollView rightScrollRef;
+
+    /**
+     * 截取区展开高度上限。
+     *
+     * 取屏幕可用高度的 52%：车机屏约 800dp → 约 416dp，
+     * 够放「跟随/手动」+ 380dp 预览 + 比例提示 + 几个按钮，
+     * 又不会把下面的「保存并应用」顶出屏幕。
+     */
+    /**
+     * 可折叠正文的最大高度。
+     *
+     * **从 520dp 提到 78% 屏高（2026-11-04）**。
+     *
+     * 原因：正文内容实际需要 ~900dp
+     *   modeRow 56 + hint 22 + cropBox 380 + hint2 22 + ratio 22
+     *   + syncRow 56 + snapRow 56 + fitRow 56 + actRow 56
+     *   + ratioRow×2 112 + shotRow 56  ≈ 894dp
+     *
+     * 现在按屏高 78% 算（1600 × 0.78 ≈ 1248px），最多 1200dp，
+     * 比内容高度略小 —— 留一点滚动余量，同时保证"保存并应用"始终可见。
+     */
+    private int bodyScrollHeight() {
+        int h = getResources().getDisplayMetrics().heightPixels;
+        int px = (int) (h * 0.78f);
+        int min = dp(600);
+        int max = dp(1200);
+        if (px < min) px = min;
+        if (px > max) px = max;
+        return px;
+    }
+
     private void buildAppCropSection(LinearLayout parent) {
+        /*
+         * ══════════════════════════════════════════════════════════════
+         * **整块卡片都能点**（2026-11-04 用户要求）
+         * ══════════════════════════════════════════════════════════════
+         *
+         * 之前只有标题行和那个小按钮可点，用户反映"点不准"。
+         * 现在：
+         *   · card 本身 clickable + 一个 OnClickListener
+         *   · 标题行、展开按钮、折叠状态下的整块卡片 —— 全都走同一个 toggle
+         *   · 展开后，卡片内的**正文**要吃掉触摸（否则点滑块、
+         *     拖截取框都会被卡片抢走）—— 见 body.setOnClickListener(null)
+         *     配合 setClickable(true)，只截不断冒泡。
+         */
         LinearLayout card = card();
         card.setPadding(dp(10), dp(8), dp(10), dp(10));
+        card.setClickable(true);
+        card.setFocusable(true);
 
-        /* ── 标题行：点整行切换折叠 ── */
+        /* ── 标题行：整行可点，右侧带明确的「展开 / 收起」按钮 ── */
         LinearLayout head = new LinearLayout(this);
         head.setOrientation(LinearLayout.HORIZONTAL);
         head.setGravity(Gravity.CENTER_VERTICAL);
+        head.setBackgroundResource(R.drawable.chip_bg);
+        head.setPadding(dp(10), 0, dp(8), 0);
 
         TextView title = new TextView(this);
         title.setText("▸ 截取 App 页面");
-        title.setTextSize(14);
+        /*
+         * **字号从 14 提到 18**（2026-11-04）。
+         *
+         * 用户原话「app 页面截取那一行再大点，太小了」——
+         * 这行是整块功能的入口，字号跟正文一样大就等于看不见。
+         * 18sp + 加粗，和「图层遮罩」标题同级，一眼能找到。
+         */
+        title.setTextSize(20);
         title.setTextColor(getColor(R.color.content_accent));
         title.setTypeface(Typeface.DEFAULT_BOLD);
+        title.setIncludeFontPadding(false);
         head.addView(title, new LinearLayout.LayoutParams(0,
                 LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
 
-        TextView hint = new TextView(this);
-        hint.setText("点标题展开");
-        hint.setTextSize(12);
-        hint.setTextColor(getColor(R.color.content_tertiary));
-        head.addView(hint);
+        /*
+         * 右侧**自己的**展开按钮。
+         *
+         * 为什么必须有：原来这里只有一行小字「点标题展开」，
+         * 而紧挨着的「图层遮罩」标题右边有个「展开编辑」按钮 ——
+         * 用户点那个，跳去了图层编辑器的全屏页面，
+         * 于是反馈"截取 app 页面无法展开，展开编辑跑到了图层遮罩那"。
+         *
+         * 现在这个区块自带一个高对比按钮，文案是「展开 / 收起」，
+         * 和「展开编辑」视觉上区分开，不会点错。
+         */
+        Button btnToggle = new Button(this);
+        btnToggle.setText("展开");
+        btnToggle.setTextSize(16);
+        btnToggle.setTextColor(getColor(R.color.accent_on));
+        btnToggle.setBackgroundResource(R.drawable.btn_selected);
+        btnToggle.setAllCaps(false);
+        btnToggle.setIncludeFontPadding(false);
+        btnToggle.setPadding(dp(14), 0, dp(14), 0);
+        btnToggle.setLayoutParams(new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.WRAP_CONTENT, dp(44)));
+        head.addView(btnToggle);
 
-        card.addView(head);
+        /*
+         * head 必须给**明确的固定高度**（2026-11-04 再调）。
+         *
+         * 原来用 WRAP_CONTENT → title 是 width=0 + weight=1 量成 0，
+         * head 高度也塌成 0，整块看起来"消失"。
+         * 现在给 dp(56)：比按钮的 44 留出上下各 6dp 余量，
+         * 手指好按，也不再"太小"。
+         */
+        card.addView(head, new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, dp(56)));
 
         /*
          * ══════════════════════════════════════════════════════════════
@@ -1168,10 +1612,22 @@ public class MainActivity extends Activity {
          * 放在标题下方独立一行（不折叠），一眼看到当前状态。
          */
         appCropEnableBox = new android.widget.CheckBox(this);
+        /*
+         * 勾选框着色（2026-11-04 浅色 UI）。
+         *
+         * 浅色主题下系统默认的 CheckBox tint 是 systemGray（#C7C7CC），
+         * 放在纯白卡片上只有 1.7:1 对比度 —— 勾没勾几乎看不出。
+         *
+         * 显式给 buttonTint：选中态用 accent 蓝（iOS 惯例），
+         * 未选中态用 surface_border（#D1D1D6，在白底上轮廓清晰）。
+         */
+        tintCheckBox(appCropEnableBox);
         appCropEnableBox.setText("启用页面截取（关闭 = 铺满遮罩）");
-        appCropEnableBox.setTextSize(13);
+        /* 13 → 16sp：这行是功能总开关，字大一点才好找、好点（2026-11-04） */
+        appCropEnableBox.setTextSize(16);
         appCropEnableBox.setTextColor(getColor(R.color.content_primary));
-        appCropEnableBox.setPadding(dp(4), dp(4), 0, dp(2));
+        appCropEnableBox.setPadding(dp(6), dp(8), 0, dp(8));
+        appCropEnableBox.setMinHeight(dp(44));
         boolean enablePref = getSharedPreferences(PREF, MODE_PRIVATE)
                 .getBoolean("app_crop_enabled", false);
         appCropEnableBox.setChecked(enablePref);
@@ -1206,34 +1662,143 @@ public class MainActivity extends Activity {
                     try {
                         snap.applyFully(appCtx);
                         mirror.restartDaemonNow();
-                        Log.i(TAG, "截取开关变化已下发（enabled=" + checked + "）");
+                        DashLog.i(TAG, "截取开关变化已下发（enabled=" + checked + "）");
                     } catch (Throwable ex) {
-                        Log.w(TAG, "截取开关下发失败: " + ex);
+                        DashLog.w(TAG, "截取开关下发失败: " + ex);
                     }
                 }, "crop-toggle-apply").start();
                 setStatus("状态：截取开关已" + (checked ? "开启" : "关闭") + "，正在刷新…");
             }
         });
-        card.addView(appCropEnableBox);
+        /*
+         * **总开关移进可折叠正文**（2026-11-04）。
+         *
+         * 原来它挂在 card 直属位置：折叠时仍然显示，
+         * 于是 head(56dp) + 复选框(44dp) 挤在卡片顶部，
+         * 用户在车机小屏上看不清那一块是什么。
+         *
+         * 现在把它作为 body 的第一个子控件 —— 折叠时一起隐藏，
+         * 展开后第一眼就能看到这个开关。
+         */
 
-        /* ── 可折叠的正文 ── */
+        /*
+         * ── 可折叠的正文：**自带 ScrollView，高度封顶** ──
+         *
+         * ══════════════════════════════════════════════════════════════
+         * 2026-11-04 修「截取页面超出界面 / 无法展开」
+         * ══════════════════════════════════════════════════════════════
+         *
+         * 原来 body 直接挂在 card 里、高度 WRAP_CONTENT：
+         * 展开后 380dp 预览 + 一堆按钮加起来七八百 dp，
+         * 整块 card 比右栏的可视区还高 ——
+         *   · 下面的「应用并投屏」被推到屏幕外，够不着
+         *   · 外层 rightScroll 已经滚到底了也看不到
+         *   · 用户看到的就是"截取页面超出界面"
+         *
+         * 而"无法展开"多半是同一个隐患的另一面：卡片被撑得太高，
+         * 点击区域的实际位置和视觉位置对不上（车机屏滚动位置固定时尤甚）。
+         *
+         * 修法：body 套进一个**高度受限的 ScrollView**，
+         * 展开时最多占屏幕高度的 52%，超出部分在块内自己滚。
+         * 这样：
+         *   · 整块 card 高度有上限，下面的控件永远不会被顶出去
+         *   · 里面的内容再长也能滚到
+         *   · 点整块卡片折叠的行为不受影响（view 始终在可视范围内）
+         */
         LinearLayout body = new LinearLayout(this);
         body.setOrientation(LinearLayout.VERTICAL);
-        body.setVisibility(View.GONE);
+        /*
+         * **body 自己不要设 GONE**（2026-11-04 修「展开后内容空白」）。
+         *
+         * 上一版把 body 设成 GONE，折叠靠它、展开只切了外层 bodyScroll ——
+         * 于是展开后 ScrollView 可见、高度也设上了，
+         * 但里面的 body 永远 GONE → **整块内容空白**，
+         * 用户还以为"跑到顶部去了"。
+         *
+         * 显隐只由 bodyScroll 一个开关负责，body 始终 VISIBLE。
+         */
         body.setPadding(0, dp(8), 0, 0);
+        /*
+         * **正文必须吃掉触摸**：整块 card 现在可点（toggle），
+         * 如果 body 不拦截，点里面的滑块/截取框会冒泡到 card，
+         * 一碰就把整块收起来 —— 那才是真的"没法用"。
+         * clickable + 空监听 = 只截住、不处理。
+         */
+        /*
+         * **总开关作为正文第一项**（2026-11-04）。
+         *
+         * 原来它挂在 card 直属位置：折叠时仍然显示，
+         * 于是 head(56dp) + 复选框(44dp) 挤在卡片顶部，
+         * 车机小屏上根本看不清那一块是什么。
+         *
+         * 现在作为 body 的第一个子控件 —— 折叠时一起隐藏，
+         * 展开后第一眼就能看到这个开关。
+         */
+        body.addView(appCropEnableBox);
+
+        body.setClickable(true);
+        body.setOnClickListener(v -> { });
+
+        /*
+         * ══════════════════════════════════════════════════════════
+         * 用 MaxHeightScrollView 替代标准 ScrollView（2026-11-04）
+         * ══════════════════════════════════════════════════════════
+         *
+         * 用户反馈"截取区展开后下面一大片空白"。
+         *
+         * 根因：标准 ScrollView 必须给固定高度。原来展开时设成
+         * bodyScrollHeight()（屏幕高 78%，约 1248px），而内容实测只有
+         * 约 500px —— ���出 748px 全是空白。
+         *
+         * MaxHeightScrollView 的行为是"高度 = min(内容高, 上限)"：
+         *   内容短 → 容器跟着缩短，无空白
+         *   内容长 → 封顶后可滚动，不会把按钮挤出屏幕
+         */
+        MaxHeightScrollView bodyScroll = new MaxHeightScrollView(this);
+        bodyScroll.setMaxHeight(bodyScrollHeight());
+        /*
+         * **高度用 WRAP_CONTENT，不要固定值**（2026-11-04）。
+         *
+         * 原来的 LinearLayout.LayoutParams(MATCH_PARENT, 0) 是
+         * "折叠状态下高度 0"的写法 —— 但它会和 MaxHeightScrollView
+         * 内部的 onMeasure 打架：外层给 0，测量结果永远是 0。
+         *
+         * 改成 WRAP_CONTENT，让 MaxHeightScrollView 自己决定高度
+         * （内容高 or 上限，取小）。折叠时靠 setVisibility(GONE) 隐藏。
+         */
+        bodyScroll.setLayoutParams(new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT));
+        bodyScroll.setOverScrollMode(View.OVER_SCROLL_NEVER);
+        bodyScroll.setVisibility(View.GONE);
+        bodyScroll.setLayoutParams(new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, 0));
+        bodyScroll.addView(body, new ScrollView.LayoutParams(
+                ScrollView.LayoutParams.MATCH_PARENT,
+                ScrollView.LayoutParams.WRAP_CONTENT));
 
         /* 模式切换：跟随窗口 / 手动 */
         LinearLayout modeRow = new LinearLayout(this);
         modeRow.setOrientation(LinearLayout.HORIZONTAL);
         appCropFollow = chipButton("跟随窗口", v -> setAppCropMode(true));
         appCropManual = chipButton("手动", v -> setAppCropMode(false));
+
+        /* 模式切换：跟随窗口 / 手动 */
+        /*
+         * **两个按钮都要加**（2026-11-04 修复丢失）。
+         *
+         * 之前一次编辑把手误删了 appCropFollow 的 addView ——
+         * 界面上只剩一个占满整行的「手动」按钮，"跟随窗口"整个消失。
+         * 用户在截图里看到的那个巨大蓝色「手动」就是它。
+         */
         modeRow.addView(appCropFollow, rowLp(1f));
         modeRow.addView(appCropManual, rowLp(1f));
+
         body.addView(modeRow);
 
         /* 两个 App 历史提示 */
         appCropHint = new TextView(this);
-        appCropHint.setTextSize(12);
+        appCropHint.setTextSize(13);
         appCropHint.setTextColor(getColor(R.color.content_tertiary));
         appCropHint.setPadding(dp(4), dp(6), 0, 0);
         body.addView(appCropHint);
@@ -1259,9 +1824,11 @@ public class MainActivity extends Activity {
             updateAppCropTexts();
         });
         FrameLayout cropBox = new FrameLayout(this);
-        cropBox.setBackgroundColor(getColor(R.color.surface_deep));
+        /* 截取预览容器：同上，squircle 化 */
+        cropBox.setBackground(Squircle.of(this).border(
+                R.color.surface_deep, R.color.surface_border, 1f, Squircle.R_TAB));
         LinearLayout.LayoutParams cropLp = new LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT, dp(420));   /* 300→420，拖拽更精确 */
+                LinearLayout.LayoutParams.MATCH_PARENT, dp(380));   /* 420→380，给下方控件留空间 */
         cropLp.setMargins(0, dp(6), 0, dp(4));
         cropBox.setLayoutParams(cropLp);
         cropBox.addView(appCropPreview, new FrameLayout.LayoutParams(
@@ -1271,14 +1838,14 @@ public class MainActivity extends Activity {
 
         /* 只读的坐标文案（替代四个滑块，仍要让用户看到精确值） */
         appCropHint2 = new TextView(this);
-        appCropHint2.setTextSize(12);
+        appCropHint2.setTextSize(13);
         appCropHint2.setTextColor(getColor(R.color.content_secondary));
         appCropHint2.setPadding(dp(4), dp(2), 0, dp(2));
         body.addView(appCropHint2);
 
         /* 比例提示 */
         appCropRatio = new TextView(this);
-        appCropRatio.setTextSize(12);
+        appCropRatio.setTextSize(13);
         appCropRatio.setTextColor(getColor(R.color.content_secondary));
         appCropRatio.setPadding(dp(4), dp(6), 0, dp(4));
         body.addView(appCropRatio);
@@ -1302,8 +1869,9 @@ public class MainActivity extends Activity {
         syncRow.setPadding(dp(4), dp(2), 0, dp(2));
 
         appCropSyncBox = new android.widget.CheckBox(this);
+        tintCheckBox(appCropSyncBox);
         appCropSyncBox.setText("同步遮罩比例（防变形）");
-        appCropSyncBox.setTextSize(12);
+        appCropSyncBox.setTextSize(13);
         appCropSyncBox.setTextColor(getColor(R.color.content_secondary));
         boolean syncPref = getSharedPreferences(PREF, MODE_PRIVATE)
                 .getBoolean("layer_sync_aspect", true);
@@ -1340,16 +1908,27 @@ public class MainActivity extends Activity {
         snapRow.setPadding(dp(4), 0, 0, dp(2));
 
         android.widget.CheckBox snapBox = new android.widget.CheckBox(this);
+        tintCheckBox(snapBox);
         snapBox.setText("吸附网格（关掉 = 像素级精确）");
-        snapBox.setTextSize(12);
+        snapBox.setTextSize(13);
         snapBox.setTextColor(getColor(R.color.content_secondary));
         boolean snapPref = getSharedPreferences(PREF, MODE_PRIVATE)
                 .getBoolean("layer_snap_grid", true);
         snapBox.setChecked(snapPref);
-        maskPreview.setSnapEnabled(snapPref);
+        /*
+         * **maskPreview 此时还是 null**（2026-11-04 崩溃修复）。
+         *
+         * buildAppCropSection 被移到右栏最顶部，执行时
+         * maskPreview 还没创建（它在下面「预览区」才 new）。
+         * 原来直接调 maskPreview.setSnapEnabled() → NPE → App 启动即死。
+         *
+         * 赋初值延后：先记下偏好，等 maskPreview 建好后在
+         * buildMaskPanel 末尾统一应用（见下方的 applySnapPref）。
+         */
+        if (maskPreview != null) maskPreview.setSnapEnabled(snapPref);
         appCropPreview.setSnapEnabled(snapPref);
         snapBox.setOnCheckedChangeListener((b, checked) -> {
-            maskPreview.setSnapEnabled(checked);
+            if (maskPreview != null) maskPreview.setSnapEnabled(checked);
             if (appCropPreview != null) appCropPreview.setSnapEnabled(checked);
             getSharedPreferences(PREF, MODE_PRIVATE).edit()
                     .putBoolean("layer_snap_grid", checked).apply();
@@ -1379,51 +1958,6 @@ public class MainActivity extends Activity {
         actRow.addView(btnRead, rowLp(1f));
         actRow.addView(btnApply, rowLp(1f));
         body.addView(actRow);
-
-        /*
-         * 「恢复整页」按钮 —— 用户反馈"拖框太难用，想一键回到铺满"。
-         *
-         * 把截取区设成整屏（0,0 2560×1600）并立刻下发，
-         * 效果等同于"不裁，铺满遮罩"。比手动拖框回到边缘可靠得多。
-         */
-        LinearLayout resetRow = new LinearLayout(this);
-        resetRow.setOrientation(LinearLayout.HORIZONTAL);
-        LinearLayout btnReset = iconButton("恢复整页（铺满）", "↺",
-                R.drawable.btn_secondary, R.color.content_primary,
-                v -> {
-                    resetAppCropToFull();
-                    setAppCropMode(false);
-                    setStatus("状态：截取区已恢复整页（铺满遮罩）");
-                    appendLog("恢复整页");
-
-                    /*
-                     * **必须落盘 + 重启抓帧**（2026-11-03 修复 Bug E）。
-                     *
-                     * 原来 resetAppCropToFull() 只改了内存里的 src*，
-                     * prefs 和 dcapd2.layer 全是旧值：
-                     *   界面显示 X=0 Y=0 W=2560 H=1600（看着生效了）
-                     *   实际 dcapd2 还在按旧框抓 → 用户以为按钮没用
-                     *
-                     * 和「勾开关」「切档」「点比例」是同一类错误，
-                     * 统一解法：立刻 applyFully + restartDaemonNow。
-                     */
-                    if (MirrorController.isMirroring()) {
-                        maskCfg.enabled = true;
-                        final LayerConfig snap = maskCfg;
-                        final android.content.Context appCtx = getApplicationContext();
-                        new Thread(() -> {
-                            try {
-                                snap.applyFully(appCtx);
-                                mirror.restartDaemonNow();
-                                Log.i(TAG, "恢复整页已下发");
-                            } catch (Throwable ex) {
-                                Log.w(TAG, "恢复整页下发失败: " + ex);
-                            }
-                        }, "reset-apply").start();
-                    }
-                });
-        resetRow.addView(btnReset, rowLp(1f));
-        body.addView(resetRow);
 
         /*
          * ══════════════════════════════════════════════════════════════
@@ -1477,9 +2011,9 @@ public class MainActivity extends Activity {
                         try {
                             snap.applyFully(appCtx);
                             mirror.restartDaemonNow();
-                            Log.i(TAG, "按比例框选已下发");
+                            DashLog.i(TAG, "按比例框选已下发");
                         } catch (Throwable ex) {
-                            Log.w(TAG, "按比例框选下发失败: " + ex);
+                            DashLog.w(TAG, "按比例框选下发失败: " + ex);
                         }
                     }, "ratio-apply").start();
                 }
@@ -1513,16 +2047,60 @@ public class MainActivity extends Activity {
         shotRow.addView(btnShotClear, rowLp(1f));
         body.addView(shotRow);
 
-        card.addView(body);
+        /* 正文装进受限高度的 bodyScroll，再挂到 card —— 卡片高度才有上限 */
+        card.addView(bodyScroll);
 
-        /* 点标题切换折叠 */
-        head.setOnClickListener(v -> {
-            boolean opening = body.getVisibility() != View.VISIBLE;
-            body.setVisibility(opening ? View.VISIBLE : View.GONE);
+        /*
+         * **整块卡片 / 标题行 / 按钮都能点**（三个入口，同一个 toggle）。
+         *
+         * 用户要求"整块卡片都能点" —— 车机上手指粗、命中率低，
+         * 只让标题行可点经常按空。现在 card 本体也绑了。
+         *
+         * 展开状态下点正文不会被折叠：body 已经 clickable 吃掉触摸
+         * （见上面 body.setClickable(true) 的注释）。
+         */
+        View.OnClickListener toggle = v -> {
+            boolean opening = bodyScroll.getVisibility() != View.VISIBLE;
+
+            /*
+             * ══════════════════════════════════════════════════════
+             * **顺序很关键：先设高度，再切可见性**（2026-11-04 修复空白）
+             * ══════════════════════════════════════════════════════
+            /*
+             * MaxHeightScrollView 自己会算高度 = min(内容, 上限)，
+             * 这里只需要切可见性，不用再手动设置 LayoutParams.height。
+             *
+             * 这也是"展开后一大片空白"的根治办法 —— 原来硬设 1248px，
+             * 内容只有 500px，多出来的 748px 就是那片空白。
+             */
+            if (opening) {
+                bodyScroll.setVisibility(View.VISIBLE);
+                bodyScroll.requestLayout();
+                bodyScroll.post(() -> bodyScroll.scrollTo(0, 0));
+            } else {
+                bodyScroll.setVisibility(View.GONE);
+            }
             title.setText((opening ? "▾ " : "▸ ") + "截取 App 页面");
-            hint.setText(opening ? "点标题收起" : "点标题展开");
-            if (opening) syncAppCropFromConfig();
-        });
+            btnToggle.setText(opening ? "收起" : "展开");
+            btnToggle.setBackgroundResource(opening
+                    ? R.drawable.btn_secondary : R.drawable.btn_selected);
+            btnToggle.setTextColor(getColor(opening
+                    ? R.color.accent_soft : R.color.accent_on));
+            if (opening) {
+                syncAppCropFromConfig();
+                /*
+                 * 展开后把外层右栏滚到这一块顶部 ——
+                 * 否则用户还在原位置，看不到刚展开的内容。
+                 */
+                final ScrollView outer = rightScrollRef;
+                if (outer != null) {
+                    outer.post(() -> outer.smoothScrollTo(0, card.getTop()));
+                }
+            }
+        };
+        card.setOnClickListener(toggle);
+        head.setOnClickListener(toggle);
+        btnToggle.setOnClickListener(toggle);
 
         parent.addView(card);
 
@@ -1575,6 +2153,66 @@ public class MainActivity extends Activity {
         appCropPreview.setAppCropMode(true, mirror.getScreenPxSafe());
         appCropPreview.refresh();
         updateAppCropTexts();
+    }
+
+    /**
+     * 切换投屏 App 时，套用该 App 的历史截取尺寸并立刻落盘。
+     *
+     * 用户的诉求：截取某个 App 的页面后保存，下次投同一个 App 时
+     * 要自动按存好的框去截，不用重新框一遍。
+     *
+     * 三层保障（缺一层就会"看起来没记住"）：
+     *   ① applyAppRect  → 把 app_rect_<pkg> 读进内存
+     *   ② applyFully    → 写回 prefs 的全局 layer_src_*
+     *   ③ restartDaemon → 让 dcapd2 按新框重新抓
+     *
+     * 注意：没有历史记录时**什么都不做** —— 保留当前框，
+     * 不要用一个"默认值"覆盖用户正在用的设置。
+     */
+    private void applyAppRectOnSwitch() {
+        if (maskCfg == null || targetPkg == null) return;
+        if (!LayerConfig.hasAppRect(this, targetPkg)) {
+            appendLog("该 App 无历史截取尺寸（保留当前框）：" + targetPkg);
+            return;
+        }
+        boolean applied = maskCfg.applyAppRect(this, targetPkg);
+        if (!applied) return;
+
+        /* ① 打开总开关 —— 有记忆就说明用户想按框截 */
+        getSharedPreferences(PREF, MODE_PRIVATE).edit()
+                .putBoolean("app_crop_enabled", true).apply();
+        if (appCropEnableBox != null && !appCropEnableBox.isChecked()) {
+            appCropEnableBox.setChecked(true);
+        }
+        updateAppCropEnableState();
+
+        /* ② 同步到界面 */
+        if (appCropPreview != null) {
+            appCropPreview.setAppCropMode(true, mirror.getScreenPxSafe());
+            appCropPreview.refresh();
+        }
+        updateAppCropTexts();
+        if (appCropHint != null) {
+            appCropHint.setText("✓ 已套用该 App 的历史尺寸：" + targetPkg);
+        }
+
+        /* ③ 落盘 + 重拉抓帧（投屏中才需要；没在投屏时下次启动自然读 prefs） */
+        maskCfg.enabled = true;
+        final LayerConfig snap = maskCfg;
+        final android.content.Context appCtx = getApplicationContext();
+        new Thread(() -> {
+            try {
+                snap.applyFully(appCtx);
+                if (MirrorController.isMirroring()) {
+                    mirror.restartDaemonNow();
+                }
+                appendLog("已套用 " + targetPkg + " 的截取尺寸 "
+                        + snap.srcW + "×" + snap.srcH
+                        + " @(" + snap.srcX + "," + snap.srcY + ")");
+            } catch (Throwable ex) {
+                DashLog.w(TAG, "套用 App 截取尺寸失败: " + ex);
+            }
+        }, "apprect-apply").start();
     }
 
     /** 刷新只读文案 + 比例提示 + 重绘预览（拖动和载入时都调） */
@@ -1654,12 +2292,10 @@ public class MainActivity extends Activity {
     private void setAppCropModeVisual(boolean follow) {
         appCropFollowMode = follow;
         if (appCropFollow != null) {
-            appCropFollow.setBackgroundResource(follow
-                    ? R.drawable.btn_selected : R.drawable.btn_secondary);
+        styleToggle(appCropFollow, follow);
         }
         if (appCropManual != null) {
-            appCropManual.setBackgroundResource(follow
-                    ? R.drawable.btn_secondary : R.drawable.btn_selected);
+        styleToggle(appCropManual, !follow);
         }
     }
 
@@ -1667,12 +2303,10 @@ public class MainActivity extends Activity {
     private void setAppCropFit(int mode) {
         maskCfg.fit = mode;
         if (appCropFitCenter != null) {
-            appCropFitCenter.setBackgroundResource(mode == 0
-                    ? R.drawable.btn_selected : R.drawable.btn_secondary);
+        styleToggle(appCropFitCenter, mode == 0);
         }
         if (appCropFitFill != null) {
-            appCropFitFill.setBackgroundResource(mode == 1
-                    ? R.drawable.btn_selected : R.drawable.btn_secondary);
+        styleToggle(appCropFitFill, mode == 1);
         }
         appendLog("App 适配方式 → " + (mode == 0 ? "等比居中" : "裁满铺"));
     }
@@ -1689,7 +2323,7 @@ public class MainActivity extends Activity {
             try {
                 r = mirror.readWindowRectPublic(targetPkg);
             } catch (Throwable t) {
-                Log.w(TAG, "读窗口失败: " + t);
+                DashLog.w(TAG, "读窗口失败: " + t);
             }
             final int[] rr = r;
             mainHandler.post(() -> {
@@ -1826,11 +2460,11 @@ public class MainActivity extends Activity {
                             }
                         }
                     } catch (Throwable t) {
-                        Log.w(TAG, "拉目标 App 前台失败（第 " + (attempt + 1) + " 次）: " + t);
+                        DashLog.w(TAG, "拉目标 App 前台失败（第 " + (attempt + 1) + " 次）: " + t);
                     }
                 }
                 if (!fgOk) {
-                    Log.w(TAG, "没能把 " + pkg + " 拉到前台，底图可能不是它的画面");
+                    DashLog.w(TAG, "没能把 " + pkg + " 拉到前台，底图可能不是它的画面");
                 }
 
                 /* ② 截屏落盘 */
@@ -1895,7 +2529,7 @@ public class MainActivity extends Activity {
                 } catch (Throwable ignored) {
                 }
             } catch (Throwable t) {
-                Log.w(TAG, "截屏失败: " + t);
+                DashLog.w(TAG, "截屏失败: " + t);
                 try {
                     AdbShell.exec("rm -f " + tmp, 3000);
                 } catch (Throwable ignored) {
@@ -2025,14 +2659,14 @@ public class MainActivity extends Activity {
                         cpManager.setLayerRect(dest[0], dest[1], dest[2], dest[3]);
                         /* 新进程没有旧像素，请求一次整屏全量 */
                         AdbShell.exec("touch /data/local/tmp/dc_force", 2000);
-                        Log.i(TAG, "截取区已生效并重建图层：" + dest[0] + ","
+                        DashLog.i(TAG, "截取区已生效并重建图层：" + dest[0] + ","
                                 + dest[1] + " " + dest[2] + "x" + dest[3]);
                     } else {
-                        Log.w(TAG, "重拉 dcapd2 失败（截取区可能仍按旧参数）");
+                        DashLog.w(TAG, "重拉 dcapd2 失败（截取区可能仍按旧参数）");
                     }
                 }
             } catch (Throwable t) {
-                Log.w(TAG, "写截取配置失败: " + t);
+                DashLog.w(TAG, "写截取配置失败: " + t);
             }
             mainHandler.post(() -> {
                 if (!casting) {
@@ -2054,14 +2688,27 @@ public class MainActivity extends Activity {
         LinearLayout b = new LinearLayout(this);
         b.setOrientation(LinearLayout.HORIZONTAL);
         b.setGravity(Gravity.CENTER);
-        b.setBackgroundResource(R.drawable.btn_secondary);
+        b.setBackground(Squircle.of(this).secondaryButton());
         b.setClickable(true);
         b.setFocusable(true);
         TextView tv = new TextView(this);
         tv.setText(text);
-        tv.setTextSize(15);
+        tv.setTextSize(16);
         tv.setTextColor(getColor(R.color.accent_soft));
         tv.setGravity(Gravity.CENTER);
+        /*
+         * **强制单行 + 不换行 + 缩放字宽**（2026-11-04）。
+         *
+         * 按钮宽度由 rowLp 按权重均分（右栏四个按钮各约 200dp）。
+         * 「矩形(固定)」「铺满(固定)」这类 7-8 个字符的文案，
+         * 在 16sp 下会顶到换行 —— 一换行按钮高度撑破、整行错位。
+         *
+         * 这里锁死单行，宽度不够时自动缩小字距而不换行。
+         */
+        tv.setSingleLine(true);
+        tv.setMaxLines(1);
+        tv.setEllipsize(null);
+        tv.setHorizontallyScrolling(false);
         b.addView(tv);
         b.setOnClickListener(l);
         return b;
@@ -2086,27 +2733,34 @@ public class MainActivity extends Activity {
         head.setOrientation(LinearLayout.HORIZONTAL);
         TextView label = new TextView(this);
         label.setText(name);
-        label.setTextSize(14);
+        label.setTextSize(16);
         label.setTextColor(getColor(R.color.content_secondary));
         head.addView(label, new LinearLayout.LayoutParams(0,
                 LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
 
         TextView val = new TextView(this);
-        val.setTextSize(14);
+        val.setTextSize(16);
         val.setTextColor(getColor(R.color.content_primary));
         val.setGravity(Gravity.END);
         head.addView(val);
+        /*
+         * 滑块换成 MiUIX 样式（2026-11-04）。
+         *
+         * 系统 SeekBar 是「4dp 细线 + 小圆点」，和 MiUIX 的
+         * 「28dp 粗轨道 + 0.72× 圆点」观感差很远。
+         * 而且 tint 只能改颜色，改不了粗细和圆点比例，
+         * 所以直接用自绘的 MiuixSeekBar。
+         *
+         * 颜色取自 MiUIX sliderColors()：
+         *   已选段 = primary (#277AF7)
+         *   未选段 = sliderBackground (26% 白)
+         *   圆点   = primary
+         */
         box.addView(head);
 
-        SeekBar sb = new SeekBar(this);
+        MiuixSeekBar sb = new MiuixSeekBar(this);
         sb.setMax(max - min);
         sb.setProgress(Math.max(0, Math.min(max - min, cur - min)));
-        sb.setProgressTintList(android.content.res.ColorStateList.valueOf(
-                getColor(R.color.accent)));
-        sb.setThumbTintList(android.content.res.ColorStateList.valueOf(
-                getColor(R.color.accent_soft)));
-        sb.setProgressBackgroundTintList(android.content.res.ColorStateList.valueOf(
-                getColor(R.color.surface_border)));
         sb.setPadding(0, dp(2), 0, dp(2));
         sb.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
             @Override public void onProgressChanged(SeekBar s, int p, boolean u) {
@@ -2160,7 +2814,6 @@ public class MainActivity extends Activity {
     private void syncMaskControls() {
         if (maskSbGrid == null) return;
         maskSbGrid.setProgress(maskCfg.grid - 4);
-        maskSbDpi.setProgress(maskCfg.dpi - 80);
         maskSbBorder.setProgress(maskCfg.border);
         maskSbTl.setProgress(maskCfg.rTl);
         maskSbTr.setProgress(maskCfg.rTr);
@@ -2170,7 +2823,6 @@ public class MainActivity extends Activity {
         maskSbTrapBot.setProgress(maskCfg.trapBot);
         maskSbFeather.setProgress(maskCfg.feather);
         maskTvGrid.setText(maskCfg.grid + "px");
-        maskTvDpi.setText("" + maskCfg.dpi);
         maskTvBorder.setText("" + maskCfg.border);
         maskTvTl.setText(maskCfg.rTl + "°");
         maskTvTr.setText(maskCfg.rTr + "°");
@@ -2203,7 +2855,7 @@ public class MainActivity extends Activity {
             TextView tv = (TextView) btn.getChildAt(0);
             tv.setText("预设 " + (slot + 1) + "\n"
                     + (saved ? LayerConfig.presetLabel(this, slot) : "空"));
-            tv.setTextSize(14);
+            tv.setTextSize(16);
             tv.setTextColor(getColor(saved ? R.color.accent_soft
                                           : R.color.content_tertiary));
             btn.setBackgroundResource(saved
@@ -2275,14 +2927,28 @@ public class MainActivity extends Activity {
         }, "save-mask").start();
     }
 
+    /**
+     * 分组小标题。
+     *
+     * ══════════════════════════════════════════════════════════════
+     * 排版调整（2026-11-04 美化）
+     * ══════════════════════════════════════════════════════════════
+     * · 字号 15 → 14sp：和按钮 15sp 拉开差距，形成"标题小而正、按钮大而重"
+     *   的层次。原来标题和按钮同大小，靠颜色区分，视觉噪音大。
+     * · letterSpacing 0.08 → 0.06：中文不像西文那样需要大字距，
+     *   0.08 会把"遮罩参数"拉得很散。
+     * · 上间距 16 → 12dp、下间距 7 → 5dp：整体紧凑，少滚动一屏。
+     * · 左侧加一条 3dp 强调色竖线（用 CompoundDrawable 模拟）——
+     *   比纯色文字更有"分组感"，也不用额外嵌套布局。
+     */
     private TextView sectionLabel(String text) {
         TextView t = new TextView(this);
         t.setText(text);
-        t.setTextSize(15);
+        t.setTextSize(16);
         t.setTextColor(getColor(R.color.content_accent));
         t.setTypeface(Typeface.DEFAULT_BOLD);
-        t.setLetterSpacing(0.08f);
-        t.setPadding(dp(4), dp(16), 0, dp(7));
+        t.setLetterSpacing(0.06f);
+        t.setPadding(dp(4), dp(12), 0, dp(5));
         return t;
     }
 
@@ -2298,31 +2964,66 @@ public class MainActivity extends Activity {
      * 用 LinearLayout 而不是 Button：Button 无法同时放图标和文字并控制间距。
      * 图标用字符（▶ ■ ↓ 等）而不是图片资源 —— 免增资产，且能跟着文字色一起变。
      */
+    /**
+     * 把旧的 XML 背景资源映射成对应的 squircle（2026-11-04）。
+     *
+     * iconButton 的签名带 bgRes 参数，19 处调用传了 4 种资源。
+     * 与其改 19 处调用，不如在这里做一次映射 —— 调用方一行都不用动。
+     *
+     * 注意 btn_selected 保持 XML 版本：它是胶囊（999dp），
+     * 用户明确要求保留胶囊样式，不该被 squircle 覆盖。
+     */
+    private android.graphics.drawable.Drawable squircleFor(int bgRes) {
+        Squircle sq = Squircle.of(this);
+        if (bgRes == R.drawable.btn_primary)   return sq.primaryButton();
+        if (bgRes == R.drawable.btn_secondary) return sq.secondaryButton();
+        if (bgRes == R.drawable.btn_danger)    return sq.dangerButton();
+        /* btn_selected 等其它（胶囊）保持原样 */
+        return getDrawable(bgRes);
+    }
+
     private LinearLayout iconButton(String text, String glyph, int bgRes, int colorRes,
                                     View.OnClickListener l) {
         LinearLayout btn = new LinearLayout(this);
         btn.setOrientation(LinearLayout.HORIZONTAL);
         btn.setGravity(Gravity.CENTER);
-        btn.setBackgroundResource(bgRes);
+        /*
+         * 背景从 XML drawable 换成 squircle（2026-11-04）。
+         *
+         * iconButton 的 bgRes 参数有 4 种取值，按它选对应的 squircle：
+         *   btn_primary   → primaryButton()   （蓝实底，16dp squircle）
+         *   btn_secondary → secondaryButton() （抬升底+描边，16dp）
+         *   btn_selected  → 保持 btn_selected（胶囊 999dp，用户要求保留）
+         *   btn_danger    → dangerButton()    （透明底+红描边，16dp）
+         */
+        btn.setBackground(squircleFor(bgRes));
         btn.setClickable(true);
         btn.setFocusable(true);
         btn.setPadding(dp(12), 0, dp(12), 0);
 
         TextView ic = new TextView(this);
         ic.setText(glyph);
-        ic.setTextSize(17);
+        ic.setTextSize(16);
         ic.setTextColor(getColor(colorRes));
         ic.setAlpha(0.85f);
         LinearLayout.LayoutParams icLp = new LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.WRAP_CONTENT,
                 LinearLayout.LayoutParams.WRAP_CONTENT);
-        icLp.setMargins(0, 0, dp(8), 0);
+        icLp.setMargins(0, 0, dp(6), 0);
         ic.setLayoutParams(icLp);
         btn.addView(ic);
 
         TextView tx = new TextView(this);
         tx.setText(text);
-        tx.setTextSize(19);
+        /*
+         * 文字 19 → 15sp（2026-11-04 美化）。
+         *
+         * 19sp 在左栏（700dp 宽）的单行按钮上没问题，但这个 iconButton
+         * 也用在右栏两张并排的按钮上（每张只有 340dp）——
+         * 「刷新截图（当底图）」这种 9 字标签在 19sp 下会被截断成
+         * 「刷新截图（当底...」。15sp 能完整放下 9 个字。
+         */
+        tx.setTextSize(16);
         tx.setTextColor(getColor(colorRes));
         tx.setTypeface(Typeface.DEFAULT_BOLD);
         tx.setGravity(Gravity.CENTER);
@@ -2353,7 +3054,7 @@ public class MainActivity extends Activity {
 
         TextView v = new TextView(this);
         v.setText(initVal);
-        v.setTextSize(30);
+        v.setTextSize(36);
         v.setTextColor(getColor(R.color.accent_soft));
         v.setTypeface(Typeface.DEFAULT_BOLD);
         v.setGravity(Gravity.CENTER);
@@ -2364,7 +3065,51 @@ public class MainActivity extends Activity {
 
         TextView lb = new TextView(this);
         lb.setText(label);
-        lb.setTextSize(13);
+        lb.setTextSize(15);
+        lb.setTextColor(getColor(R.color.content_tertiary));
+        lb.setGravity(Gravity.CENTER);
+        lb.setIncludeFontPadding(false);
+        lb.setPadding(0, dp(3), 0, 0);
+        cell.addView(lb, new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT));
+
+        parent.addView(cell);
+        return v;
+    }
+
+    /**
+     * 固定宽度的指标格（删掉「图块」后只剩两格，不能再用 1/3 权重均分）。
+     *
+     * 原来三格用 weight=1 均分 —— 那是为"三个指标铺满一行"设计的。
+     * 现在只有 fps 和上行两个，若继续均分，每格占一半宽度，
+     * 数字会离得老远、中间空一大片，看着像两组无关的数据。
+     *
+     * 改成每格固定 200dp，整体左对齐 —— 两个数字紧凑挨在一起，
+     * 右侧留白，视觉上是一组。
+     */
+    private TextView statCellFixed(LinearLayout parent, String label, String initVal) {
+        LinearLayout cell = new LinearLayout(this);
+        cell.setOrientation(LinearLayout.VERTICAL);
+        cell.setGravity(Gravity.CENTER);
+        /* 高度 56 → 76dp，跟上外层的 84dp（原 56 会裁掉标签） */
+        cell.setLayoutParams(new LinearLayout.LayoutParams(dp(200),
+                LinearLayout.LayoutParams.WRAP_CONTENT));
+
+        TextView v = new TextView(this);
+        v.setText(initVal);
+        v.setTextSize(36);
+        v.setTextColor(getColor(R.color.accent_soft));
+        v.setTypeface(Typeface.DEFAULT_BOLD);
+        v.setGravity(Gravity.CENTER);
+        v.setIncludeFontPadding(false);
+        cell.addView(v, new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT));
+
+        TextView lb = new TextView(this);
+        lb.setText(label);
+        lb.setTextSize(15);
         lb.setTextColor(getColor(R.color.content_tertiary));
         lb.setGravity(Gravity.CENTER);
         lb.setIncludeFontPadding(false);
@@ -2411,6 +3156,20 @@ public class MainActivity extends Activity {
         if (cur == want) return;
         mirror.setCodec(want);
         refreshCodecButtons();
+        /*
+         * 切档后刷新形状/适配按钮的**文案**（2026-11-04）。
+         *
+         * 这两个按钮在 H.264 下会显示「矩形（H264 固定）」「铺满（固定）」，
+         * 切回 BGRA 要还原成正常文案。
+         * 原来只有 applyAlphaDependentAvailability() 改它们的 enabled/alpha，
+         * 没改 text —— 切档后按钮虽然可点了，文案却还留着「（固定）」后缀。
+         */
+        if (maskBtnShape != null) {
+            ((TextView) maskBtnShape.getChildAt(0)).setText(shapeLabel());
+        }
+        if (maskBtnFit != null) {
+            ((TextView) maskBtnFit.getChildAt(0)).setText(fitLabel());
+        }
         setStatus("状态：编码档位已切换 · "
                 + (want == MirrorController.CODEC_H264 ? "H.264" : "BGRA+LZ4"));
 
@@ -2451,9 +3210,9 @@ public class MainActivity extends Activity {
                  */
                 MirrorController.awaitCodecSwitched(3000);
                 snap.applyFully(appCtx);
-                Log.i(TAG, "编码档切换后已重新下发配置（codec=" + newCodec + "）");
+                DashLog.i(TAG, "编码档切换后已重新下发配置（codec=" + newCodec + "）");
             } catch (Throwable ex) {
-                Log.w(TAG, "切档后下发失败: " + ex);
+                DashLog.w(TAG, "切档后下发失败: " + ex);
             }
         }, "codec-reapply").start();
 
@@ -2560,7 +3319,7 @@ public class MainActivity extends Activity {
                     ((TextView) maskBtnShape.getChildAt(0)).setText(shapeLabel());
                 }
                 refreshMask();
-                Log.i(TAG, "H.264：形状压成矩形，已记住原形状=" + sShapeBeforeH264);
+                DashLog.i(TAG, "H.264：形状压成矩形，已记住原形状=" + sShapeBeforeH264);
             }
         } else {
             /*
@@ -2576,7 +3335,7 @@ public class MainActivity extends Activity {
                     ((TextView) maskBtnShape.getChildAt(0)).setText(shapeLabel());
                 }
                 refreshMask();
-                Log.i(TAG, "BGRA：已还原形状=" + maskCfg.shape);
+                DashLog.i(TAG, "BGRA：已还原形状=" + maskCfg.shape);
             }
         }
     }
@@ -2590,15 +3349,55 @@ public class MainActivity extends Activity {
         sb.setAlpha(alpha);
     }
 
+    /** 编码档按钮的选中态（委托给统一的 styleToggle，保持全界面一致） */
     private void applyCodecStyle(LinearLayout b, boolean selected) {
+        styleToggle(b, selected);
+    }
+
+    /**
+     * **统一的"选中态"样式切换**（2026-11-04）。
+     *
+     * 背景换胶囊 + **同时改文字颜色** —— 两者必须同步，否则
+     * 选中档的淡青字压在蓝底上对比度只有 1.3:1，比未选中还难读。
+     *
+     * 原来只有 applyCodecStyle 做对了（编码档按钮），
+     * 其余 6 处（跟随窗口/手动、等比居中/裁满铺、远景中景近景、
+     * 地图模式、地图 HUD）都只换背景不改字色 —— 全是同一个 bug。
+     *
+     * @param b   按钮容器（chipButton / iconButton 返回的 LinearLayout）
+     * @param on  true=选中
+     */
+    private void styleToggle(LinearLayout b, boolean on) {
         if (b == null) return;
-        int fg = selected ? getColor(R.color.surface_root)
-                          : getColor(R.color.content_secondary);
-        b.setBackgroundResource(selected
+        b.setBackgroundResource(on
                 ? R.drawable.btn_selected : R.drawable.btn_secondary);
-        for (int i = 0; i < b.getChildCount(); i++) {
-            View c = b.getChildAt(i);
-            if (c instanceof TextView) ((TextView) c).setTextColor(fg);
+        /*
+         * 选中态文字必须是**白色**（2026-11-04 修复）。
+         *
+         * 原来用 surface_root —— 那时它还是深色（#17161A），深字压蓝底勉强能看。
+         * 现在 surface_root 改成浅灰 #F5F5F5 后，浅灰字压在蓝底上直接糊成一片，
+         * 选中项反而看不清。
+         *
+         * 正确做法：选中态一律白字（accent_on = #FFFFFF），
+         * 这是 iOS 蓝底按钮的标准配法，对比度 3.6:1。
+         *
+         * 「所有文字变黑」那条要求针对的是未选中态和普通文字；
+         * 选中态是「白字蓝底」的特殊组合，不属于该规则。
+         */
+        int fg = getColor(on ? R.color.accent_on : R.color.content_secondary);
+        applyTextColorRecursive(b, fg);
+    }
+
+    /** 递归给容器内所有 TextView 设字色（兼容图标+文字的复合按钮） */
+    private void applyTextColorRecursive(View v, int color) {
+        if (v instanceof TextView) {
+            ((TextView) v).setTextColor(color);
+            return;
+        }
+        if (!(v instanceof android.view.ViewGroup)) return;
+        android.view.ViewGroup g = (android.view.ViewGroup) v;
+        for (int i = 0; i < g.getChildCount(); i++) {
+            applyTextColorRecursive(g.getChildAt(i), color);
         }
     }
 
@@ -2630,7 +3429,7 @@ public class MainActivity extends Activity {
         @Override
         public void run() {
             if (!busy) return;
-            Log.w(TAG, "操作超时，强制解锁 UI");
+            DashLog.w(TAG, "操作超时，强制解锁 UI");
             setStatus("状态：操作超时（没等到虚拟屏回调），已解锁，请重试");
             setDotColor(R.color.text_sub);
             leaveBusy();
@@ -2642,7 +3441,7 @@ public class MainActivity extends Activity {
                        java.util.function.BooleanSupplier op,
                        String okMsg, String failMsg) {
         if (busy) {
-            Log.i(TAG, "操作进行中，忽略重复点击: " + name);
+            DashLog.i(TAG, "操作进行中，忽略重复点击: " + name);
             return;
         }
         enterBusy();
@@ -2652,7 +3451,7 @@ public class MainActivity extends Activity {
             try {
                 ok = op.getAsBoolean();
             } catch (Exception e) {
-                Log.e(TAG, name + " 异常", e);
+                DashLog.e(TAG, name + " 异常", e);
                 ok = false;
             }
             final boolean done = ok;
@@ -2663,6 +3462,21 @@ public class MainActivity extends Activity {
 
     /** [部署服务] 只推送文件，不启动 */
     private void deployService() {
+        /*
+         * ══════════════════════════════════════════════════════════════
+         * **部署前先清空日志**（2026-11-05）
+         * ══════════════════════════════════════════════════════════════
+         *
+         * 用户要求："下次部署把这个路径的 dashcast.log 清空，再把日志写入"。
+         *
+         * 理由：日志是纯追加（FileWriter 的 append=true），用久了会累积到
+         * 2MB 才轮转。每次部署是一个"新会话"的起点 —— 从这里清空，
+         * 之后看到的都是本次部署之后的日志，排查问题不会被历史噪音干扰。
+         *
+         * 清空放在 runOp 之前：保证「推送 dashcastd…」这条
+         * 就是新日志的第一行。
+         */
+        LocalStore.clearLog(this);
         runOp("cp-deploy", "状态：推送 dashcastd…",
                 cpManager::pushDashcastd,
                 "状态：部署完成", "状态：部署失败");
@@ -2683,7 +3497,6 @@ public class MainActivity extends Activity {
                 "状态：已停止，文件已删除", "状态：停止失败");
     }
 
-    /** 弹出已安装 App 列表（分组：自己安装 / 系统自带），选择投屏目标 */
     private void showAppPicker() {
         List<AppEntry> userApps = new ArrayList<>();
         List<AppEntry> systemApps = new ArrayList<>();
@@ -2725,7 +3538,7 @@ public class MainActivity extends Activity {
     private TextView groupHeader(String text) {
         TextView t = new TextView(this);
         t.setText(text);
-        t.setTextSize(15);
+        t.setTextSize(16);
         t.setTextColor(getColor(R.color.accent));
         t.setTypeface(Typeface.DEFAULT_BOLD);
         t.setPadding(dp(4), dp(14), 0, dp(8));
@@ -2797,7 +3610,7 @@ public class MainActivity extends Activity {
 
         TextView name = new TextView(this);
         name.setText(e.label);
-        name.setTextSize(14);
+        name.setTextSize(16);
         name.setTextColor(getColor(R.color.content_primary));
         name.setGravity(Gravity.CENTER);
         name.setMaxLines(2);
@@ -2814,6 +3627,16 @@ public class MainActivity extends Activity {
             targetCls = e.info.activityInfo.name;
             targetLabel = e.label;
             saveTargetPref();
+            /*
+             * **切换 App 立刻套用该 App 的历史截取尺寸并落盘**（2026-11-04）。
+             *
+             * 用户要求："截取某 App 页面保存后，下次启动该 App 要默认
+             * 从配置文件读取并按配置截取，不想重新截。"
+             *
+             * 这里补上：切 App 就套用 + 立刻 applyFully，
+             * 让"选 App → 开始投屏"这条最短路径也正确。
+             */
+            applyAppRectOnSwitch();
             updateTargetHint();
             if (dialogRef[0] != null) dialogRef[0].dismiss();
             if (MirrorController.isMirroring() || running) {
@@ -2870,7 +3693,7 @@ public class MainActivity extends Activity {
                 if (ri.activityInfo != null) set.add(ri.activityInfo.packageName);
             }
         } catch (Exception e) {
-            Log.w(TAG, "查询桌面包名失败: " + e);
+            DashLog.w(TAG, "查询桌面包名失败: " + e);
         }
         set.add("com.flyme.auto.launcher");
         set.add("com.android.launcher3");
@@ -2919,7 +3742,7 @@ public class MainActivity extends Activity {
      */
     private void startHudCast() {
         if (busy) {
-            Log.i(TAG, "操作进行中，忽略重复点击: 地图 HUD");
+            DashLog.i(TAG, "操作进行中，忽略重复点击: 地图 HUD");
             return;
         }
 
@@ -2993,7 +3816,7 @@ public class MainActivity extends Activity {
 
     private void startCast() {
         if (busy) {
-            Log.i(TAG, "操作进行中，忽略重复点击: 开始投屏");
+            DashLog.i(TAG, "操作进行中，忽略重复点击: 开始投屏");
             return;
         }
         // 必须点名一个 App。不点名就等于"投整个桌面"，那不是我们要的。
@@ -3024,7 +3847,7 @@ public class MainActivity extends Activity {
         // 这种情况直接 startForegroundService 会因为 sRunning==true 而跳过建屏，
         // 回调永远不来 → UI 卡在"等待虚拟屏就绪…"。所以先停干净，再重开。
         if (DashcastSenderService.isRunning()) {
-            Log.i(TAG, "上一场还在跑，先停掉再重开");
+            DashLog.i(TAG, "上一场还在跑，先停掉再重开");
             setStatus("状态：结束上一场投屏…");
             stopServiceNow();
             mainHandler.postDelayed(this::startCastInner, 500);
@@ -3103,7 +3926,7 @@ public class MainActivity extends Activity {
             } catch (Throwable e) {
                 // 必须 catch Throwable：这里如果漏出的是 Error（OOM / 链接错误），
                 // 线程一死整个进程就闪退 —— 用户看到的就是"点开始投屏直接退出"。
-                Log.e(TAG, "启动 dashcastd 异常", e);
+                DashLog.e(TAG, "启动 dashcastd 异常", e);
                 ok = false;
             }
             final boolean done = ok;
@@ -3170,7 +3993,7 @@ public class MainActivity extends Activity {
         try {
             startActivityForResult(mpm.createScreenCaptureIntent(), REQ_PROJECTION);
         } catch (Exception e) {
-            Log.e(TAG, "拉起授权框失败", e);
+            DashLog.e(TAG, "拉起授权框失败", e);
             setStatus("状态：拉起屏幕授权失败 " + e.getMessage());
             setDotColor(R.color.text_sub);
         }
@@ -3200,7 +4023,7 @@ public class MainActivity extends Activity {
             // 之前是无条件先弹，结果正常路径也被拦一道。
             if (DashcastSenderService.isProjectionRequired()
                     && projectionData == null && !projectionTried) {
-                Log.i(TAG, "私有屏被拒（缺 CAPTURE_VIDEO_OUTPUT），退到 MediaProjection 授权");
+                DashLog.i(TAG, "私有屏被拒（缺 CAPTURE_VIDEO_OUTPUT），退到 MediaProjection 授权");
                 leaveBusy();
                 requestProjection();
                 return;
@@ -3275,10 +4098,10 @@ public class MainActivity extends Activity {
             int end = dump.indexOf("Display #", at + marker.length());
             String block = end > at ? dump.substring(at, end) : dump.substring(at);
             boolean hit = block.contains(pkg);
-            Log.i(TAG, "落地验证 display " + displayId + " ⊃ " + pkg + " = " + hit);
+            DashLog.i(TAG, "落地验证 display " + displayId + " ⊃ " + pkg + " = " + hit);
             return hit;
         } catch (Throwable t) {
-            Log.w(TAG, "落地验证失败: " + t);
+            DashLog.w(TAG, "落地验证失败: " + t);
             return true;   // 验不了就不吓唬人
         }
     }
@@ -3310,14 +4133,14 @@ public class MainActivity extends Activity {
                 ActivityOptions opts = ActivityOptions.makeBasic();
                 opts.setLaunchDisplayId(displayId);
                 startActivity(i, opts.toBundle());
-                Log.i(TAG, "公开 API 把 " + component + " 送到 display " + displayId);
+                DashLog.i(TAG, "公开 API 把 " + component + " 送到 display " + displayId);
                 return true;
             } catch (SecurityException e) {
-                Log.w(TAG, "launchDisplayId=" + displayId + " 被 SafeActivityOptions 拒（第 "
+                DashLog.w(TAG, "launchDisplayId=" + displayId + " 被 SafeActivityOptions 拒（第 "
                         + attempt + " 次）");
                 try { Thread.sleep(200); } catch (InterruptedException ignored) {}
             } catch (Exception e) {
-                Log.e(TAG, "启动到虚拟屏失败: " + e);
+                DashLog.e(TAG, "启动到虚拟屏失败: " + e);
                 return false;
             }
         }
@@ -3339,13 +4162,13 @@ public class MainActivity extends Activity {
 
         try {
             String out = AdbShell.exec("am display move-stack " + taskId + " " + displayId, 8000).trim();
-            Log.i(TAG, "am display move-stack " + taskId + " " + displayId + " → " + out);
+            DashLog.i(TAG, "am display move-stack " + taskId + " " + displayId + " → " + out);
             boolean ok = !out.contains("Exception") && !out.contains("Error");
             if (ok) sLastLaunchError = "";
             else sLastLaunchError = out.replace('\n', ' ');
             return ok;
         } catch (Throwable t) {
-            Log.w(TAG, "move-stack 失败: " + t);
+            DashLog.w(TAG, "move-stack 失败: " + t);
             return false;
         }
     }
@@ -3375,14 +4198,14 @@ public class MainActivity extends Activity {
                     int slash = rest.indexOf('/');
                     String tpkg = slash > 0 ? rest.substring(0, slash) : "";
                     if (pkg.equals(tpkg) && curDisplay != displayId) {
-                        Log.i(TAG, "找到 " + pkg + " 的 task=" + id
+                        DashLog.i(TAG, "找到 " + pkg + " 的 task=" + id
                                 + "（stack=" + curStack + "，在 display " + curDisplay + "）");
                         return id;
                     }
                 }
             }
         } catch (Throwable t) {
-            Log.w(TAG, "读 am stack list 失败: " + t);
+            DashLog.w(TAG, "读 am stack list 失败: " + t);
         }
         return -1;
     }
@@ -3405,28 +4228,28 @@ public class MainActivity extends Activity {
                 + " --activity-multiple-task -n " + component;
         try {
             String out = AdbShell.exec(cmd, 8000).trim();
-            Log.i(TAG, "adbd: " + cmd + "\n" + out);
+            DashLog.i(TAG, "adbd: " + cmd + "\n" + out);
 
             if (out.contains("not started")) {
                 // 备用手段：先杀掉目标进程，让它没有旧 task 可复用
                 String pkg = component.substring(0, component.indexOf('/'));
-                Log.i(TAG, "已有旧 task，force-stop " + pkg + " 后重开");
+                DashLog.i(TAG, "已有旧 task，force-stop " + pkg + " 后重开");
                 AdbShell.exec("am force-stop " + pkg, 5000);
                 try { Thread.sleep(300); } catch (InterruptedException ignored) {}
                 out = AdbShell.exec(cmd, 8000).trim();
-                Log.i(TAG, "adbd 重试:\n" + out);
+                DashLog.i(TAG, "adbd 重试:\n" + out);
             }
 
             boolean ok = out.contains("Starting:") && !out.contains("Error")
                     && !out.contains("not started");
             if (!ok) {
                 sLastLaunchError = out.replace('\n', ' ');
-                Log.e(TAG, "adbd 启动失败: " + sLastLaunchError);
+                DashLog.e(TAG, "adbd 启动失败: " + sLastLaunchError);
             }
             return ok;
         } catch (Throwable t) {
             sLastLaunchError = t.toString();
-            Log.e(TAG, "adbd 通道失败: " + t);
+            DashLog.e(TAG, "adbd 通道失败: " + t);
             return false;
         }
     }
@@ -3471,7 +4294,7 @@ public class MainActivity extends Activity {
         try {
             if (mirror != null) mirror.stop();
         } catch (Throwable t) {
-            Log.w(TAG, "mirror.stop 异常: " + t.getMessage());
+            DashLog.w(TAG, "mirror.stop 异常: " + t.getMessage());
         }
 
         try {
@@ -3496,10 +4319,10 @@ public class MainActivity extends Activity {
                     && false) {   /* HUD 是系统应用，停止时无需撤离 */
                 try {
                     mirror.dismissMapHud();
-                    Log.i(TAG, "地图 HUD 已从 Display "
+                    DashLog.i(TAG, "地图 HUD 已从 Display "
                             + MirrorController.HUD_DISPLAY_ID + " 撤回");
                 } catch (Throwable t) {
-                    Log.w(TAG, "撤回地图 HUD 失败: " + t);
+                    DashLog.w(TAG, "撤回地图 HUD 失败: " + t);
                 }
             }
 
@@ -3516,12 +4339,12 @@ public class MainActivity extends Activity {
                     sleepQuiet(1200);
                     String still = AdbShell.exec("pidof " + killed, 3000);
                     killedOk = still == null || still.trim().isEmpty();
-                    Log.i(TAG, killedOk
+                    DashLog.i(TAG, killedOk
                             ? "已结束投屏 App: " + killed
                             : "投屏 App 仍在运行（系统应用会被自动拉起）: " + killed);
                 } catch (Throwable t) {
                     killedOk = false;
-                    Log.w(TAG, "结束投屏 App 失败: " + t.getMessage());
+                    DashLog.w(TAG, "结束投屏 App 失败: " + t.getMessage());
                 }
             }
 
@@ -3530,7 +4353,7 @@ public class MainActivity extends Activity {
             try {
                 ok = cpManager.restoreDashboard();
             } catch (Throwable t) {
-                Log.w(TAG, "还原仪表异常: " + t.getMessage());
+                DashLog.w(TAG, "还原仪表异常: " + t.getMessage());
             }
             final boolean done = ok;
             final boolean appGone = killedOk;
@@ -3560,7 +4383,7 @@ public class MainActivity extends Activity {
         try {
             startService(stop);          // 服务在跑，这条只是投递指令
         } catch (Throwable t) {
-            Log.w(TAG, "投递停止指令失败: " + t);
+            DashLog.w(TAG, "投递停止指令失败: " + t);
         }
         stopService(new Intent(this, DashcastSenderService.class));
         running = false;
@@ -3568,7 +4391,7 @@ public class MainActivity extends Activity {
 
     private void setStatus(final String text) {
         mainHandler.post(() -> status.setText(text));
-        Log.i(TAG, text);
+        DashLog.i(TAG, text);
         mainHandler.post(() -> {
             updateBadge(text);
             appendLog(text);
@@ -3603,7 +4426,7 @@ public class MainActivity extends Activity {
                         try {
                             hideNavBars(w);
                         } catch (Throwable t) {
-                            Log.w(TAG, "applyImmersive(post) 失败（忽略）: " + t);
+                            DashLog.w(TAG, "applyImmersive(post) 失败（忽略）: " + t);
                         }
                     });
                 }
@@ -3617,7 +4440,7 @@ public class MainActivity extends Activity {
                     | View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION);
         } catch (Throwable t) {
             /* 任何机型差异都不该让 App 起不来 —— 藏导航栏只是锦上添花 */
-            Log.w(TAG, "applyImmersive 失败（忽略）: " + t);
+            DashLog.w(TAG, "applyImmersive 失败（忽略）: " + t);
         }
     }
 
@@ -3665,8 +4488,7 @@ public class MainActivity extends Activity {
     private void updateMapHudBtn() {
         if (btnMapHud == null) return;
         ((TextView) btnMapHud.getChildAt(1)).setText(mapHudLabel());
-        btnMapHud.setBackgroundResource(MirrorController.isHudSession()
-                ? R.drawable.btn_selected : R.drawable.btn_secondary);
+        styleToggle(btnMapHud, MirrorController.isHudSession());
 
         /*
          * **HUD 按钮永远可见**（2026-11-03 修复）。
@@ -3694,8 +4516,7 @@ public class MainActivity extends Activity {
     private void updateMapModeBtn() {
         if (btnMapMode == null) return;
         ((TextView) btnMapMode.getChildAt(1)).setText(mapModeLabel());
-        btnMapMode.setBackgroundResource(mirror.isMapMode()
-                ? R.drawable.btn_selected : R.drawable.btn_secondary);
+        styleToggle(btnMapMode, mirror.isMapMode());
         /* 预览上的"抓取区"参考框跟着开关走 */
         if (maskPreview != null) {
             maskPreview.setMapMode(mirror.isMapMode(), 2560, 1600);
@@ -3741,10 +4562,10 @@ public class MainActivity extends Activity {
         new Thread(() -> {
             try {
                 snap.applyFully(appCtx);
-                Log.i("DashcastView", "视角档已下发"
+                DashLog.i("DashcastView", "视角档已下发"
                         + (casting ? "（含图层矩形）" : "（未投屏，仅落盘）"));
             } catch (Throwable ex) {
-                Log.w("DashcastView", "视角档下发失败: " + ex);
+                DashLog.w("DashcastView", "视角档下发失败: " + ex);
             }
         }, "view-apply").start();
 
@@ -3753,14 +4574,25 @@ public class MainActivity extends Activity {
         }
     }
 
-    /** 高亮当前视角档 */
+    /**
+     * 高亮当前视角档。
+     *
+     * **还要同步文字颜色**（2026-11-04 补充）。
+     *
+     * 原来只换背景，文字一直保持创建时的颜色（accent_soft 淡青）。
+     * 背景从"深色描边"变成"强调色实底"后，淡青字压在蓝底上
+     * 对比度只有 1.3:1，几乎看不见 —— 选中档的字反而比未选中的更难读。
+     *
+     * 现在按状态给字色：
+     *   选中 → surface_root（近黑），压在蓝底上 7:1
+     *   未选 → content_secondary（灰）
+     */
     private void updateViewBtns() {
         if (viewBtns == null) return;
         int cur = getSharedPreferences(PREF, MODE_PRIVATE).getInt("map_view", LayerConfig.VIEW_MID);
         for (int i = 0; i < viewBtns.length; i++) {
             if (viewBtns[i] == null) continue;
-            viewBtns[i].setBackgroundResource(i == cur
-                    ? R.drawable.btn_selected : R.drawable.btn_secondary);
+            styleToggle(viewBtns[i], i == cur);
         }
     }
 
@@ -3784,31 +4616,187 @@ public class MainActivity extends Activity {
     }
 
     /** 设置状态灯颜色 */
+    /**
+     * 设置状态灯颜色 —— 同时更新状态卡左侧色条。
+     *
+     * 状态卡背景已从 XML layer-list 换成 StatusCardDrawable（squircle），
+     * 所以这里不能再走 LayerDrawable.getDrawable(1) 的老路，
+     * 要直接调它的 setBarColor。
+     */
     private void setDotColor(int colorRes) {
         final int color = getColor(colorRes);
         mainHandler.post(() -> {
-            android.graphics.drawable.GradientDrawable d =
-                    (android.graphics.drawable.GradientDrawable) statusDot.getBackground();
-            if (d != null) d.setColor(color);
-            /* 状态卡左侧色条：改 layer-list 第 2 层（index 1）的颜色 */
-            android.graphics.drawable.Drawable bg = statusCardView == null
-                    ? null : statusCardView.getBackground();
-            if (bg instanceof android.graphics.drawable.LayerDrawable) {
-                android.graphics.drawable.LayerDrawable ld =
-                        (android.graphics.drawable.LayerDrawable) bg;
-                android.graphics.drawable.Drawable bar = ld.getDrawable(1);
-                if (bar != null) bar.setColorFilter(color,
-                        android.graphics.PorterDuff.Mode.SRC_IN);
+            /* 左上角那个小圆点（GradientDrawable） */
+            if (statusDot != null) {
+                android.graphics.drawable.Drawable d = statusDot.getBackground();
+                if (d instanceof android.graphics.drawable.GradientDrawable) {
+                    ((android.graphics.drawable.GradientDrawable) d).setColor(color);
+                }
+            }
+            /* 状态卡左侧 5dp 色条 */
+            if (statusCardView != null) {
+                android.graphics.drawable.Drawable bg = statusCardView.getBackground();
+                if (bg instanceof StatusCardDrawable) {
+                    ((StatusCardDrawable) bg).setBarColor(color);
+                    bg.invalidateSelf();
+                } else if (bg instanceof android.graphics.drawable.LayerDrawable) {
+                    /* 兼容：万一还是旧的 layer-list */
+                    android.graphics.drawable.LayerDrawable ld =
+                            (android.graphics.drawable.LayerDrawable) bg;
+                    android.graphics.drawable.Drawable bar = ld.getDrawable(1);
+                    if (bar != null) bar.setColorFilter(color,
+                            android.graphics.PorterDuff.Mode.SRC_IN);
+                }
             }
         });
     }
+    /**
+     * 行内按钮的布局参数（等分宽度 + 固定高度）。
+     *
+     * ══════════════════════════════════════════════════════════════
+     * 尺寸收紧（2026-11-04 布局重构）
+     * ══════════════════════════════════════════════════════════════
+     * 原来是 62dp 高 + 上下各 6dp 边距 = 每行占 74dp。
+     *
+     * 右栏有 6 行按钮 + 若干滑块行，光按钮区就吃掉 444dp，
+     * 加上遮罩参数区 300dp、截取区展开 560dp，总高超过 1600dp，
+     * 用户必须滚动才能看到「保存并应用」—— 最重要的按钮被推到屏幕外。
+     *
+     * 改成 48dp 高 + 上下 4dp = 每行 56dp，6 行省下 108dp。
+     * 48dp 也符合 Android 触摸目标最小尺寸建议（48dp），不算小。
+     */
     private LinearLayout.LayoutParams rowLp(float weight) {
-        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(0, dp(62), weight);
-        lp.setMargins(dp(5), dp(6), dp(5), dp(6));
+        /*
+         * 按钮尺寸按 MiUIX ButtonDefaults 调整（2026-11-04）。
+         *
+         *   MiUIX: MinHeight = 40dp, InsideMargin = 16dp横 / 13dp纵
+         *
+         * 车机上纯 40dp 偏小（手指粗、路面颠簸），取 44dp ——
+         * 比 MiUIX 高 4dp，触摸目标更准，视觉上仍接近。
+         * 边距 4dp 保留（MiUIX 卡片内元素间距是 4-8dp 栅格）。
+         */
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(0, dp(44), weight);
+        lp.setMargins(dp(4), dp(4), dp(4), dp(4));
         return lp;
     }
 
+
     private int dp(int v) {
         return (int) (v * getResources().getDisplayMetrics().density + 0.5f);
+    }
+
+    /**
+     * 给 CheckBox 上色（浅色 UI 必需，否则勾选框在白底上几乎不可见）。
+     *
+     * buttonTint 是三态 ColorStateList：
+     *   选中   → accent (#007AFF)
+     *   未选中 → surface_border (#D1D1D6)
+     *   禁用   → 半透明
+     */
+    private void tintCheckBox(android.widget.CheckBox cb) {
+        if (cb == null) return;
+        int[][] states = new int[][]{
+                {android.R.attr.state_checked},
+                {-android.R.attr.state_enabled},
+                {}
+        };
+        int[] colors = new int[]{
+                getColor(R.color.accent),
+                getColor(R.color.content_tertiary),
+                getColor(R.color.surface_border)
+        };
+        cb.setButtonTintList(new android.content.res.ColorStateList(states, colors));
+    }
+    /**
+     * 设置某一个角的圆角（0=左上 1=右上 2=左下 3=右下）。
+     *
+     * **如果"同步"勾上了，四个角一起改**（2026-11-05）。
+     *
+     * 为什么要专门一个方法而不是直接 maskCfg.rTl = v：
+     *   · 同步模式下改一个滑块，另外三个滑块的**位置和数字也要跟着动**，
+     *     否则用户看到"左上 65°、右上 20°"但实际渲染是四个 65° —— 界面说谎。
+     *   · 三个滑块的 setProgress 又会回调 setCorner，需要防重入。
+     */
+    private void setCorner(int which, int v) {
+        if (cornerSyncing) {
+            /* 正在批量同步，只改值不改 UI，避免无限递归 */
+            applyCornerValue(which, v);
+            refreshMask();
+            return;
+        }
+        boolean locked = cornerLockBox != null && cornerLockBox.isChecked();
+        if (locked) {
+            cornerSyncing = true;
+            try {
+                applyCornerValue(0, v);
+                applyCornerValue(1, v);
+                applyCornerValue(2, v);
+                applyCornerValue(3, v);
+                /* 三个同伴滑块的 UI 也要跟上（正在拖的那个已经是 v 了） */
+                setCornerSlider(maskSbTl, maskTvTl, v);
+                setCornerSlider(maskSbTr, maskTvTr, v);
+                setCornerSlider(maskSbBl, maskTvBl, v);
+                setCornerSlider(maskSbBr, maskTvBr, v);
+            } finally {
+                cornerSyncing = false;
+            }
+        } else {
+            applyCornerValue(which, v);
+        }
+        refreshMask();
+    }
+
+    /** 只改 maskCfg 的字段，不碰 UI */
+    private void applyCornerValue(int which, int v) {
+        switch (which) {
+            case 0: maskCfg.rTl = v; break;
+            case 1: maskCfg.rTr = v; break;
+            case 2: maskCfg.rBl = v; break;
+            case 3: maskCfg.rBr = v; break;
+        }
+    }
+
+    /** 同步一个圆角滑块的进度 + 右侧数值文字 */
+    private void setCornerSlider(SeekBar sb, TextView tv, int v) {
+        if (sb != null && sb.getProgress() != v) sb.setProgress(v);
+        if (tv != null) tv.setText(v + "°");
+    }
+
+    /** "同步"勾上时把四个角的当前值统一（取左上的），并调整样式 */
+    private void applyCornerLockStyle() {
+        boolean locked = cornerLockBox != null && cornerLockBox.isChecked();
+        if (locked) {
+            int v = maskCfg.rTl;
+            cornerSyncing = true;
+            try {
+                applyCornerValue(1, v);
+                applyCornerValue(2, v);
+                applyCornerValue(3, v);
+                setCornerSlider(maskSbTl, maskTvTl, v);
+                setCornerSlider(maskSbTr, maskTvTr, v);
+                setCornerSlider(maskSbBl, maskTvBl, v);
+                setCornerSlider(maskSbBr, maskTvBr, v);
+            } finally {
+                cornerSyncing = false;
+            }
+            refreshMask();
+        }
+        /*
+         * 锁定态下把三个"同伴"滑块调暗一点 —— 暗示"改它们没用"。
+         * 但不能真 disable：用户可能想改锁定值，四个都拖得动，
+         * 只是效果等价。所以只降一点 alpha 做视觉提示。
+         */
+        float alpha = locked ? 0.72f : 1.0f;
+        if (maskSbTr != null) maskSbTr.setAlpha(alpha);
+        if (maskSbBl != null) maskSbBl.setAlpha(alpha);
+        if (maskSbBr != null) maskSbBr.setAlpha(alpha);
+        if (maskTvTr != null) maskTvTr.setAlpha(alpha);
+        if (maskTvBl != null) maskTvBl.setAlpha(alpha);
+        if (maskTvBr != null) maskTvBr.setAlpha(alpha);
+    }
+
+    /** dp → px 的 float 版本（squircle 圆角要 float 精度） */
+    private float dpFloat(float v) {
+        return v * getResources().getDisplayMetrics().density;
     }
 }

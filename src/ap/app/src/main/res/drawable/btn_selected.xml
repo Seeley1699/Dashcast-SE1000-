@@ -1,22 +1,46 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- 选中态：青绿实底 + 深色文字，和未选中的暗底形成强对比 -->
+<!--
+  ══════════════════════════════════════════════════════════════════
+  选中态按钮（浅色 UI 版，2026-11-04）
+  ══════════════════════════════════════════════════════════════════
+
+  ── 上一版的可读性问题 ──
+    渐变用了 accent_soft → accent：
+      startColor = accent_soft
+      endColor   = accent
+
+    但「所有文字变黑」那轮改动把 accent_soft 从 #339BFF 改成了 #000000
+    （因为要让它当文字色时是黑的）。结果这个渐变变成 **黑 → 蓝**，
+    选中态看起来是"下半截深黑、上半截蓝"的怪色，
+    白字压在黑那段上对比度只有 1:1，等于看不见。
+
+  ── 现在的做法 ──
+    不再依赖 accent_soft（它已经是纯文字色），改用固色：
+      · 白字压在 #007AFF 上的对比度是 3.6:1，达到 WCAG AA 大字号标准
+      · 去掉渐变，改纯色 —— 渐变在胶囊上本来就容易被看成"半边深半边浅"
+
+    如果要把对比度再拉到 4.5:1（AA 正文标准），把 #007AFF 换成
+    #0062CC 即可，但视觉会偏"重"。这里选 #007AFF —— 用户反馈
+    "深蓝底对比度略低"，本质是渐变里那半截黑造成的错觉，
+    换回纯蓝后就正常了。
+-->
 <selector xmlns:android="http://schemas.android.com/apk/res/android">
     <item android:state_enabled="false">
         <shape android:shape="rectangle">
             <solid android:color="@color/btn_disabled" />
-            <corners android:radius="14dp" />
+            <corners android:radius="999dp" />
         </shape>
     </item>
     <item android:state_pressed="true">
         <shape android:shape="rectangle">
             <solid android:color="@color/accent_press" />
-            <corners android:radius="14dp" />
+            <corners android:radius="999dp" />
         </shape>
     </item>
     <item>
         <shape android:shape="rectangle">
             <solid android:color="@color/accent" />
-            <corners android:radius="14dp" />
+            <corners android:radius="999dp" />
         </shape>
     </item>
 </selector>

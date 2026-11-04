@@ -87,11 +87,11 @@ public class CpManager {
                     sb.append(Character.forDigit(b & 0xF, 16));
                 }
                 sLocalMd5 = sb.toString();
-                Log.i(TAG, "本地 dashcastd MD5 = " + sLocalMd5 + " (" + bin.length
+                DashLog.i(TAG, "本地 dashcastd MD5 = " + sLocalMd5 + " (" + bin.length
                         + " 字节，已缓存，后续复用)");
                 return sLocalMd5;
             } catch (Exception e) {
-                Log.w(TAG, "计算本地 MD5 失败: " + e.getMessage());
+                DashLog.w(TAG, "计算本地 MD5 失败: " + e.getMessage());
                 return null;
             }
         }
@@ -133,7 +133,7 @@ public class CpManager {
         session.setTimeout(20000);
         session.connect(20000);
         sSharedSession = session;
-        Log.i(TAG, "SSH 已连 " + HOST + ":" + PORT + "（建立共享 Session，后续复用）");
+        DashLog.i(TAG, "SSH 已连 " + HOST + ":" + PORT + "（建立共享 Session，后续复用）");
         return session;
     }
 
@@ -142,7 +142,7 @@ public class CpManager {
         if (sSharedSession != null) {
             try { sSharedSession.disconnect(); } catch (Throwable ignored) {}
             sSharedSession = null;
-            Log.i(TAG, "SSH 共享 Session 已关闭");
+            DashLog.i(TAG, "SSH 共享 Session 已关闭");
         }
     }
 
@@ -202,7 +202,7 @@ public class CpManager {
             try {
                 String b64 = readAssetText("dashcastd.b64");
                 if (b64 == null || b64.length() == 0) {
-                    Log.e(TAG, "assets/dashcastd.b64 读取失败");
+                    DashLog.e(TAG, "assets/dashcastd.b64 读取失败");
                     return false;
                 }
                 b64 = b64.replaceAll("\\s+", "");
@@ -230,7 +230,7 @@ public class CpManager {
                 bos.close();
 
                 String gzB64 = Base64.encodeToString(gzBytes, Base64.NO_WRAP);
-                Log.i(TAG, "dashcastd " + bin.length + " 字节 → gzip " + gzBytes.length
+                DashLog.i(TAG, "dashcastd " + bin.length + " 字节 → gzip " + gzBytes.length
                         + " 字节（" + (gzBytes.length * 100 / bin.length) + "%），base64 "
                         + gzB64.length() + " 字符 (md5=" + wantMd5 + ")，开始推送");
 
@@ -282,7 +282,7 @@ public class CpManager {
                             long got = 0;
                             try { got = Long.parseLong(sz.split("\\s+")[0]); } catch (Throwable ignored) {}
                             if (got < expect * 9 / 10) {
-                                Log.e(TAG, "分片丢失: 期望 " + expect + " 实际 " + got + "，中止");
+                                DashLog.e(TAG, "分片丢失: 期望 " + expect + " 实际 " + got + "，中止");
                                 lastPushError = "分片丢失 @" + got + "/" + expect;
                                 return false;
                             }
@@ -306,13 +306,13 @@ public class CpManager {
                 String res = execOnSession(session, tail).trim();
                 String remoteMd5 = res.isEmpty() ? "" : res.split("\\s+")[0];
                 boolean ok = remoteMd5.equalsIgnoreCase(wantMd5);
-                Log.i(TAG, "落盘校验: 远端 " + remoteMd5 + " vs 本地 " + wantMd5
+                DashLog.i(TAG, "落盘校验: 远端 " + remoteMd5 + " vs 本地 " + wantMd5
                         + (ok ? " (一致)" : " (不一致!)")
                         + "（本次共 " + sentCmds + " 条批量命令）");
                 if (!ok) lastPushError = "md5 不一致: " + remoteMd5 + " / " + wantMd5;
                 return ok;
             } catch (Exception e) {
-                Log.e(TAG, "推送 dashcastd 失败: " + e.getMessage(), e);
+                DashLog.e(TAG, "推送 dashcastd 失败: " + e.getMessage(), e);
                 lastPushError = String.valueOf(e);
                 return false;
             } finally {
@@ -360,13 +360,13 @@ public class CpManager {
                 Session session = acquireSession();
                 try {
                     String out = execOnSession(session, cmd);
-                    Log.i(TAG, "启动结果: " + out.trim());
+                    DashLog.i(TAG, "启动结果: " + out.trim());
                     return out.contains("STARTED");
                 } finally {
                     /* 共享 Session：不断开，由 closeSession() 管理 */
                 }
             } catch (Exception e) {
-                Log.e(TAG, "启动 dashcastd 失败: " + e.getMessage(), e);
+                DashLog.e(TAG, "启动 dashcastd 失败: " + e.getMessage(), e);
                 return false;
             }
         }
@@ -388,7 +388,7 @@ public class CpManager {
     public boolean ensureDashcastd() {
         if (checkDashcastd()) return true;              /* 版本一致，直接用 */
 
-        Log.w(TAG, "CP 上 dashcastd 缺失或版本不一致，尝试推送");
+        DashLog.w(TAG, "CP 上 dashcastd 缺失或版本不一致，尝试推送");
         if (pushDashcastd()) return true;
 
         /* 推送失败：只要 CP 上有可执行文件就继续（旧版也能投屏，图层矩形走外部命令） */
@@ -397,17 +397,17 @@ public class CpManager {
             try {
                 String out = execOnSession(session, "test -x " + CP_PATH + " && echo HAVE || echo NONE");
                 if (out != null && out.contains("HAVE")) {
-                    Log.w(TAG, "推送失败，但 CP 上已有可执行的 dashcastd —— 继续使用旧版"
+                    DashLog.w(TAG, "推送失败，但 CP 上已有可执行的 dashcastd —— 继续使用旧版"
                             + "（图层矩形由 setLayerRect 外部设置，功能不受影响）");
                     return true;
                 }
-                Log.e(TAG, "CP 上既没有可执行文件、推送也失败");
+                DashLog.e(TAG, "CP 上既没有可执行文件、推送也失败");
                 return false;
             } finally {
                 /* 共享 Session：不断开，由 closeSession() 管理 */
             }
         } catch (Throwable t) {
-            Log.e(TAG, "检查 CP 二进制失败: " + t);
+            DashLog.e(TAG, "检查 CP 二进制失败: " + t);
             return false;
         }
     }
@@ -422,13 +422,13 @@ public class CpManager {
                             "killall dashcastd 2>/dev/null; "
                             + "rm -f " + CP_PATH + " " + CP_B64_PATH + " /run/dashcastd.log; "
                             + "echo DONE");
-                    Log.i(TAG, "停止结果: " + out.trim() + "（已删除推送文件）");
+                    DashLog.i(TAG, "停止结果: " + out.trim() + "（已删除推送文件）");
                     return out.contains("DONE");
                 } finally {
                     /* 共享 Session：不断开，由 closeSession() 管理 */
                 }
             } catch (Exception e) {
-                Log.e(TAG, "停止 dashcastd 失败: " + e.getMessage(), e);
+                DashLog.e(TAG, "停止 dashcastd 失败: " + e.getMessage(), e);
                 return false;
             }
         }
@@ -484,14 +484,14 @@ public class CpManager {
                     boolean clean = true;
                     for (int id : ids2) if (id == LAYER_ID_CAST) clean = false;
 
-                    Log.i(TAG, "还原仪表（第 " + (attempt + 1) + " 次）: 原表含99=" + has99
+                    DashLog.i(TAG, "还原仪表（第 " + (attempt + 1) + " 次）: 原表含99=" + has99
                             + " → 设为 [" + order + "] 验证=" + (clean ? "干净" : "仍含99"));
                     if (clean) return true;
                 } finally {
                     /* 共享 Session：不断开，由 closeSession() 管理 */
                 }
             } catch (Throwable t) {
-                Log.w(TAG, "还原仪表失败（第 " + (attempt + 1) + " 次）: " + t);
+                DashLog.w(TAG, "还原仪表失败（第 " + (attempt + 1) + " 次）: " + t);
             }
         }
         return false;
@@ -583,17 +583,17 @@ public class CpManager {
             out = out == null ? "" : out.trim();
 
             if (out.contains("NOEXEC") || out.isEmpty()) {
-                Log.i(TAG, "dashcastd 不存在或不可执行，需推送");
+                DashLog.i(TAG, "dashcastd 不存在或不可执行，需推送");
                 return false;
             }
 
             String remoteMd5 = out.split("\\s+")[0];
             boolean match = localMd5 != null && remoteMd5.equalsIgnoreCase(localMd5);
-            Log.i(TAG, "dashcastd 可执行, 远端 MD5 " + remoteMd5 + " vs 本地 "
+            DashLog.i(TAG, "dashcastd 可执行, 远端 MD5 " + remoteMd5 + " vs 本地 "
                     + localMd5 + (match ? " (一致)" : " (不一致，需重推)"));
             return match;
         } catch (Exception e) {
-            Log.w(TAG, "校验 dashcastd 失败（可能未推过）: " + e.getMessage());
+            DashLog.w(TAG, "校验 dashcastd 失败（可能未推过）: " + e.getMessage());
             return false;
         }
     }
@@ -641,16 +641,16 @@ public class CpManager {
                         + "cat /sys/class/drm/card0-*/modes 2>/dev/null | head -3");
                 int[] r = parseSize(out);
                 if (r != null) {
-                    Log.i(TAG, "CP 屏幕尺寸 = " + r[0] + "x" + r[1]);
+                    DashLog.i(TAG, "CP 屏幕尺寸 = " + r[0] + "x" + r[1]);
                 } else {
-                    Log.w(TAG, "CP 屏幕尺寸解析失败，原始输出: " + out.replace('\n', ' '));
+                    DashLog.w(TAG, "CP 屏幕尺寸解析失败，原始输出: " + out.replace('\n', ' '));
                 }
                 return r;
             } finally {
                 /* 共享 Session：不断开，由 closeSession() 管理 */
             }
         } catch (Exception e) {
-            Log.w(TAG, "查 CP 屏幕尺寸失败: " + e.getMessage());
+            DashLog.w(TAG, "查 CP 屏幕尺寸失败: " + e.getMessage());
             return null;
         }
     }
@@ -678,7 +678,7 @@ public class CpManager {
                 /* 共享 Session：不断开，由 closeSession() 管理 */
             }
         } catch (Exception e) {
-            Log.w(TAG, "ping 失败: " + e.getMessage());
+            DashLog.w(TAG, "ping 失败: " + e.getMessage());
             return false;
         }
     }
@@ -745,14 +745,14 @@ public class CpManager {
                  * 直接 != 判断会恒为 true，去重完全失效 —— 之前就踩了这个坑）。 */
                 if (!key.equals(sLastNoLayerRect)) {
                     sLastNoLayerRect = key;
-                    Log.i(TAG, "图层 " + lid + " 尚未建立（未投屏）："
+                    DashLog.i(TAG, "图层 " + lid + " 尚未建立（未投屏）："
                             + x + "," + y + " " + w + "x" + h + "（同参数后续静默）");
                 }
                 return false;
             }
 
             if (out.toLowerCase().contains("failed")) {
-                Log.w(TAG, "设置图层矩形失败: " + out.trim().replace('\n', ' '));
+                DashLog.w(TAG, "设置图层矩形失败: " + out.trim().replace('\n', ' '));
                 return false;
             }
 
@@ -763,7 +763,7 @@ public class CpManager {
             }
             return ok;
         } catch (Throwable t) {
-            Log.w(TAG, "设置图层矩形异常: " + t);
+            DashLog.w(TAG, "设置图层矩形异常: " + t);
             return false;
         }
     }
@@ -772,7 +772,7 @@ public class CpManager {
         synchronized (pushLock) {
             try {
                 java.io.File f = new java.io.File(localPath);
-                if (!f.exists()) { Log.e(TAG, "本地文件不存在: " + localPath); return false; }
+                if (!f.exists()) { DashLog.e(TAG, "本地文件不存在: " + localPath); return false; }
                 byte[] bin = new byte[(int) f.length()];
                 java.io.FileInputStream fi = new java.io.FileInputStream(f);
                 int off = 0;
@@ -789,7 +789,7 @@ public class CpManager {
                  * md5sum 照样有输出 → 假成功。症状就是"PUSH_OK 但 CP 上还是旧
                  * 二进制"，排查时极难定位。 */
                 String localMd5 = md5Hex(bin);
-                Log.i(TAG, "推送 " + localPath + " (" + bin.length + "B, md5=" + localMd5
+                DashLog.i(TAG, "推送 " + localPath + " (" + bin.length + "B, md5=" + localMd5
                         + ") → " + remotePath);
 
                 Session session = acquireSession();
@@ -813,7 +813,7 @@ public class CpManager {
                     String out = execOnSession(session, "md5sum " + remotePath + " 2>/dev/null").trim();
                     String remoteMd5 = out.isEmpty() ? "" : out.split("\\s+")[0];
                     boolean ok = remoteMd5.equalsIgnoreCase(localMd5);
-                    Log.i(TAG, "推送结果: 远端 " + remoteMd5 + " vs 本地 " + localMd5
+                    DashLog.i(TAG, "推送结果: 远端 " + remoteMd5 + " vs 本地 " + localMd5
                             + (ok ? " (一致)" : " (不一致!)"));
                     if (!ok) lastPushError = "md5 不一致: 远端 " + remoteMd5 + " 本地 " + localMd5;
                     return ok;
@@ -822,7 +822,7 @@ public class CpManager {
                 }
             } catch (Throwable t) {
                 lastPushError = String.valueOf(t);
-                Log.e(TAG, "推送失败: " + t);
+                DashLog.e(TAG, "推送失败: " + t);
                 return false;
             }
         }

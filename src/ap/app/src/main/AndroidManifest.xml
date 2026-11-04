@@ -29,6 +29,7 @@
 
     <application
         android:label="Dashcast"
+        android:name=".DashcastApp"
         android:icon="@mipmap/ic_launcher"
         android:theme="@style/Theme.Dashcast"
         android:allowBackup="false">

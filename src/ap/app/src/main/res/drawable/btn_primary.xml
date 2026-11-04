@@ -1,23 +1,29 @@
-﻿<?xml version="1.0" encoding="utf-8"?>
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  主操作按钮（部署 / 开始投屏 / 保存并应用）。
+  
+  2026-11-04：去掉 accent_soft → accent 渐变。
+  原因同 btn_selected.xml —— 「所有文字变黑」那轮把 accent_soft
+  改成了 #000000，渐变就变成"上半截黑、下半截蓝"，白字压在
+  黑那段上完全看不见。改纯 accent 色（#007AFF）。
+-->
 <selector xmlns:android="http://schemas.android.com/apk/res/android">
     <item android:state_enabled="false">
         <shape android:shape="rectangle">
             <solid android:color="@color/surface_muted" />
-            <corners android:radius="12dp" />
+            <corners android:radius="16dp" />
         </shape>
     </item>
     <item android:state_pressed="true">
         <shape android:shape="rectangle">
             <solid android:color="@color/accent_press" />
-            <corners android:radius="12dp" />
+            <corners android:radius="16dp" />
         </shape>
     </item>
     <item>
         <shape android:shape="rectangle">
-            <gradient android:angle="90"
-                android:startColor="@color/accent_soft"
-                android:endColor="@color/accent" />
-            <corners android:radius="12dp" />
+            <solid android:color="@color/accent" />
+            <corners android:radius="16dp" />
         </shape>
     </item>
 </selector>

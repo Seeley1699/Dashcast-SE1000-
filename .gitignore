@@ -25,3 +25,4 @@ _probe/
 # 本地备份快照（不进版本库）
 _backup/
 
+.commitmsg

@@ -136,7 +136,7 @@ public class VdMirror {
             //    仪表的命门。连接在投屏开始时就挂好了（hold()），这里只是一次
             //    微秒级的 write，dcapd2 收到后立刻停抓，桌面根本来不及被抓到。
             if (!ensureConnected() || !sendCmdBg()) {
-                Log.e(TAG, "控制通道不可用，后台跟随不可用");
+                DashLog.e(TAG, "控制通道不可用，后台跟随不可用");
                 sending = false;
                 closeSocket();
                 return false;
@@ -152,7 +152,7 @@ public class VdMirror {
             lastSend = 0;
 
             if (!moveTaskIn(component)) {
-                Log.e(TAG, "App 搬不上虚拟屏（displayId=" + displayId + "）");
+                DashLog.e(TAG, "App 搬不上虚拟屏（displayId=" + displayId + "）");
                 sending = false;
                 closeSocket();
                 return false;
@@ -174,7 +174,7 @@ public class VdMirror {
 
             state("App 已转后台（虚拟屏 " + displayId + "），仪表实时跟随", true);
             return true;        } catch (Throwable t) {
-            Log.e(TAG, "start 失败", t);
+            DashLog.e(TAG, "start 失败", t);
             sending = false;
             closeSocket();
             return false;
@@ -260,10 +260,10 @@ public class VdMirror {
             o.write(b.array(), 0, 20);
             o.flush();
             sPendingCrop = false;
-            Log.i(TAG, "后台跟随截取区 → 虚拟屏 " + cw + "×" + ch
+            DashLog.i(TAG, "后台跟随截取区 → 虚拟屏 " + cw + "×" + ch
                     + " @(" + cx + "," + cy + ")（虚拟屏 " + vdW + "×" + vdH + "）");
         } catch (Throwable t) {
-            Log.w(TAG, "下发 VD 截取框失败: " + t);
+            DashLog.w(TAG, "下发 VD 截取框失败: " + t);
             closeSocket();
         }
     }
@@ -294,13 +294,13 @@ public class VdMirror {
                 if (vd != null) {
                     Display d = vd.getDisplay();
                     displayId = d == null ? -1 : d.getDisplayId();
-                    Log.i(TAG, "建屏成功 flags=0x" + Integer.toHexString(flags)
+                    DashLog.i(TAG, "建屏成功 flags=0x" + Integer.toHexString(flags)
                             + " displayId=" + displayId + " " + vdW + "x" + vdH + " @" + vdDpi
                             + "dpi 回读 " + rw + "x" + rh);
                     return displayId >= 0;
                 }
             } catch (Throwable t) {
-                Log.w(TAG, "createVirtualDisplay(flags=0x" + Integer.toHexString(flags)
+                DashLog.w(TAG, "createVirtualDisplay(flags=0x" + Integer.toHexString(flags)
                         + ") 失败: " + t);
             }
             teardownDisplay();
@@ -349,13 +349,13 @@ public class VdMirror {
         if (taskId > 0) {
             try {
                 String r = AdbShell.exec("am display move-stack " + taskId + " " + displayId, 8000);
-                Log.i(TAG, "move-stack " + taskId + " → " + displayId + ": "
+                DashLog.i(TAG, "move-stack " + taskId + " → " + displayId + ": "
                         + (r == null ? "null" : r.trim().replace('\n', ' ')));
                 if (r != null && !r.contains("Exception") && !r.contains("Error")) {
                     return true;
                 }
             } catch (Throwable t) {
-                Log.w(TAG, "move-stack 失败: " + t);
+                DashLog.w(TAG, "move-stack 失败: " + t);
             }
         }
 
@@ -363,7 +363,7 @@ public class VdMirror {
             AdbShell.exec("am start --display " + displayId + " -n " + component, 6000);
             return true;
         } catch (Throwable t) {
-            Log.w(TAG, "am start --display 失败: " + t);
+            DashLog.w(TAG, "am start --display 失败: " + t);
             return false;
         }
     }
@@ -442,10 +442,10 @@ public class VdMirror {
                 lastSend = now;
                 sentFrames++;
                 if (sentFrames == 1 || sentFrames % 150 == 0) {
-                    Log.i(TAG, "已发 " + sentFrames + " 帧 → dcapd2");
+                    DashLog.i(TAG, "已发 " + sentFrames + " 帧 → dcapd2");
                 }
             } catch (Throwable t) {
-                Log.w(TAG, "发帧失败，重连: " + t);
+                DashLog.w(TAG, "发帧失败，重连: " + t);
                 closeSocket();
             } finally {
                 try { img.close(); } catch (Throwable ignored) {}
@@ -511,10 +511,10 @@ public class VdMirror {
             b.putInt(CMD_BG);
             o.write(b.array(), 0, 4);
             o.flush();
-            Log.i(TAG, "已发 DCBG（dcapd2 立刻停抓主屏）");
+            DashLog.i(TAG, "已发 DCBG（dcapd2 立刻停抓主屏）");
             return true;
         } catch (Throwable t) {
-            Log.w(TAG, "发 DCBG 失败: " + t);
+            DashLog.w(TAG, "发 DCBG 失败: " + t);
             closeSocket();
             return false;
         }
@@ -579,7 +579,7 @@ public class VdMirror {
             out = s.getOutputStream();
             connectFailCount = 0;
             nextConnectAllowedMs = 0;
-            Log.i(TAG, "已连 dcapd2 帧源 127.0.0.1:" + PROXY_PORT);
+            DashLog.i(TAG, "已连 dcapd2 帧源 127.0.0.1:" + PROXY_PORT);
             /*
              * 重连之后 dcapd2 是新进程（裁剪框回到默认的整块），
              * 已有的截取框必须补发一次，否则"中途断过一次就又整块了"。
@@ -592,7 +592,7 @@ public class VdMirror {
             nextConnectAllowedMs = now + back;
             /* 只在首次/每 10 次打一条，避免刷屏 */
             if (connectFailCount == 1 || connectFailCount % 10 == 0) {
-                Log.w(TAG, "连 dcapd2 帧源失败（第 " + connectFailCount
+                DashLog.w(TAG, "连 dcapd2 帧源失败（第 " + connectFailCount
                         + " 次，退避 " + back + "ms）: " + t.getMessage());
             }
             return false;
@@ -607,7 +607,7 @@ public class VdMirror {
     }
 
     private void state(String msg, boolean ok) {
-        Log.i(TAG, msg);
+        DashLog.i(TAG, msg);
         Listener l = listener;
         if (l != null) l.onState(msg, ok);
     }

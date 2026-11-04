@@ -77,7 +77,7 @@ public class MirrorController {
             if (w >= 640 && h >= 320) {
                 sOutW = w;
                 sOutH = h;
-                Log.i(TAG, "仪表画布尺寸（缓存）= " + w + "×" + h);
+                DashLog.i(TAG, "仪表画布尺寸（缓存）= " + w + "×" + h);
             }
         } catch (Throwable ignored) {
         }
@@ -92,7 +92,7 @@ public class MirrorController {
             prefs(c).edit().putInt(PREF_OUT_W, w).putInt(PREF_OUT_H, h).apply();
         } catch (Throwable ignored) {
         }
-        Log.i(TAG, "仪表画布尺寸 → " + w + "×" + h);
+        DashLog.i(TAG, "仪表画布尺寸 → " + w + "×" + h);
     }
 
     /** 分片推送时每片的 base64 字符数（adbd 单条命令别太长） */
@@ -226,7 +226,7 @@ public class MirrorController {
     /** 设置 / 清除 HUD 会话 */
     public static void setHudSession(boolean on) {
         sHudSession = on;
-        Log.i(TAG, "HUD 会话 " + (on ? "开启" : "清除"));
+        DashLog.i(TAG, "HUD 会话 " + (on ? "开启" : "清除"));
     }
 
     private static final int DEFAULT_FPS = 30;
@@ -307,7 +307,7 @@ public class MirrorController {
                          * HUD 画面一直在 Display 1 上，不需要建虚拟屏搬运。
                          * 这里直接什么都不做，保持投屏继续。
                          */
-                        Log.i(TAG, "HUD 模式：忽略后台事件（无需虚拟屏跟随）");
+                        DashLog.i(TAG, "HUD 模式：忽略后台事件（无需虚拟屏跟随）");
                     } else {
                         enterBg(myGen);
                     }
@@ -356,15 +356,15 @@ public class MirrorController {
         this.component = component;
         this.listener = l;
         this.running = true;
-        Log.i(TAG, "start 目标=" + pkg + " gen=" + myGen);
+        DashLog.i(TAG, "start 目标=" + pkg + " gen=" + myGen);
 
         try {
             IntentFilter f = new IntentFilter(Intent.ACTION_CLOSE_SYSTEM_DIALOGS);
             f.addAction(Intent.ACTION_SCREEN_OFF);
             ctx.registerReceiver(leavingReceiver, f);
-            Log.i(TAG, "已注册 HOME/熄屏 监听（按下即暂停，不等轮询）");
+            DashLog.i(TAG, "已注册 HOME/熄屏 监听（按下即暂停，不等轮询）");
         } catch (Throwable t) {
-            Log.w(TAG, "注册离开广播失败（不影响推流，仅降级为轮询）", t);
+            DashLog.w(TAG, "注册离开广播失败（不影响推流，仅降级为轮询）", t);
         }
 
         worker = new Thread(() -> loop(myGen), "mirror-loop");
@@ -415,7 +415,7 @@ public class MirrorController {
              * 判据：gen 还是我们那次递增的值 = 期间没人再 start/stop。
              */
             if (gen.get() != myGen) {
-                Log.i(TAG, "停止流程已被新会话取代（gen " + myGen + " → "
+                DashLog.i(TAG, "停止流程已被新会话取代（gen " + myGen + " → "
                         + gen.get() + "），跳过清理");
                 return;
             }
@@ -438,7 +438,7 @@ public class MirrorController {
         Thread t = new Thread(() -> {
             synchronized (cleanupLock) {
                 if (gen.get() != myGen) {
-                    Log.i(TAG, "清理开始时代次已变，放弃");
+                    DashLog.i(TAG, "清理开始时代次已变，放弃");
                     return;
                 }
                 boolean hadDaemon = daemonAlive();
@@ -446,7 +446,7 @@ public class MirrorController {
 
                 for (int i = 0; i < 4; i++) {
                     if (gen.get() != myGen) {
-                        Log.i(TAG, "清理中途代次变化，停止 pkill（新会话已在跑）");
+                        DashLog.i(TAG, "清理中途代次变化，停止 pkill（新会话已在跑）");
                         return;
                     }
                     try {
@@ -457,25 +457,25 @@ public class MirrorController {
                                 + "ls /data/local/tmp/dcapd2.bg >/dev/null 2>&1 || echo BGCLEAN",
                                 6000);
                         if (out != null && out.contains("KILLED") && out.contains("BGCLEAN")) {
-                            Log.i(TAG, "清理确认完成（第 " + (i + 1) + " 次）");
+                            DashLog.i(TAG, "清理确认完成（第 " + (i + 1) + " 次）");
                             if (hadDaemon && logLines >= 0) {
                                 if (cp.verifySessionEnded(logLines, 3000)) {
-                                    Log.i(TAG, "dashcastd 已确认会话结束，图层已还原");
+                                    DashLog.i(TAG, "dashcastd 已确认会话结束，图层已还原");
                                 } else {
-                                    Log.e(TAG, "dashcastd 未报告会话结束 —— 图层可能仍在，"
+                                    DashLog.e(TAG, "dashcastd 未报告会话结束 —— 图层可能仍在，"
                                             + "但不再阻塞（restoreDashboard 会再兜一次）");
                                 }
                             }
                             return;
                         }
-                        Log.w(TAG, "清理未确认（第 " + (i + 1) + " 次）: "
+                        DashLog.w(TAG, "清理未确认（第 " + (i + 1) + " 次）: "
                                 + (out == null ? "null" : out.trim().replace('\n', ' ')));
                     } catch (Throwable te) {
-                        Log.w(TAG, "清理命令失败（第 " + (i + 1) + " 次）: " + te);
+                        DashLog.w(TAG, "清理命令失败（第 " + (i + 1) + " 次）: " + te);
                     }
                     sleep(400);
                 }
-                Log.e(TAG, "清理重试 4 次仍未确认，dcapd2 可能还在按旧目标推流");
+                DashLog.e(TAG, "清理重试 4 次仍未确认，dcapd2 可能还在按旧目标推流");
             }
         }, "mirror-cleanup");
         t.start();
@@ -500,7 +500,7 @@ public class MirrorController {
         bgMode = true;
         final String comp = component;
         state("回桌面 —— App 转后台，仪表继续实时跟随", true);
-        Log.i(TAG, "进入后台跟随模式 gen=" + myGen);
+        DashLog.i(TAG, "进入后台跟随模式 gen=" + myGen);
 
         if (gen.get() != myGen) return;
 
@@ -548,7 +548,7 @@ public class MirrorController {
                 vd.setCropRect(null, null);
             }
         } catch (Throwable t) {
-            Log.w(TAG, "读取截取框失败（后台跟随将取整块）: " + t);
+            DashLog.w(TAG, "读取截取框失败（后台跟随将取整块）: " + t);
         }
 
         /*
@@ -562,7 +562,7 @@ public class MirrorController {
         boolean started = vd.start(comp, srcW, srcH, mainDpi, this::state);
 
         if (gen.get() != myGen) {
-            Log.i(TAG, "enterBg 期间代次变化（已停止），收回虚拟屏");
+            DashLog.i(TAG, "enterBg 期间代次变化（已停止），收回虚拟屏");
             try {
                 vd.stop(true);
             } catch (Throwable ignored) {
@@ -582,7 +582,25 @@ public class MirrorController {
                 AdbShell.exec("rm -f /data/local/tmp/dcapd2.bg", CHUNK);
             } catch (Throwable ignored) {
             }
-            state("后台跟随不可用 —— 仪表停在最后一帧", true);
+            /*
+             * ══════════════════════════════════════════════════════════
+             * **失败提示要说清原因**（2026-11-05）
+             * ══════════════════════════════════════════════════════════
+             *
+             * 原来的文案「后台跟随不可用 —— 仪表停在最后一帧」
+             * 只说了"结果"，没说"为什么"和"怎么办"。
+             *
+             * 实测最常见的原因：用户选了一个**没有可投屏界面**的系统服务
+             * （比如「智能泊车辅助」com.ecarx.apa），am start 起不来，
+             * 虚拟屏自然也建不成。
+             *
+             * 这类情况用户完全无从判断 —— 界面上什么都没错，
+             * 就是投不出来。所以要明确告诉他"换一个 App 试试"。
+             */
+            String tgt = (pkg == null) ? "该 App" : pkg;
+            state("状态：投屏失败 —— " + tgt + " 起不到前台"
+                    + "（可能是系统服务类 App，没有可投屏的界面）"
+                    + "。请换一个 App 重试", true);
         } else {
             try {
                 AdbShell.exec("touch /data/local/tmp/dcapd2.bg", CHUNK);
@@ -595,7 +613,7 @@ public class MirrorController {
     private void exitBg() {
         if (!bgMode) return;
         bgMode = false;
-        Log.i(TAG, "退出后台跟随模式");
+        DashLog.i(TAG, "退出后台跟随模式");
         vd.stop(true);
         VdMirror.setFeedFrames(false);
         try {
@@ -615,12 +633,12 @@ public class MirrorController {
     /** 会话结束：清理 + 通知界面复位（目标 App 退出时走这里）。 */
     private void endSession(final String reason) {
         final Listener l = listener;
-        Log.i(TAG, "结束投屏会话：" + reason);
+        DashLog.i(TAG, "结束投屏会话：" + reason);
         new Thread(() -> {
             try {
                 stop();
             } catch (Throwable t) {
-                Log.w(TAG, "结束会话时清理异常", t);
+                DashLog.w(TAG, "结束会话时清理异常", t);
             }
             /*
              * **必须停 KeepAliveService**。
@@ -653,6 +671,21 @@ public class MirrorController {
      */
     private void loop(int myGen) {
         long lastStats = 0, lastFgCheck = 0, lastAliveCheck = 0;
+        /*
+         * **启动宽限期**（2026-11-05 修复"投屏启动即失败"）。
+         *
+         * 现象：点「开始投屏」→ 日志「正在打开目标 App」→ 1 秒后
+         *      「回桌面 —— App 转后台」→「后台跟随不可用」。
+         *
+         * 根因：am start 发出后 App 需要 2~3 秒才真正到前台，
+         *      而 loop 每 800ms 检查一次前台包名，第一次读到的是桌面，
+         *      立刻判"目标离开前台"→ enterBg 建虚拟屏 → 失败。
+         *
+         * 修法：start() 记下启动时刻，loop 在前 6 秒内**不做离开判定**，
+         *      只等 App 上来。如果 6 秒后还没上来，才认为是真的失败。
+         */
+        long startGraceAt = SystemClock.elapsedRealtime();
+        final long LAUNCH_GRACE_MS = 6000;
         long lastCpAliveCheck = 0, lastRectSync = 0, lastHold = 0;
         int failCount = 0, deadChecks = 0;
         boolean seenTargetAlive = false, broughtForward = false;
@@ -753,7 +786,6 @@ public class MirrorController {
                         if (launchDaemon(rect)) {
                             if (gen.get() != myGen) return;
                             failCount = 0;
-                            clearPause();
                             vd.hold();
                             LayerConfig.setCasting(true);
                             syncLayerRectAsync();
@@ -768,6 +800,14 @@ public class MirrorController {
                 }
 
                 boolean fgIsTarget = false;
+                /*
+                 * 启动宽限期：前 6 秒不做"离开前台"判定。
+                 *
+                 * am start 发出后 App 要 2~3 秒才到前台，
+                 * 这期间 foregroundPkg() 读到的是桌面 ——
+                 * 不能据此判定"目标已转后台"，否则会立刻进虚拟屏跟随并失败。
+                 */
+                boolean inGrace = (now - startGraceAt) < LAUNCH_GRACE_MS;
                 if (!hud && now - lastFgCheck >= 800) {
                     lastFgCheck = now;
                     String fg = foregroundPkg();
@@ -775,9 +815,18 @@ public class MirrorController {
                     if (fgIsTarget) {
                         if (bgMode) exitBg();      /* 目标回前台 → 退出虚拟屏跟随 */
                         seenTargetAlive = true;
-                    } else if (!bgMode) {
-                        enterBg(myGen);            /* 目标离开前台 → 进虚拟屏跟随 */
-                        if (gen.get() != myGen) return;
+                    } else if (!bgMode && !inGrace) {
+                        /*
+                         * **冷却期内不重试 enterBg**（2026-11-05 修复死循环）。
+                         *
+                         * 否则会形成：
+                         *   enterBg → VD 无帧 → exitBg → enterBg → …
+                         * 日志里「虚拟屏 15/16/17/18...」不断新建。
+                         */
+                        if (SystemClock.elapsedRealtime() >= vdFailCooldownUntil) {
+                            enterBg(myGen);
+                            if (gen.get() != myGen) return;
+                        }
                     }
                 }
 
@@ -794,14 +843,14 @@ public class MirrorController {
                     lastCpAliveCheck = now;
                     if (gen.get() != myGen) return;
                     if (!cp.isDashcastdRunning()) {
-                        Log.w(TAG, "CP 侧 dashcastd 不在运行，尝试恢复…");
+                        DashLog.w(TAG, "CP 侧 dashcastd 不在运行，尝试恢复…");
                         if (cp.ensureDashcastd() && cp.startDashcastd()) {
-                            Log.i(TAG, "CP 侧 dashcastd 已恢复，重置图层同步退避");
+                            DashLog.i(TAG, "CP 侧 dashcastd 已恢复，重置图层同步退避");
                             resetRectBackoff();
                             lastRectSync = 0;
                             forceFullFrame();    /* CP 是新会话，整屏补一帧 */
                         } else {
-                            Log.e(TAG, "CP 侧 dashcastd 恢复失败（CP 不可达或文件推不上）");
+                            DashLog.e(TAG, "CP 侧 dashcastd 恢复失败（CP 不可达或文件推不上）");
                         }
                     } else if (rectFailCount >= 3) {
                         /* 进程活着但矩形一直设不上：多半是 layer 99 被重建了，
@@ -835,7 +884,7 @@ public class MirrorController {
                         seenTargetAlive = true;
                         deadChecks = 0;
                     } else if (seenTargetAlive && ++deadChecks >= 2) {
-                        Log.i(TAG, "目标 App 已退出，结束投屏会话");
+                        DashLog.i(TAG, "目标 App 已退出，结束投屏会话");
                         endSession("目标 App 已退出 —— 投屏已结束，仪表已还原");
                         return;
                     }
@@ -891,7 +940,7 @@ public class MirrorController {
                 sleep(300);
             }
         } catch (Throwable t) {
-            Log.e(TAG, "mirror 循环异常", t);
+            DashLog.e(TAG, "mirror 循环异常", t);
             if (gen.get() == myGen) {
                 state("投屏异常结束: " + t.getMessage(), false);
             }
@@ -905,17 +954,17 @@ public class MirrorController {
         try {
             String out = AdbShell.exec("md5sum " + BIN + " 2>/dev/null", CHUNK);
             if (out != null && out.contains(BIN_MD5)) {
-                Log.i(TAG, "dcapd2 已是最新");
+                DashLog.i(TAG, "dcapd2 已是最新");
                 return true;
             }
 
             String b64 = readAsset("dcapd2.b64");
             if (b64 == null || b64.isEmpty()) {
-                Log.e(TAG, "assets 里没有 dcapd2.b64");
+                DashLog.e(TAG, "assets 里没有 dcapd2.b64");
                 return false;
             }
 
-            Log.i(TAG, "推送 dcapd2（" + b64.length() + " 字符）");
+            DashLog.i(TAG, "推送 dcapd2（" + b64.length() + " 字符）");
             AdbShell.exec("rm -f " + BIN + ".b64", CHUNK);
 
             int chunks = (b64.length() + CHUNK - 1) / CHUNK;
@@ -935,10 +984,10 @@ public class MirrorController {
 
             String chk = AdbShell.exec("md5sum " + BIN, CHUNK);
             boolean ok = chk != null && chk.contains(BIN_MD5);
-            Log.i(TAG, ok ? "dcapd2 落盘校验通过" : "dcapd2 落盘校验失败: " + chk);
+            DashLog.i(TAG, ok ? "dcapd2 落盘校验通过" : "dcapd2 落盘校验失败: " + chk);
             return ok;
         } catch (Throwable t) {
-            Log.e(TAG, "部署失败: " + t);
+            DashLog.e(TAG, "部署失败: " + t);
             return false;
         }
     }
@@ -951,7 +1000,7 @@ public class MirrorController {
             while ((n = in.read(buf)) > 0) bos.write(buf, 0, n);
             return new String(bos.toByteArray(), "US-ASCII");
         } catch (Throwable t) {
-            Log.e(TAG, "读 asset 失败: " + name, t);
+            DashLog.e(TAG, "读 asset 失败: " + name, t);
             return null;
         }
     }
@@ -993,7 +1042,7 @@ public class MirrorController {
              * 拿到的还是 App 模式参数 —— 因为判定发生在那两个字段
              * 生效之前的时机。这条日志能立刻定位。
              */
-            Log.i(TAG, "launchDaemon 判定: isMapHudActive=" + hud
+            DashLog.i(TAG, "launchDaemon 判定: isMapHudActive=" + hud
                     + " mapMode=" + mapMode
                     + " hudSession=" + sHudSession
                     + " ctx=" + (ctx != null));
@@ -1018,13 +1067,13 @@ public class MirrorController {
                  * 换车型/换 HUD 版本时可能要重标。
                  */
                 cap  = new int[]{HUD_SRC_X, HUD_SRC_Y, HUD_SRC_W, HUD_SRC_H};
-                Log.i(TAG, "HUD 投屏：抓 Display " + HUD_DISPLAY_ID
+                DashLog.i(TAG, "HUD 投屏：抓 Display " + HUD_DISPLAY_ID
                         + "（物理屏 #" + HUD_PHYSICAL_INDEX + "）"
                         + "源 " + HUD_W + "×" + HUD_H
                         + " → 裁 x=" + HUD_SRC_X + " y=" + HUD_SRC_Y
                         + " " + HUD_SRC_W + "×" + HUD_SRC_H);
             } else if (mapMode) {
-                Log.i(TAG, "地图模式：源 " + safeR[2] + "×" + safeR[3]
+                DashLog.i(TAG, "地图模式：源 " + safeR[2] + "×" + safeR[3]
                         + " → 抓 " + cap[2] + "×" + cap[3]
                         + " @ (" + cap[0] + "," + cap[1] + ")");
             }
@@ -1048,7 +1097,7 @@ public class MirrorController {
             for (int i = 0; i < 8; i++) {
                 sleep(400);
                 if (daemonAlive()) {
-                    Log.i(TAG, "dcapd2 已启动");
+                    DashLog.i(TAG, "dcapd2 已启动");
                     return true;
                 }
             }
@@ -1066,7 +1115,7 @@ public class MirrorController {
         new Thread(() -> {
             try {
                 AdbShell.exec("touch /data/local/tmp/dc_force", 2000);
-                Log.i(TAG, "已请求整屏全量重画");
+                DashLog.i(TAG, "已请求整屏全量重画");
             } catch (Throwable ignored) {
             }
         }, "force-full").start();
@@ -1115,14 +1164,14 @@ public class MirrorController {
                         if (cp.setLayerRect(r[0], r[1], r[2], r[3])) {
                             if (!same) {
                                 sLastRectKey = key;
-                                Log.i(TAG, "图层矩形已应用 → " + key);
+                                DashLog.i(TAG, "图层矩形已应用 → " + key);
                             }
                             /* 保活成功：完全静默。任何级别都会淹掉真信息 */
                             done = true;
                             return;
                         }
                     } catch (Throwable t) {
-                        Log.w(TAG, "图层矩形同步异常（第 " + (i + 1) + " 次）: " + t);
+                        DashLog.w(TAG, "图层矩形同步异常（第 " + (i + 1) + " 次）: " + t);
                     }
                     try {
                         Thread.sleep(500);
@@ -1141,7 +1190,7 @@ public class MirrorController {
                     if (rectFailCount < 10) rectFailCount++;
                     long back = Math.min(120000L, 10000L * (1L << Math.min(3, rectFailCount - 1)));
                     rectNextAllowedMs = SystemClock.elapsedRealtime() + back;
-                    Log.w(TAG, "图层矩形同步失败，退避 " + (back / 1000) + " 秒后再试");
+                    DashLog.w(TAG, "图层矩形同步失败，退避 " + (back / 1000) + " 秒后再试");
                 }
             }
         }, "layer-rect").start();
@@ -1197,6 +1246,58 @@ public class MirrorController {
          * 这样才满足"默认关闭（就是铺满遮罩尺寸）"：
          * 用户不主动开，就不会被框选参数干扰。
          */
+        /*
+         * ══════════════════════════════════════════════════════════════
+         * **按「当前目标 App」取截取框，不是全局 layer_src_***
+         * ══════════════════════════════════════════════════════════════
+         *
+         * 用户报："我截取某 App 页面保存后，下次启动该 App 会不会默认从
+         * 配置文件读取、按配置截取？不想还得重新截。"
+         *
+         * 原来只读全局 layer_src_* —— 那是"最后一次操作的那个 App"的值。
+         * 场景：先框抖音（存 app_rect_抖音 + 全局=抖音框），
+         *       再框 B 站（存 app_rect_B站 + 全局=B站框），
+         *       切回抖音投屏 → 读全局 = **B 站的框** → 抓错位置。
+         *
+         * 而 MainActivity 里 applyAppRect 早就按 App 记了
+         * （app_rect_<pkg>.x/.y/.w/.h），只是这里没用上。
+         *
+         * 现在：有该 App 的专属记录就优先用它，没有才退回全局值。
+         */
+        LayerConfig lcApp = null;
+        if (pkg != null && !pkg.isEmpty() && LayerConfig.hasAppRect(ctx, pkg)) {
+            lcApp = LayerConfig.loadFromPrefs(ctx, getOutputW(), getOutputH());
+            int[] ar = LayerConfig.loadAppRect(ctx, pkg);
+            if (ar != null && ar[2] > 0 && ar[3] > 0) {
+                lcApp.srcX = ar[0];
+                lcApp.srcY = ar[1];
+                lcApp.srcW = ar[2];
+                lcApp.srcH = ar[3];
+                DashLog.i(TAG, "按 App 历史尺寸抓取 → " + pkg + " "
+                        + ar[2] + "×" + ar[3] + " @(" + ar[0] + "," + ar[1] + ")");
+            } else {
+                lcApp = null;
+            }
+        }
+        if (lcApp != null) {
+            lc0 = lcApp;   /* 有专属记录就覆盖全局值 */
+        } else if (pkg != null && !pkg.isEmpty()) {
+            /*
+             * **无历史尺寸 → 沿用全局 layer_src_*，但要说清楚**。
+             *
+             * 这是有意的设计（不是漏写）：用户在这台车机上通常只会
+             * 设一次框，之后所有 App 都按这个区域截 —— 沿用全局值
+             * 正好符合这个习惯。
+             *
+             * 如果用户想「每个 App 各截一块」，那就对它点一次
+             * 「应用并投屏」（会存下 app_rect_<pkg>），之后自动套用。
+             *
+             * 这条日志是给排查用的：万一画面截错位置，能一眼看出
+             * "是用了全局框，不是这个 App 的框"。
+             */
+            DashLog.i(TAG, "该 App 无历史尺寸，沿用全局截取框 → " + pkg
+                    + "（想为它单独设框：点「应用并投屏」）");
+        }
         boolean cropOn = MainActivity.isAppCropEnabled(ctx);
         if (cropOn && lc0 != null && lc0.srcW > 0 && lc0.srcH > 0) {
             int sw = ((lc0.srcW + 15) / 16) * 16;   /* 16 对齐（H.264 硬编要求） */
@@ -1240,7 +1341,7 @@ public class MirrorController {
                     double srcAspect = (double) sw / sh;
                     double drift = Math.abs(srcAspect - boxAspect) / boxAspect;
                     if (drift > 0.01) {
-                        Log.w(TAG, "H.264 截取比例与遮罩不一致 "
+                        DashLog.w(TAG, "H.264 截取比例与遮罩不一致 "
                                 + String.format(java.util.Locale.US,
                                         "src=%.3f box=%.3f 偏差 %.1f%%", srcAspect, boxAspect, drift * 100)
                                 + " —— 画面会被拉伸（拖框时应已锁定比例，可能是旧配置）");
@@ -1272,7 +1373,7 @@ public class MirrorController {
             if (sx + sw > scrW) sx = Math.max(0, scrW - sw);
             if (sy + sh > scrH) sy = Math.max(0, scrH - sh);
 
-            Log.i(TAG, "App 截取区生效：源 " + sw + "×" + sh + " @(" + sx + "," + sy
+            DashLog.i(TAG, "App 截取区生效：源 " + sw + "×" + sh + " @(" + sx + "," + sy
                     + ")  屏幕 " + scrW + "×" + scrH + "  窗口 "
                     + win[0] + "," + win[1] + " " + win[2] + "×" + win[3]);
             return new int[]{sx, sy, sw, sh};
@@ -1354,7 +1455,7 @@ public class MirrorController {
     public void setMapMode(Context c, boolean on) {
         mapMode = on;
         prefs(c).edit().putBoolean(PREF_MAP_MODE, on).apply();
-        Log.i(TAG, "地图模式 " + (on ? "开启（按遮罩裁剪）" : "关闭（整窗口缩放）"));
+        DashLog.i(TAG, "地图模式 " + (on ? "开启（按遮罩裁剪）" : "关闭（整窗口缩放）"));
     }
 
     public boolean isMapMode() {
@@ -1424,43 +1525,84 @@ public class MirrorController {
     public boolean launchMapHud() {
         try {
             /*
-             * **HUD 通常已经在跑**（系统预装、开机自启）。
-             * 先判断进程，活着就完全不动它 ——
-             * 这是"点多次不要跳转别的 App"的根本保证。
+             * ══════════════════════════════════════════════════════════════
+             * **HUD 可用性检查 —— 不能只看 pidof**（2026-11-05 修复）
+             * ══════════════════════════════════════════════════════════════
              *
-             * 为什么不能每次 `am start`：
-             *   `am start` 即使指定了 display，也会把目标 Activity
-             *   **带到前台 / 抢焦点**，于是 dashcast 自己的界面被挤走。
-             *   用户看到的就是"点几次地图 HUD 就跳到别的 App"。
-             *   实测确认。
+             * 「点多次不要跳转别的 App」→ 进程活着就别 am start。
+             * 但实测发现：**进程活着不代表界面正常**。
              *
-             * 而且我们抓的是 Display 1 的**像素**，跟它是否在前台无关 ——
-             * 进程活着就行。
+             * 故障现场：
+             *   HUD 进程 PID 6090 活着
+             *   Activity mBounds = Rect(0,0-0,0)        ← 窗口 0×0
+             *   lastActiveTime inactive for 14561s      ← 4 小时没动过
+             *   → captureScreen(display=1) 抓到全黑
+             *   → STAT capture=30 但 tiles=0 kbps=0
+             *
+             * 所以判据要升级：
+             *   ① pidof 有值
+             *   ② Activity 的 mBounds 宽高都 > 0
+             * 两条都满足才算"可用"；任一条不满足就 am start 重启它。
              */
             String running = AdbShell.exec("pidof " + HUD_PKG, 3000);
             boolean alive = running != null && !running.trim().isEmpty();
 
+            boolean boundsOk = false;
+            int bw = 0, bh = 0;
             if (alive) {
-                Log.i(TAG, "HUD 进程已在运行（pid=" + running.trim()
-                        + "），不重复启动、不抢焦点");
+                try {
+                    String d = AdbShell.exec(
+                            "dumpsys activity activities | grep -A2 '"
+                                    + HUD_PKG + "/" + HUD_CLS + "' | grep mBounds", 5000);
+                    if (d != null && !d.isEmpty()) {
+                        Matcher mm = Pattern.compile(
+                                "Rect\\(\\d+, \\d+ - (\\d+), (\\d+)\\)").matcher(d);
+                        while (mm.find()) {
+                            bw = Integer.parseInt(mm.group(1));
+                            bh = Integer.parseInt(mm.group(2));
+                        }
+                    }
+                } catch (Throwable t) {
+                    DashLog.w(TAG, "读 HUD bounds 失败: " + t);
+                }
+                boundsOk = (bw > 0 && bh > 0);
+                DashLog.i(TAG, "HUD 检查：pid=" + running.trim()
+                        + " bounds=" + bw + "x" + bh
+                        + (boundsOk ? "（可用）" : "（0×0 僵死）"));
+            }
+
+            if (alive && boundsOk) {
+                DashLog.i(TAG, "HUD 已就绪，不重复启动、不抢焦点");
                 return true;
             }
 
-            /* 真没在跑才启动（这时才可能抢焦点，但属于必要的一次） */
+            /* 进程不在，或者界面僵死 → 都要重新 am start */
+            DashLog.i(TAG, alive
+                    ? "HUD 界面僵死（0×0），强制重新拉起"
+                    : "HUD 未运行，启动到 Display " + HUD_DISPLAY_ID);
             AdbShell.exec("am start --display " + HUD_DISPLAY_ID
                     + " -n " + HUD_PKG + "/" + HUD_CLS, 6000);
-            sleep(1200);
+            sleep(1500);
 
             /* 回读确认 */
             String out = AdbShell.exec(
-                    "dumpsys activity activities | grep -A3 'Display #"
-                            + HUD_DISPLAY_ID + "'", 6000);
-            boolean ok = out != null && out.contains(HUD_PKG);
-            Log.i(TAG, "HUD 投 Display " + HUD_DISPLAY_ID
-                    + "：" + (ok ? "确认到位" : "未确认（看 dumpsys）"));
+                    "dumpsys activity activities | grep -A2 '"
+                            + HUD_PKG + "/" + HUD_CLS + "' | grep mBounds", 6000);
+            boolean ok = false;
+            if (out != null) {
+                Matcher mm = Pattern.compile(
+                        "Rect\\(\\d+, \\d+ - (\\d+), (\\d+)\\)").matcher(out);
+                while (mm.find()) {
+                    bw = Integer.parseInt(mm.group(1));
+                    bh = Integer.parseInt(mm.group(2));
+                }
+                ok = (bw > 0 && bh > 0);
+            }
+            DashLog.i(TAG, "HUD 重启后 bounds=" + bw + "x" + bh
+                    + "：" + (ok ? "确认到位" : "仍未就绪"));
             return ok;
         } catch (Throwable t) {
-            Log.w(TAG, "启动 HUD 失败: " + t);
+            DashLog.w(TAG, "启动 HUD 失败: " + t);
             return false;
         }
     }
@@ -1473,7 +1615,7 @@ public class MirrorController {
      * 停止投屏只需要 dcapd2 停止抓取，Display 1 上留着 HUD 不影响任何事。
      */
     public void dismissMapHud() {
-        Log.i(TAG, "HUD 保留在 Display " + HUD_DISPLAY_ID + "（系统应用，无需撤离）");
+        DashLog.i(TAG, "HUD 保留在 Display " + HUD_DISPLAY_ID + "（系统应用，无需撤离）");
     }
 
     // ============================== 设备查询 ==============================
@@ -1548,7 +1690,7 @@ public class MirrorController {
 
             Matcher m = Pattern.compile("\\[(-?\\d+),(-?\\d+)\\]\\[(-?\\d+),(-?\\d+)\\]").matcher(out);
             if (!m.find()) {
-                Log.w(TAG, "没解析到窗口矩形: " + out);
+                DashLog.w(TAG, "没解析到窗口矩形: " + out);
                 return null;
             }
             int x1 = Integer.parseInt(m.group(1));
@@ -1558,7 +1700,7 @@ public class MirrorController {
             if (x2 <= x1 || y2 <= y1) return null;
             return new int[]{x1, y1, x2 - x1, y2 - y1};
         } catch (Throwable t) {
-            Log.e(TAG, "取窗口矩形失败", t);
+            DashLog.e(TAG, "取窗口矩形失败", t);
             return null;
         }
     }
@@ -1674,14 +1816,14 @@ public class MirrorController {
     public boolean restartDaemonNow() {
         MirrorController c = sActive;
         if (c == null || !c.running) {
-            Log.i(TAG, "未在投屏（sActive=" + (c != null) + "），"
+            DashLog.i(TAG, "未在投屏（sActive=" + (c != null) + "），"
                     + "restartDaemonNow 跳过（交给 startCast 起新进程）");
             return false;
         }
         synchronized (c.cleanupLock) {
             c.ensureBinary();
             int[] rect = c.lastRect != null ? c.lastRect : new int[]{0, 0, getOutputW(), getOutputH()};
-            Log.i(TAG, "按新配置重拉 dcapd2（用 sActive 实例）");
+            DashLog.i(TAG, "按新配置重拉 dcapd2（用 sActive 实例）");
             boolean ok = c.launchDaemon(rect);
 
             /*
@@ -1702,14 +1844,14 @@ public class MirrorController {
             if (lc != null && lc.srcW > 0 && lc.srcH > 0) {
                 int[] crop = {lc.srcX, lc.srcY, lc.srcW, lc.srcH};
                 vd.setCropRect(crop, lastRect);
-                Log.i(TAG, "VD 截取框已重发 → " + lc.srcW + "×" + lc.srcH
+                DashLog.i(TAG, "VD 截取框已重发 → " + lc.srcW + "×" + lc.srcH
                         + " @(" + lc.srcX + "," + lc.srcY + ")");
             } else {
                 vd.setCropRect(null, null);
-                Log.i(TAG, "VD 截取框已清空（取整块虚拟屏）");
+                DashLog.i(TAG, "VD 截取框已清空（取整块虚拟屏）");
             }
         } catch (Throwable t) {
-            Log.w(TAG, "重发 VD 截取框失败: " + t);
+            DashLog.w(TAG, "重发 VD 截取框失败: " + t);
         }
     }
 
@@ -1722,7 +1864,7 @@ public class MirrorController {
         if (f > 120) f = 120;
         fps = f;
         prefs(c).edit().putInt(PREF_FPS, f).apply();
-        Log.i(TAG, "帧率切到 " + f + " fps");
+        DashLog.i(TAG, "帧率切到 " + f + " fps");
         if (isMirroring() && lastRect != null) {
             new Thread(() -> {
                 synchronized (cleanupLock) {
@@ -1770,11 +1912,11 @@ public class MirrorController {
         new Thread(() -> {
             try {
                 AdbShell.exec("echo " + codec + " > " + CODEC_FILE, 2000);
-                Log.i(TAG, "编码档位切到 "
+                DashLog.i(TAG, "编码档位切到 "
                         + (codec == CODEC_H264 ? "H.264" : "BGRA+LZ4")
                         + "（已写入 " + CODEC_FILE + "，dcapd2 自行切换）");
             } catch (Throwable t) {
-                Log.w(TAG, "写编码档文件失败: " + t.getMessage());
+                DashLog.w(TAG, "写编码档文件失败: " + t.getMessage());
             }
         }, "codec-switch").start();
     }
@@ -1818,7 +1960,7 @@ public class MirrorController {
                     } catch (Throwable ignored) {
                     }
                     if (n > 0) {
-                        Log.i(TAG, "dcapd2 已完成编码档切换（"
+                        DashLog.i(TAG, "dcapd2 已完成编码档切换（"
                                 + (SystemClock.elapsedRealtime() - t0) + "ms）");
                         return;
                     }
@@ -1837,7 +1979,7 @@ public class MirrorController {
             Thread.sleep(600);
         } catch (InterruptedException ignored) {
         }
-        Log.w(TAG, "没等到编码档切换标记，按固定延迟继续（" + maxMs + "ms）");
+        DashLog.w(TAG, "没等到编码档切换标记，按固定延迟继续（" + maxMs + "ms）");
     }
 
     /** 切档前记下日志基线行号（只在后台线程写） */
@@ -1858,7 +2000,24 @@ public class MirrorController {
 
     /** 读 dcapd2 的 STAT 行：帧率 / 图块 / 带宽 */
     /** VD 无帧计数：连续几次采样 capture=0 就认为虚拟屏没在喂帧 */
+    /** VD 无帧计数：连续几次采样 capture=0 就认为虚拟屏没在喂帧 */
     private int vdDeadStreak = 0;
+    /**
+     * **VD 失败冷却期**（2026-11-05 修复死循环）。
+     *
+     * 现象：日志每 7 秒循环一次
+     *   「App 已转后台（虚拟屏 N）→ 后台跟随失败 → 已退回主屏」
+     *   虚拟屏编号从 15 一路涨到 18+，一直在新建。
+     *
+     * 根因：readStats 检测到 VD 无帧 → exitBg() 退回主屏；
+     *      紧接着 loop() 下一轮又发现"目标不在前台" → enterBg()；
+     *      新建虚拟屏照样无帧 → 又被退回 → 无限循环。
+     *
+     * 修法：VD 失败后 30 秒内不再尝试 enterBg，
+     *      直接保持主屏抓取（画面不理想但至少能用），
+     *      避免反复建屏消耗资源。
+     */
+    private volatile long vdFailCooldownUntil = 0;
 
     private void readStats() {
         try {
@@ -1894,7 +2053,6 @@ public class MirrorController {
              * **虚拟屏无帧检测**（2026-11-03 黑屏根因修复）
              * ══════════════════════════════════════════════════════════════
              *
-             * 现象：App 转后台 → enterBg 建虚拟屏 → 但虚拟屏 state=OFF
              * （dumpsys display 实测 owner 是别的进程、state OFF）
              * → dcapd2 收到 DCBG 切到 VD 模式，却一帧都收不到
              * → STAT 显示 src=VD capture=0 fps=0 → **仪表纯黑**
@@ -1910,13 +2068,15 @@ public class MirrorController {
             if ("VD".equals(src) && cap == 0) {
                 vdDeadStreak++;
                 if (vdDeadStreak >= 3 && bgMode) {
-                    Log.w(TAG, "虚拟屏连续 " + vdDeadStreak + " 次无帧，退回主屏抓取");
+                    DashLog.w(TAG, "虚拟屏连续 " + vdDeadStreak + " 次无帧，退回主屏抓取");
                     vdDeadStreak = 0;
+                    /* 设置 30 秒冷却，避免 enterBg ↔ exitBg 死循环 */
+                    vdFailCooldownUntil = SystemClock.elapsedRealtime() + 30000;
                     state("后台跟随失败（虚拟屏无帧）—— 已退回主屏", true);
                     try {
                         exitBg();
                     } catch (Throwable ex) {
-                        Log.w(TAG, "退出后台跟随失败: " + ex);
+                        DashLog.w(TAG, "退出后台跟随失败: " + ex);
                     }
                 }
             } else {
@@ -1930,7 +2090,7 @@ public class MirrorController {
                 new Thread(() -> {
                     try {
                         String s = cp.tailLog(40);
-                        for (String line : s.split("\n")) Log.w(TAG + "/CP", line);
+                        for (String line : s.split("\n")) DashLog.w(TAG + "/CP", line);
                     } catch (Throwable ignored) {
                     }
                 }, "cp-log").start();
@@ -1944,7 +2104,7 @@ public class MirrorController {
     private void setPause() {
         try {
             AdbShell.exec("touch " + PAUSE, CHUNK);
-            Log.i(TAG, "已暂停推流（保持连接，仪表留最后一帧）");
+            DashLog.i(TAG, "已暂停推流（保持连接，仪表留最后一帧）");
         } catch (Throwable ignored) {
         }
     }
@@ -1964,9 +2124,9 @@ public class MirrorController {
      * 停止却还是运行中。running 已经置 false，这里直接不外发。
      */
     public void state(String msg, boolean ok) {
-        Log.i(TAG, msg);
+        DashLog.i(TAG, msg);
         if (!running) {
-            Log.i(TAG, "已停止，忽略迟到的状态回调: " + msg);
+            DashLog.i(TAG, "已停止，忽略迟到的状态回调: " + msg);
             return;
         }
         if (listener != null) listener.onState(msg, ok);

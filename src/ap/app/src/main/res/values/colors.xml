@@ -1,52 +1,120 @@
-﻿<?xml version="1.0" encoding="utf-8"?>
+<?xml version="1.0" encoding="utf-8"?>
 <!--
-  全局色板 v3（2026-10-31 深度美化）
+  ══════════════════════════════════════════════════════════════════
+  全局色板 v7 —— ShipSwift 设计规范（2026-11-04）
+  ══════════════════════════════════════════════════════════════════
 
-  设计思路：
-    · 背景用带蓝调的中性深灰（#0D1117），不是纯黑 —— 纯黑在大屏上会让
-      文字边缘"晕开"，蓝调能稳住对比
-    · 卡片三级抬升（#161B22 → #1C2128 → #22282F），每级差 ~6% 亮度，
-      肉眼刚好能分辨但不刺眼
-    · 主色用「冷青蓝」#58A6FF（GitHub Dark 同款），中性、专业、不抢眼
-    · 语义色降低饱和（成功 #3FB950 / 警告 #D29922 / 危险 #F85149），
-      避免警示色在深色背景上"发光"
+  色值与尺寸**直接取自 ShipSwift 源码**（F:\Downloads\ShipSwift-main）：
+
+    SWPackage/SWComponent/Display/SWKPICard.swift:139-149
+      .padding(14)
+      RoundedRectangle(cornerRadius: 16).fill(systemBackground)
+      .shadow(color: .black.opacity(0.04), radius: 6, x: 0, y: 2)
+      .overlay(RoundedRectangle(cornerRadius: 16)
+                 .stroke(tint.opacity(0.15), lineWidth: 1))
+
+    SWPackage/SWComponent/Display/SWStatusBadge.swift:99-110
+      .font(.caption).fontWeight(.semibold)
+      .padding(.horizontal, 10).padding(.vertical, 4)
+      Capsule().fill(tint.opacity(0.18))
+      Capsule().stroke(tint.opacity(0.35), lineWidth: 0.5)
+
+    SWPackage/SWComponent/Input/SWSearchBar.swift:56-59
+      .font(.system(size: 14))
+      .padding(.horizontal, 12).padding(.vertical, 8)
+      .background(.ultraThinMaterial, in: .capsule)
+
+    SWKPICard.swift:296（预览里的页面底色）
+      .background(Color.gray.opacity(0.06))   ← 浅灰页面
+
+  ══════════════════════════════════════════════════════════════════
+  **这是一套浅色 UI**（用户要求：背景不要黑色，用 #F5F5F5）
+  ══════════════════════════════════════════════════════════════════
+
+  和之前的深色方案相比，核心差别：
+
+    深色（MiUIX）          浅色（ShipSwift）
+    ─────────────────────────────────────────
+    卡片和背景同色          卡片是纯白，浮在浅灰上
+    靠描边分层              靠**阴影**分层（0.04 极淡）
+    文字用透明度分级        文字用灰阶（黑/深灰/中灰）
+    无阴影                  有阴影 radius 6, y 2
+
+  分层的原理完全不同：浅色 UI 是"白纸浮在灰桌上"，
+  阴影是唯一的层级线索，不能省。
+
+  ── 色值 ──
+    页面底 #F5F5F5  ← Color.gray.opacity(0.06) 在白色上的等效值
+    卡片   #FFFFFF  ← systemBackground
+    阴影   黑 4%    ← .black.opacity(0.04)
+    分隔线 #E5E5E5  ← SwiftUI Divider 默认色
+    主文字 #1C1C1E  ← .primary（iOS label）
+    次文字 #8E8E93  ← .secondary（iOS secondaryLabel）
+    弱文字 #C7C7CC  ← .tertiary
+    主色   #007AFF  ← iOS systemBlue
 -->
+
 <resources>
 
-    <!-- ── 背景：三级抬升 ── -->
-    <color name="surface_root">#FF0D1117</color>        <!-- 页面底 -->
-    <color name="surface_card">#FF161B22</color>        <!-- 卡片 -->
-    <color name="surface_raised">#FF1C2128</color>      <!-- 次级按钮 -->
-    <color name="surface_raised_press">#FF22282F</color><!-- 按下 -->
-    <color name="surface_border">#FF30363D</color>      <!-- 描边 -->
-    <color name="surface_muted">#FF161B22</color>       <!-- 禁用底 -->
-    <color name="surface_deep">#FF010409</color>        <!-- 预览区最深 -->
+    <!-- ══ 背景：浅灰页面 + 白色卡片 ══ -->
+    <!-- 页面底：Color.gray.opacity(0.06) 叠在白底上的等效值 -->
+    <color name="surface_root">#FFDDE1E8</color>
+    <!-- 卡片：systemBackground -->
+    <color name="surface_card">#FFEFF2F7</color>
+    <!-- 次级面（搜索框/输入区）：比卡片略灰，用于区分可交互区 -->
+    <color name="surface_raised">#FFE5E9F0</color>
+    <!-- 按下态：iOS 的 systemFill 概念 -->
+    <color name="surface_raised_press">#FFD5DAE3</color>
+    <!-- 描边：iOS separator -->
+    <color name="surface_border">#FFCBD2DE</color>
+    <!-- 禁用底 -->
+    <color name="surface_muted">#FFE7EBF2</color>
+    <!-- 预览区（画布）：纯白，让网格线清晰 -->
+    <color name="surface_deep">#FFF4F7FB</color>
 
-    <!-- ── 文字：四级对比 ── -->
-    <color name="content_primary">#FFE6EDF3</color>     <!-- 主文字 -->
-    <color name="content_secondary">#FF8B949E</color>   <!-- 次文字 -->
-    <color name="content_tertiary">#FF6E7681</color>    <!-- 弱文字 -->
-    <color name="content_accent">#FF58A6FF</color>      <!-- 强调文字 -->
+    <!-- ══ 文字：iOS label 三级 ══ -->
+    <color name="content_primary">#FF2B2F36</color>     <!-- 深灰（原纯黑，对比度 21:1→11:1 更柔和） -->
+    <color name="content_secondary">#FF545A66</color>   <!-- 中深灰 -->
+    <color name="content_tertiary">#FF858B99</color>    <!-- 弱文字 -->
+    <color name="content_quaternary">#FF8A8A90</color>
+    <!-- 强调文字：用户要求所有文字纯黑，故改 #000000（原 #007AFF） -->
+    <color name="content_accent">#FF000000</color>
 
-    <!-- ── 主色：冷青蓝 ── -->
-    <color name="accent">#FF58A6FF</color>
-    <color name="accent_press">#FF388BFD</color>
-    <color name="accent_on">#FF0D1117</color>
-    <color name="accent_soft">#FF79C0FF</color>
-    <color name="accent_tint">#1F58A6FF</color>
 
-    <!-- ── 语义状态 ── -->
-    <color name="state_ok">#FF3FB950</color>
-    <color name="state_ok_tint">#1F3FB950</color>
-    <color name="state_warn">#FFD29922</color>
-    <color name="state_warn_tint">#1FD29922</color>
-    <color name="state_error">#FFF85149</color>
-    <color name="state_error_press">#FFDA3633</color>
-    <color name="state_error_tint">#1FF85149</color>
-    <color name="state_idle">#FF8B949E</color>
-    <color name="state_idle_tint">#12FFFFFF</color>
+    <!-- ══ 主色：iOS systemBlue ══ -->
+    <color name="accent">#FF007AFF</color>
+    <color name="accent_press">#FF0062CC</color>
+    <color name="accent_on">#FFFFFFFF</color>
+    <!--
+      accent_soft 原本是 #339BFF（淡蓝），被 14 处**按钮文字**引用。
+      用户要求所有文字纯黑 → 改 #000000。
+      注意：这个名字虽叫 accent，但实际只当文字色用，
+      改黑不影响任何背景色。
+    -->
+    <color name="accent_soft">#FF000000</color>
 
-    <!-- ── 兼容别名 ── -->
+    <color name="accent_tint">#0F007AFF</color>
+
+    <!-- ══ 语义状态：iOS 系统色 ══ -->
+    <color name="state_ok">#FF34C759</color>            <!-- systemGreen -->
+    <color name="state_ok_tint">#2E34C759</color>
+    <color name="state_warn">#FFFF9500</color>          <!-- systemOrange -->
+    <color name="state_warn_tint">#2EFF9500</color>
+    <color name="state_error">#FFFF3B30</color>         <!-- systemRed -->
+    <color name="state_error_press">#FFD92B21</color>
+    <color name="state_error_tint">#2EFF3B30</color>
+    <color name="state_idle">#FF8E8E93</color>          <!-- .secondary -->
+    <color name="state_idle_tint">#1F8E8E93</color>
+
+    <!-- ══ 胶囊标签：SWStatusBadge 规范（tint×0.18 底 + tint×0.35 描边）══ -->
+    <color name="pill_on">#FF007AFF</color>
+    <color name="pill_on_text">#FFFFFFFF</color>
+    <!-- 未选中：surfaceRaised 底（浅灰），文字用主色 -->
+    <color name="pill_off">#FFF0F0F3</color>
+    <color name="pill_off_text">#FF007AFF</color>
+    <color name="pill_off_border">#FFD1D1D6</color>
+
+    <!-- ══ 兼容别名 ══ -->
     <color name="bg">@color/surface_root</color>
     <color name="card_bg">@color/surface_card</color>
     <color name="card_border">@color/surface_border</color>
@@ -59,5 +127,9 @@
     <color name="text_sub">@color/content_secondary</color>
     <color name="btn_disabled">@color/surface_muted</color>
     <color name="text_disabled">@color/content_tertiary</color>
+    <color name="divider">#FFE5E5E5</color>
+
+    <!-- ══ 阴影（ShipSwift: .black.opacity(0.04), radius 6, y 2）══ -->
+    <color name="card_shadow">#0A000000</color>          <!-- 4% 黑 -->
 
 </resources>

@@ -66,11 +66,11 @@ public class KeepAliveService extends Service {
         // 自作主张把画面再推上仪表，否则用户看到的就是"停了又自己回来了"。
         // casting_active 只在 start()/stop() 里翻转，是唯一的权威状态。
         if (!p.getBoolean("casting_active", false)) {
-            Log.i("DashcastMirror", "进程被系统重启，但用户已停止投屏 —— 不自动恢复");
+            DashLog.i("DashcastMirror", "进程被系统重启，但用户已停止投屏 —— 不自动恢复");
             return;
         }
 
-        Log.i("DashcastMirror", "进程被系统重启，自动恢复投屏: " + pkg);
+        DashLog.i("DashcastMirror", "进程被系统重启，自动恢复投屏: " + pkg);
         // MirrorController 单例还没建（没有 Activity），这里建一个无界面的
         final MirrorController c = new MirrorController(
                 getApplicationContext(), new CpManager(getApplicationContext()));
@@ -79,7 +79,7 @@ public class KeepAliveService extends Service {
             try {
                 c.start(pkg, pkg + "/" + cls, null);
             } catch (Throwable t) {
-                Log.w("DashcastMirror", "自动恢复投屏失败: " + t);
+                DashLog.w("DashcastMirror", "自动恢复投屏失败: " + t);
             }
         }, "mirror-resume").start();
     }

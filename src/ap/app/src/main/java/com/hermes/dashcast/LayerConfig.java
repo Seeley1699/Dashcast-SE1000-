@@ -180,12 +180,12 @@ public final class LayerConfig {
             String cmd = "echo " + b64 + " | base64 -d > " + CFG_PATH;
             String out = AdbShell.exec(cmd, 4000);
             boolean ok = out != null;
-            Log.i(TAG, "图层配置已写入 " + CFG_PATH
+            DashLog.i(TAG, "图层配置已写入 " + CFG_PATH
                     + "（enabled=" + enabled + " shape=" + SHAPE_NAMES[shape]
                     + " " + w + "x" + h + " 圆角" + rTl + " 羽化" + feather + "）");
             return ok;
         } catch (Throwable t) {
-            Log.e(TAG, "图层配置写入失败", t);
+            DashLog.e(TAG, "图层配置写入失败", t);
             return false;
         }
     }
@@ -216,7 +216,7 @@ public final class LayerConfig {
             try {
                 snapshot.applyFully(null);
             } catch (Throwable t) {
-                Log.e(TAG, "下发配置失败", t);
+                DashLog.e(TAG, "下发配置失败", t);
             }
         }, "layer-push").start();
     }
@@ -228,11 +228,11 @@ public final class LayerConfig {
             try {
                 snapshot.push();
             } catch (Throwable t) {
-                Log.e(TAG, "下发配置失败", t);
+                DashLog.e(TAG, "下发配置失败", t);
             }
             /* 图层矩形同步：只在投屏中做（未投屏 layer 99 不存在） */
             if (sCp == null || !sCasting) {
-                Log.i(TAG, "配置已保存（未投屏，跳过图层矩形同步）");
+                DashLog.i(TAG, "配置已保存（未投屏，跳过图层矩形同步）");
                 return;
             }
             try {
@@ -254,7 +254,7 @@ public final class LayerConfig {
                         : new int[]{0, 0, snapshot.canvasW, snapshot.canvasH};
                 sCp.setLayerRect(dest[0], dest[1], dest[2], dest[3]);
             } catch (Throwable t) {
-                Log.w(TAG, "同步图层矩形失败: " + t);
+                DashLog.w(TAG, "同步图层矩形失败: " + t);
             }
         }, "layer-push").start();
     }
@@ -281,7 +281,7 @@ public final class LayerConfig {
     public static void clear() {
         try {
             AdbShell.exec("rm -f " + CFG_PATH, 3000);
-            Log.i(TAG, "图层配置已清除（恢复全屏铺满）");
+            DashLog.i(TAG, "图层配置已清除（恢复全屏铺满）");
         } catch (Throwable ignored) {
         }
     }
@@ -434,97 +434,104 @@ public final class LayerConfig {
         return c;
     }
 
-    /* ===================== 预设槽（3 个，存 Download/Dashcast/presets.txt） ===================== */
+    /* ══════════════════════════════════════════════════════════════
+     * 预设槽（3 个）—— **存 SharedPreferences，不落文件**
+     * ══════════════════════════════════════════════════════════════
+     *
+     * 原来存 Download/Dashcast/presets.txt（纯文本，方便直接编辑）。
+     * 实测问题：
+     *   · 车机 ROM 拒了 MANAGE_EXTERNAL_STORAGE（appops rejectTime）
+     *   · /storage/emulated/N 走 FUSE —— 追加已有文件可以，**新建被拒**
+     *   · 文件一旦被删就再也建不回来（ENOENT），预设功能永久失效
+     *
+     * 用户决定：**不要文件，改存 prefs**。
+     *   · prefs 是 App 私有文件，写入永远成功
+     *   · 键名 "preset_<槽号>_<字段>"，和已有 layer_* 键平级
+     */
 
     public static final int PRESET_COUNT = 3;
 
-    /** 预设文件：每行 "槽号 key=value ..."（纯文本，可直接编辑或拷走） */
-    private static java.util.Properties readPresetProps(Context ctx) {
-        java.util.Properties p = new java.util.Properties();
-        File f = LocalStore.presetFile(ctx);
-        if (!f.exists()) return p;
-        try (java.io.FileInputStream in = new java.io.FileInputStream(f)) {
-            p.load(new java.io.InputStreamReader(in, "UTF-8"));
-        } catch (Throwable ignored) {
-        }
-        return p;
+    /** pref 键：预设 slot 的 field 字段 → "preset_0_w" */
+    private static String pk(int slot, String field) {
+        return "preset_" + slot + "_" + field;
     }
 
-    private static void writePresetProps(Context ctx, java.util.Properties p) {
-        File f = LocalStore.presetFile(ctx);
+    /** 读 prefs 里的 int，缺失或异常返回 def */
+    private static int prefInt(Context ctx, String key, int def) {
         try {
-            if (!f.getParentFile().exists()) f.getParentFile().mkdirs();
-            try (java.io.FileOutputStream out = new java.io.FileOutputStream(f)) {
-                p.store(new java.io.OutputStreamWriter(out, "UTF-8"),
-                        "Dashcast 遮罩预设（可直接编辑）");
-            }
+            return ctx.getApplicationContext()
+                    .getSharedPreferences(PREF, Context.MODE_PRIVATE)
+                    .getInt(key, def);
         } catch (Throwable t) {
-            Log.w("DashcastLayer", "预设写入失败: " + t.getMessage());
+            return def;
         }
     }
 
-    /** 预设是否已保存 */
+    /** 预设是否已保存（w 存在即算） */
     public static boolean hasPreset(Context ctx, int slot) {
-        return readPresetProps(ctx).containsKey("s" + slot + ".w");
+        return prefInt(ctx, pk(slot, "w"), 0) > 0;
     }
 
     /** 预设的简短描述（按钮上显示尺寸） */
     public static String presetLabel(Context ctx, int slot) {
-        java.util.Properties p = readPresetProps(ctx);
-        String w = p.getProperty("s" + slot + ".w");
-        String h = p.getProperty("s" + slot + ".h");
-        return (w == null || h == null) ? "空" : (w + "×" + h);
+        int w = prefInt(ctx, pk(slot, "w"), 0);
+        int h = prefInt(ctx, pk(slot, "h"), 0);
+        return (w <= 0 || h <= 0) ? "空" : (w + "×" + h);
     }
 
-    /** 把当前配置存进指定槽位 */
+    /**
+     * 把当前配置存进指定槽位。
+     *
+     * 字段集合和原来写文件时一致，**含 src_w**（2026-11-05 补的：
+     * 缺它会让预设读回来抓取区宽度为 0）。
+     */
     public void savePreset(Context ctx, int slot) {
-        java.util.Properties p = readPresetProps(ctx);
-        String k = "s" + slot + ".";
-        p.setProperty(k + "x",   String.valueOf(x));
-        p.setProperty(k + "y",   String.valueOf(y));
-        p.setProperty(k + "w",   String.valueOf(w));
-        p.setProperty(k + "h",   String.valueOf(h));
-        p.setProperty(k + "shape", String.valueOf(shape));
-        p.setProperty(k + "r_tl", String.valueOf(rTl));
-        p.setProperty(k + "r_tr", String.valueOf(rTr));
-        p.setProperty(k + "r_bl", String.valueOf(rBl));
-        p.setProperty(k + "r_br", String.valueOf(rBr));
-        p.setProperty(k + "trap_top", String.valueOf(trapTop));
-        p.setProperty(k + "trap_bot", String.valueOf(trapBot));
-        p.setProperty(k + "feather",  String.valueOf(feather));
-        p.setProperty(k + "border",   String.valueOf(border));
-        p.setProperty(k + "fit",      String.valueOf(fit));
-        /* 地图模式的抓取源区域也要一起存，否则切回预设时构图会丢 */
-        p.setProperty(k + "src_x", String.valueOf(srcX));
-        p.setProperty(k + "src_y", String.valueOf(srcY));
-        p.setProperty(k + "src_h", String.valueOf(srcH));
-        writePresetProps(ctx, p);
+        android.content.SharedPreferences.Editor e = ctx
+                .getApplicationContext()
+                .getSharedPreferences(PREF, Context.MODE_PRIVATE).edit();
+        e.putInt(pk(slot, "x"), x);
+        e.putInt(pk(slot, "y"), y);
+        e.putInt(pk(slot, "w"), w);
+        e.putInt(pk(slot, "h"), h);
+        e.putInt(pk(slot, "shape"), shape);
+        e.putInt(pk(slot, "r_tl"), rTl);
+        e.putInt(pk(slot, "r_tr"), rTr);
+        e.putInt(pk(slot, "r_bl"), rBl);
+        e.putInt(pk(slot, "r_br"), rBr);
+        e.putInt(pk(slot, "trap_top"), trapTop);
+        e.putInt(pk(slot, "trap_bot"), trapBot);
+        e.putInt(pk(slot, "feather"), feather);
+        e.putInt(pk(slot, "border"), border);
+        e.putInt(pk(slot, "fit"), fit);
+        e.putInt(pk(slot, "src_x"), srcX);
+        e.putInt(pk(slot, "src_y"), srcY);
+        e.putInt(pk(slot, "src_w"), srcW);
+        e.putInt(pk(slot, "src_h"), srcH);
+        e.apply();
         LocalStore.log(ctx, "保存预设 " + (slot + 1) + " · " + w + "×" + h);
     }
 
     /** 从指定槽位读回（没存过返回 false，不改动当前配置） */
     public boolean loadPreset(Context ctx, int slot) {
-        java.util.Properties p = readPresetProps(ctx);
-        String k = "s" + slot + ".";
-        if (!p.containsKey(k + "w")) return false;
-        x        = intProp(p, k + "x", x);
-        y        = intProp(p, k + "y", y);
-        w        = intProp(p, k + "w", w);
-        h        = intProp(p, k + "h", h);
-        shape    = intProp(p, k + "shape", shape);
-        rTl      = intProp(p, k + "r_tl", rTl);
-        rTr      = intProp(p, k + "r_tr", rTr);
-        rBl      = intProp(p, k + "r_bl", rBl);
-        rBr      = intProp(p, k + "r_br", rBr);
-        trapTop  = intProp(p, k + "trap_top", trapTop);
-        trapBot  = intProp(p, k + "trap_bot", trapBot);
-        feather  = intProp(p, k + "feather", feather);
-        border   = intProp(p, k + "border", border);
-        fit      = intProp(p, k + "fit", fit);
-        /* 老预设里没有这三个键 → 保持当前值（intProp 的 def 就是自 assignment） */
-        srcX     = intProp(p, k + "src_x", srcX);
-        srcY     = intProp(p, k + "src_y", srcY);
-        srcH     = intProp(p, k + "src_h", srcH);
+        if (!hasPreset(ctx, slot)) return false;
+        x        = prefInt(ctx, pk(slot, "x"), x);
+        y        = prefInt(ctx, pk(slot, "y"), y);
+        w        = prefInt(ctx, pk(slot, "w"), w);
+        h        = prefInt(ctx, pk(slot, "h"), h);
+        shape    = prefInt(ctx, pk(slot, "shape"), shape);
+        rTl      = prefInt(ctx, pk(slot, "r_tl"), rTl);
+        rTr      = prefInt(ctx, pk(slot, "r_tr"), rTr);
+        rBl      = prefInt(ctx, pk(slot, "r_bl"), rBl);
+        rBr      = prefInt(ctx, pk(slot, "r_br"), rBr);
+        trapTop  = prefInt(ctx, pk(slot, "trap_top"), trapTop);
+        trapBot  = prefInt(ctx, pk(slot, "trap_bot"), trapBot);
+        feather  = prefInt(ctx, pk(slot, "feather"), feather);
+        border   = prefInt(ctx, pk(slot, "border"), border);
+        fit      = prefInt(ctx, pk(slot, "fit"), fit);
+        srcX     = prefInt(ctx, pk(slot, "src_x"), srcX);
+        srcY     = prefInt(ctx, pk(slot, "src_y"), srcY);
+        srcW     = prefInt(ctx, pk(slot, "src_w"), srcW);
+        srcH     = prefInt(ctx, pk(slot, "src_h"), srcH);
         sanitize();
         return true;
     }
@@ -606,41 +613,34 @@ public final class LayerConfig {
                         new int[]{rr[0], rr[1], rr[2], rr[3]},
                         canvasW, canvasH);
                 boolean rc = cp.setLayerRect(dest[0], dest[1], dest[2], dest[3]);
-                Log.i(TAG, "图层矩形下发 → " + dest[0] + "," + dest[1] + " "
+                DashLog.i(TAG, "图层矩形下发 → " + dest[0] + "," + dest[1] + " "
                         + dest[2] + "x" + dest[3]
                         + "（codec=" + MirrorController.getCodec()
                         + " 遮罩=" + rr[2] + "x" + rr[3] + "）rc=" + rc);
             } catch (Throwable t) {
-                Log.w(TAG, "预设同步图层矩形失败: " + t);
+                DashLog.w(TAG, "预设同步图层矩形失败: " + t);
             }
         } else {
             /*
              * 走不到下发分支时把原因记下来 —— 这个条件以前静默跳过，
              * 排查"预设位置应用不上"时完全没有线索。
              */
-            Log.i(TAG, "图层矩形**跳过**：cp=" + (cp != null)
+            DashLog.i(TAG, "图层矩形**跳过**：cp=" + (cp != null)
                     + " casting=" + sCasting + " w=" + w + " h=" + h);
         }
         return ok;
     }
 
-    private static int intProp(java.util.Properties p, String key, int def) {
-        try {
-            String v = p.getProperty(key);
-            return v == null ? def : Integer.parseInt(v.trim());
-        } catch (Throwable t) {
-            return def;
-        }
-    }
-
-    /** 清空指定槽位 */
+    /** 清空指定槽位（只删 prefs 里的 preset_<slot>_* 键） */
     public static void clearPreset(Context ctx, int slot) {
-        java.util.Properties p = readPresetProps(ctx);
-        String k = "s" + slot + ".";
-        for (String key : new java.util.ArrayList<>(p.stringPropertyNames())) {
-            if (key.startsWith(k)) p.remove(key);
-        }
-        writePresetProps(ctx, p);
+        android.content.SharedPreferences.Editor e = ctx
+                .getApplicationContext()
+                .getSharedPreferences(PREF, Context.MODE_PRIVATE).edit();
+        String[] fields = {"x","y","w","h","shape","r_tl","r_tr","r_bl","r_br",
+                "trap_top","trap_bot","feather","border","fit",
+                "src_x","src_y","src_w","src_h"};
+        for (String f : fields) e.remove(pk(slot, f));
+        e.apply();
     }
 
     /** 夹到合法范围（与 C 侧 sanitize 同规则） */

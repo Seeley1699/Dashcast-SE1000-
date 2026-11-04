@@ -28,10 +28,26 @@ public class LayerPreviewView extends View {
     }
 
     private final Paint pBg     = new Paint();
+    /** 截取预览区专用底色（深蓝），和 pBg（图层遮罩用的白底）分开 */
+    private final Paint pCropBg = new Paint();
     private final Paint pLayer  = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Paint pEdge   = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Paint pHandle = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Paint pGrid   = new Paint();
+
+    /**
+     * 羽化 / 边框预览用的画笔（2026-11-05 新增）。
+     *
+     * 用户反馈"调羽化和边框，预览区看不出变化"。
+     * 原来预览只画一个纯色矩形（alpha=200 的 accent），
+     * 羽化和边框这两个纯 alpha 特性完全没有体现。
+     *
+     * pFeather 用 RadialGradient 太麻烦（形状不规则），
+     * 改用**多层内缩描边**：从边缘向内画 N 层由透明到不透明的线，
+     * 天然形成渐变，且对圆角/梯形/椭圆都适用。
+     */
+    private final Paint pFeather = new Paint(Paint.ANTI_ALIAS_FLAG);
+    private final Paint pBorder  = new Paint(Paint.ANTI_ALIAS_FLAG);
     /** 地图模式的"实际抓取区"参考框 */
     private final Paint pMap    = new Paint(Paint.ANTI_ALIAS_FLAG);
 
@@ -44,7 +60,7 @@ public class LayerPreviewView extends View {
     /** 目标 App 窗口像素尺寸（默认主屏 2560×1600，enterBg 时会更准） */
     private int winW = 2560, winH = 1600;
 
-    private boolean zoomed;
+    /* zoomed 字段已随「放大」按钮一起删除（2026-11-04） */
     private float scale = 1f, ox, oy;
 
     /* 拖拽状态 */
@@ -119,29 +135,41 @@ public class LayerPreviewView extends View {
         this.cfg = cfg;
         this.ctx = ctx;
 
-        pBg.setColor(ctx.getColor(R.color.surface_root));
+        /* 预览区画布底色：用 surface_deep（#FFFFFF），和网格线形成对比 */
+        pBg.setColor(ctx.getColor(R.color.surface_deep));
         pLayer.setColor(ctx.getColor(R.color.accent));
         pLayer.setAlpha(200);
         pEdge.setColor(ctx.getColor(R.color.accent_soft));
         pEdge.setStyle(Paint.Style.STROKE);
         pEdge.setStrokeWidth(2f);
         pHandle.setColor(ctx.getColor(R.color.accent));
-        pGrid.setColor(0x22FFFFFF);
+        /*
+         * 网格线颜色（2026-11-04 浅色 UI）。
+         *
+         * 原来是 0x22FFFFFF（22% 白）—— 那是深色背景下的"极淡白线"。
+         * 现在预览区背景改成纯白（surface_deep = #FFFFFF），
+         * 白线画在白底上 = **完全不可见**，用户反馈"网格栏看不见"。
+         *
+         * 改成 30% 黑（#4D000000）：在白底上是清晰但不刺眼的浅灰网格，
+         * 4.5:1 对比度，既看得见又不会抢主体。
+         */
+        pGrid.setColor(0x26000000);
         pGrid.setStrokeWidth(1f);
 
         /* 截取模式的画笔：橙色（和遮罩的蓝色区分开，一眼看清哪个是抓取区） */
-        pCrop.setColor(0xFFFFB454);
+        /* 截取框：#FFB454 → #E88A1A（白色背景上 2.1:1 → 3.4:1） */
+        pCrop.setColor(0xFFE88A1A);
         pCrop.setStyle(Paint.Style.STROKE);
         pCrop.setStrokeWidth(2f);
         /* 目标窗口参考框：灰色细线 */
-        pWin.setColor(0x66FFFFFF);
+        pWin.setColor(0x66000000);
         pWin.setStyle(Paint.Style.STROKE);
         pWin.setStrokeWidth(1.5f);
         /* 拖拽手柄：实心橙圆 */
-        pInset.setColor(0xFFFFB454);
+        pInset.setColor(0xFFE88A1A);
         pInset.setStyle(Paint.Style.FILL);
         /* 截取框外的暗色蒙版（突出"只抓这块"） */
-        pInsetBg.setColor(0x66000000);
+        pInsetBg.setColor(0x99000000);
     }
 
     /* ==================== App 页面截取模式（方案 D）==================== */
@@ -217,14 +245,6 @@ public class LayerPreviewView extends View {
         invalidate();
     }
 
-    public void setZoomed(boolean z) {
-        zoomed = z;
-        invalidate();
-    }
-
-    public boolean isZoomed() {
-        return zoomed;
-    }
 
     public void refresh() {
         cfg.sanitize();
@@ -236,7 +256,6 @@ public class LayerPreviewView extends View {
         float availH = getHeight() - 16f;
         if (availW <= 0 || availH <= 0) return;
         scale = Math.min(availW / cfg.canvasW, availH / cfg.canvasH);
-        if (zoomed) scale *= 2f;
         ox = (getWidth() - cfg.canvasW * scale) / 2f;
         oy = (getHeight() - cfg.canvasH * scale) / 2f;
     }
@@ -255,12 +274,12 @@ public class LayerPreviewView extends View {
         c.drawRect(0, 0, getWidth(), getHeight(), pBg);
 
         /* 画布边界 */
-        pEdge.setColor(0x44FFFFFF);
+        pEdge.setColor(0x44000000);
         c.drawRect(ox, oy, ox + cfg.canvasW * scale, oy + cfg.canvasH * scale, pEdge);
 
         /* 网格 */
         if (cfg.grid > 0) {
-            pEdge.setColor(0x22FFFFFF);
+            pEdge.setColor(0x22000000);
             for (int gx = 0; gx <= cfg.canvasW; gx += cfg.grid) {
                 float px = ox + gx * scale;
                 c.drawLine(px, oy, px, oy + cfg.canvasH * scale, pGrid);
@@ -272,14 +291,103 @@ public class LayerPreviewView extends View {
         }
 
         /* 图层形状 */
+        /* 图层形状 */
         RectF r = new RectF(ox + cfg.x * scale, oy + cfg.y * scale,
                 ox + (cfg.x + cfg.w) * scale, oy + (cfg.y + cfg.h) * scale);
         Path path = buildPath(r);
+
+        /*
+         * ══════════════════════════════════════════════════════════════
+         * **预览要反映羽化和边框**（2026-11-05）
+         * ══════════════════════════════════════════════════════════════
+         *
+         * 用户反馈："调羽化、边框，预览区看不出变化"。
+         *
+         * 原来这里只有一个纯色矩形（alpha=200 的 accent），
+         * 而羽化（边缘 alpha 渐变）和边框（边缘压暗一圈）
+         * 都是**纯 alpha 通道特性**，纯色填充完全体现不出来。
+         *
+         * 现在按三层画：
+         *   ① 主体填充（半透明 accent）
+         *   ② **羽化**：从边缘向内画 N 层渐透明的描边
+         *      —— 天然形成"边缘渐渐隐去"的观感，
+         *         对矩形/圆角/梯形/椭圆都适用，不需要 RadialGradient
+         *   ③ **边框**：沿路径画一条压暗的实线
+         *
+         * 注意：feather 和 border 都是**画布像素**，要先按 scale 缩到控件坐标。
+         */
+
+        /* ① 主体填充 */
         pLayer.setColor(cfg.enabled ? ctx.getColor(R.color.accent)
                                     : ctx.getColor(R.color.content_tertiary));
         pLayer.setAlpha(cfg.enabled ? 200 : 120);
         c.drawPath(path, pLayer);
 
+        /* ② 羽化预览 */
+        if (cfg.enabled && cfg.feather > 0) {
+            float fpx = cfg.feather * scale;       /* 画布 px → 控件 px */
+            if (fpx > 0.5f) {
+                /*
+                 * 层数固定 10 层（不管 feather 多大）：
+                 *   · 太少 → 看得出明显的台阶
+                 *   · 太多 → 每次 onDraw 画几十条路径，拖动时卡
+                 * 10 层在 96px 羽化下每层约 10px，肉眼看是连续渐变。
+                 */
+                int steps = 10;
+                pFeather.setStyle(Paint.Style.STROKE);
+                pFeather.setStrokeWidth(fpx / steps + 1f);
+                for (int i = 1; i <= steps; i++) {
+                    /*
+                     * t 从 0（最外层，几乎透明）到 1（最内层，接近主体）
+                     * alpha 从 0 到 ~120（不超过主体 200，否则会盖成实心）
+                     */
+                    float t = (float) i / steps;
+                    int a = (int) (t * t * 120f);
+                    if (a <= 0) continue;
+                    pFeather.setColor(ctx.getColor(R.color.accent));
+                    pFeather.setAlpha(a);
+
+                    /* 内缩 i 层 —— 用 Path 缩放实现，保证圆角/梯形也跟着缩 */
+                    c.save();
+                    float insetPx = (fpx / steps) * i;
+                    /* 以路径中心缩放，缩放比 = (宽-2*inset)/宽 */
+                    float cx0 = r.centerX(), cy0 = r.centerY();
+                    float sx = (r.width() > 2 * insetPx)
+                            ? (r.width() - 2 * insetPx) / r.width() : 0f;
+                    float sy = (r.height() > 2 * insetPx)
+                            ? (r.height() - 2 * insetPx) / r.height() : 0f;
+                    if (sx <= 0f || sy <= 0f) { c.restore(); continue; }
+                    c.scale(sx, sy, cx0, cy0);
+                    c.drawPath(path, pFeather);
+                    c.restore();
+                }
+            }
+        }
+
+        /* ③ 边框预览 */
+        if (cfg.enabled && cfg.border > 0) {
+            float bpx = cfg.border * scale;        /* 画布 px → 控件 px */
+            if (bpx > 0.5f) {
+                /*
+                 * 边框是"从边缘向内 bpx 宽的一圈，颜色压暗到 40%"。
+                 * 预览里画一条**居中的粗描边**：宽度 bpx，颜色是 accent 压暗。
+                 * 描边以路径为中心，所以会各向外/内扩 bpx/2 —— 视觉上和
+                 * 真实效果（全在内部）略有差异，但预览只需要"看得出来"。
+                 */
+                pBorder.setStyle(Paint.Style.STROKE);
+                pBorder.setStrokeWidth(bpx);
+                int base = ctx.getColor(R.color.accent);
+                /* 压暗到 55%，同时提高不透明度让它在半透明主体上能看见 */
+                int rr = (int) (((base >> 16) & 0xFF) * 0.55f);
+                int gg = (int) (((base >> 8) & 0xFF) * 0.55f);
+                int bb = (int) ((base & 0xFF) * 0.55f);
+                pBorder.setColor(0xFF000000 | (rr << 16) | (gg << 8) | bb);
+                pBorder.setAlpha(230);
+                c.drawPath(path, pBorder);
+            }
+        }
+
+        /* ④ 轮廓线（细，用来标出精确边界） */
         pEdge.setColor(cfg.enabled ? ctx.getColor(R.color.accent)
                                   : ctx.getColor(R.color.content_secondary));
         pEdge.setStrokeWidth(2f);
@@ -304,7 +412,16 @@ public class LayerPreviewView extends View {
      */
     private void drawAppCropMode(Canvas c) {
         computeAppScale();
-        c.drawRect(0, 0, getWidth(), getHeight(), pBg);
+        /*
+         * 截取预览区底色：**深蓝**（2026-11-04 用户要求"蓝底+白网格"）。
+         *
+         * 用独立的 pCropBg，不复用 pBg —— 因为 pBg 同时被「图层遮罩」
+         * 那个预览用着（那里要保持白底）。两个模式共用一块画布，
+         * 混用画笔会互相污染。
+         */
+        /* 底色跟色板走（冷雾灰 #F5F7FA），不再硬编码纯白 */
+        pCropBg.setColor(ctx.getColor(R.color.surface_deep));
+        c.drawRect(0, 0, getWidth(), getHeight(), pCropBg);
 
         /*
          * 【方案 C】底图：有截图就直接画满整屏，用户"看着真实界面框选"。
@@ -321,21 +438,41 @@ public class LayerPreviewView extends View {
         }
 
         /* ② 屏幕区域 */
-        pEdge.setColor(0x44FFFFFF);
+        pEdge.setColor(0x44000000);
         pEdge.setStrokeWidth(2f);
         c.drawRect(aox, aoy, aox + screenW * ascale, aoy + screenH * ascale, pEdge);
 
-        /* 屏幕内网格（帮助目测坐标）；有底图时画淡一点，别盖住画面 */
-        int grid = Math.max(64, screenW / 32);
-        pEdge.setColor(hasBackgroundShot() ? 0x0AFFFFFF : 0x18FFFFFF);
-        pEdge.setStrokeWidth(1f);
+        /*
+         * 网格间距与线色（2026-11-04 修正"深灰底"问题）。
+         *
+         * 现象：截取预览区看起来是深灰底，网格看不清。
+         * 实测像素：背景 #FFFFFF（白），网格线 #666666（40% 黑）。
+         *
+         * 两个原因：
+         *   ① 间距太密 —— grid=80（屏幕像素），而 ascale 约 0.22，
+         *      换算到控件上每 17px 一条线，密密麻麻叠成灰面。
+         *      改成 screenW/16（约 160），控件上是 35px 一条。
+         *   ② 线色被污染 —— pEdge 和 pWin 都是 STROKE，
+         *      画完窗口框后 pWin 的 0x66 遗留，网格跟着变深。
+         *      改用独立的 pGrid 画笔，颜色锁死 0x2E000000（18% 黑）。
+         */
+        int grid = Math.max(120, screenW / 16);
+        /*
+         * 网格线：深蓝底上必须用**白线**（黑线在深蓝上完全看不见）。
+         *
+         *   有底图 → 40% 白（不盖住画面）
+         *   无底图 → 55% 白（清晰可数又不刺眼）
+         */
+        pGrid.setColor(hasBackgroundShot() ? 0x1A000000 : 0x2E000000);
+        pGrid.setStrokeWidth(1f);
+        pGrid.setStyle(Paint.Style.STROKE);
         for (int gx = 0; gx <= screenW; gx += grid) {
             float px = aox + gx * ascale;
-            c.drawLine(px, aoy, px, aoy + screenH * ascale, pEdge);
+            c.drawLine(px, aoy, px, aoy + screenH * ascale, pGrid);
         }
         for (int gy = 0; gy <= screenH; gy += grid) {
             float py = aoy + gy * ascale;
-            c.drawLine(aox, py, aox + screenW * ascale, py, pEdge);
+            c.drawLine(aox, py, aox + screenW * ascale, py, pGrid);
         }
 
         /* ③ 目标窗口参考框 */
@@ -354,15 +491,27 @@ public class LayerPreviewView extends View {
                 aox + (cfg.srcX + cfg.srcW) * ascale,
                 aoy + (cfg.srcY + cfg.srcH) * ascale);
 
-        /* ④ 框外蒙版：四条矩形拼起来（比 clip 反选简单可靠） */
+        /*
+         * ══ 框外蒙版：**去掉了**（2026-11-04）══
+         *
+         * 原来用 pInsetBg（60% 黑）填满截取框外的四个矩形：
+         *   c.drawRect(上/下/左/右, pInsetBg)
+         *
+         * 当截取框很大时这是"暗角高亮"效果，挺好。
+         * 但当框很小（用户当前 240×176，只占屏幕 0.9%）时，
+         * 那 99.1% 的区域全被涂成深灰 —— 整块预览区看起来
+         * 是一大片深灰底，网格线全被盖住。
+         *
+         * 用户反馈"这个深灰请改成跟第二张一样（白底黑网格）"。
+         * 所以直接不画蒙版，让白底 + 黑网格始终清晰可见，
+         * 只靠橙色框 + 手柄标识截取范围。
+         */
+        /* 框外不做蒙版（保持底图/网格清晰） */
         float sw = aox + screenW * ascale, sh = aoy + screenH * ascale;
-        c.drawRect(aox, aoy, sw, cr.top, pInsetBg);              /* 上 */
-        c.drawRect(aox, cr.bottom, sw, sh, pInsetBg);            /* 下 */
-        c.drawRect(aox, cr.top, cr.left, cr.bottom, pInsetBg);   /* 左 */
-        c.drawRect(cr.right, cr.top, sw, cr.bottom, pInsetBg);   /* 右 */
 
         /* ⑤ 橙色截取框 */
-        pCrop.setColor(0xFFFFB454);      /* 每帧显式设色，别依赖上次的值 */
+        /* 截取框：#FFB454 → #E88A1A（白色背景上 2.1:1 → 3.4:1） */
+        pCrop.setColor(0xFFE88A1A);      /* 每帧显式设色，别依赖上次的值 */
         pCrop.setStyle(Paint.Style.STROKE);
         pCrop.setPathEffect(null);
         pCrop.setStrokeWidth(2.5f);
@@ -375,7 +524,7 @@ public class LayerPreviewView extends View {
         c.drawText("(" + cfg.srcX + "," + cfg.srcY + ")", cr.left + dp(6), cr.top + dp(32), pCrop);
 
         /* 8 个拖拽手柄 + 4 个角柄 */
-        pInset.setColor(0xFFFFB454);
+        pInset.setColor(0xFFE88A1A);
         drawHandle(c, cr.left, cr.top);
         drawHandle(c, cr.right, cr.top);
         drawHandle(c, cr.left, cr.bottom);
@@ -389,7 +538,8 @@ public class LayerPreviewView extends View {
         float r = cfg.srcH > 0 ? (float) cfg.srcW / cfg.srcH : 0f;
         float target = (float) cfg.canvasW / cfg.canvasH;
         boolean ok = Math.abs(r - target) < 0.15f;
-        pCrop.setColor(ok ? 0xFF8B949E : 0xFFD29922);
+        /* 比例提示文字：白底上要用深灰/深橙，原来的浅灰浅橙看不见 */
+            pCrop.setColor(ok ? 0xFF6B6B70 : 0xFFC77800);
         pCrop.setTextSize(dp(11));
         c.drawText(String.format(Locale.US, "%.2f:1  %s  仪表 %.2f:1",
                 r, ok ? "✓" : "⚠", target), aox + dp(4), sh - dp(6), pCrop);
@@ -401,7 +551,7 @@ public class LayerPreviewView extends View {
         pInset2.setColor(0xFFFFFFFF);
         pInset2.setStyle(Paint.Style.FILL);
         c.drawCircle(x, y, dp(2), pInset2);
-        pInset.setColor(0xFFFFB454);
+        pInset.setColor(0xFFE88A1A);
     }
 
     /**

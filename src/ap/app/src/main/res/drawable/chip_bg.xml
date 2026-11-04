@@ -1,6 +1,21 @@
-﻿<?xml version="1.0" encoding="utf-8"?>
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  小条形容器（投屏目标提示条、截取 App 页面的标题行）。
+
+  ══════════════════════════════════════════════════════════════════
+  改中性（2026-11-04，按 MiUIX 规范）
+  ══════════════════════════════════════════════════════════════════
+  原来是 accent_tint 淡蓝底 + 1dp 强调蓝描边。
+  实测截图上它和蓝色主按钮抢视觉，整页"蓝成一片"。
+
+  MiUIX 的容器一律中性：surfaceContainerHighest 做底（比卡片亮一档），
+  outline 灰描边。蓝色只留给主操作。
+
+  注意「截取 App 页面」标题行也用这个 —— 那里文字本身是 content_accent（蓝），
+  深灰底 + 蓝字已经足够醒目，不需要再加蓝框。
+-->
 <shape xmlns:android="http://schemas.android.com/apk/res/android" android:shape="rectangle">
-    <solid android:color="@color/accent_tint" />
-    <stroke android:width="1dp" android:color="@color/accent" />
-    <corners android:radius="10dp" />
+    <solid android:color="@color/surface_raised" />
+    <stroke android:width="1dp" android:color="@color/surface_border" />
+    <corners android:radius="12dp" />
 </shape>

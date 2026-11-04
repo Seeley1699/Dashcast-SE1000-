@@ -65,7 +65,7 @@ public class LayerEditorActivity extends Activity {
             LayerConfig.attachCp(new CpManager(this));
             /* 只改内存，点「保存」才落盘并同步仪表 */
         } catch (Throwable t) {
-            android.util.Log.w("DashcastLayerUI", "同步图层矩形失败: " + t);
+            DashLog.w("DashcastLayerUI", "同步图层矩形失败: " + t);
         }
 
         ScrollView scroll = new ScrollView(this);

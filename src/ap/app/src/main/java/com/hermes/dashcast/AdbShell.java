@@ -93,7 +93,7 @@ public final class AdbShell {
 
             while (true) {
                 Msg m = read(in);
-                Log.d(TAG, "pkt cmd=" + Integer.toHexString(m.cmd)
+                DashLog.d(TAG, "pkt cmd=" + Integer.toHexString(m.cmd)
                         + " a0=" + m.arg0 + " a1=" + m.arg1
                         + " len=" + (m.data == null ? 0 : m.data.length));
                 if (m.cmd == A_OKAY) {
@@ -160,7 +160,7 @@ public final class AdbShell {
             int s = 0;
             for (byte b : m.data) s += (b & 0xFF);
             if ((s & 0xFFFFFFFF) != (sum & 0xFFFFFFFF)) {
-                Log.w(TAG, "ADB 校验和不符（继续）");
+                DashLog.w(TAG, "ADB 校验和不符（继续）");
             }
         }
         return m;

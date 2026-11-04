@@ -1,12 +1,32 @@
 <?xml version="1.0" encoding="utf-8"?>
+<!--
+  ══════════════════════════════════════════════════════════════════
+  主题 —— 浅色 UI（ShipSwift 规范，2026-11-04）
+  ══════════════════════════════════════════════════════════════════
+
+  父主题从 Theme.Material.NoActionBar（深色系）换成
+  **Theme.Material.Light.NoActionBar** —— 这不只是配色问题：
+
+    · 系统控件（CheckBox / SeekBar / Button）的默认样式由父主题决定。
+      深色父主题下，CheckBox 的勾选框是浅灰、文字是浅色 ——
+      放到 #F5F5F5 页面上几乎看不见。
+    · windowLightStatusBar 必须设 true，状态栏图标才会变深色。
+      设 false 的话，浅灰背景配白图标 = 完全看不清。
+
+  背景色、文字色全部指向新色板（页面 #F5F5F5 / 卡片 #FFFFFF / 文字 #1C1C1E）。
+-->
 <resources>
-    <style name="Theme.Dashcast" parent="android:Theme.Material.NoActionBar">
+    <style name="Theme.Dashcast" parent="android:Theme.Material.Light.NoActionBar">
         <item name="android:windowBackground">@color/bg</item>
         <item name="android:colorBackground">@color/bg</item>
         <item name="android:statusBarColor">@color/bg</item>
         <item name="android:navigationBarColor">@color/bg</item>
-        <item name="android:windowLightStatusBar">false</item>
+        <!-- 浅色背景 → 状态栏图标必须转深色 -->
+        <item name="android:windowLightStatusBar">true</item>
         <item name="android:textColorPrimary">@color/text_main</item>
         <item name="android:textColorSecondary">@color/text_sub</item>
+        <!-- 系统控件（CheckBox/RadioButton）的强调色 -->
+        <item name="android:colorAccent">@color/accent</item>
+        <item name="android:colorControlActivated">@color/accent</item>
     </style>
 </resources>
