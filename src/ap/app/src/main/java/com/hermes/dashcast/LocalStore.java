@@ -219,26 +219,6 @@ public final class LocalStore {
         f.renameTo(bak);
     }
 
-    /** 读技术日志的尾部（导出排查时用）。 */
-    public static String readTechLog(Context ctx, int maxChars) {
-        File f = logFile(ctx);
-        if (!f.exists()) return "";
-        try {
-            long len = f.length();
-            java.io.RandomAccessFile raf = new java.io.RandomAccessFile(f, "r");
-            long skip = Math.max(0, len - maxChars);
-            raf.seek(skip);
-            byte[] buf = new byte[(int) (len - skip)];
-            raf.readFully(buf);
-            raf.close();
-            String s = new String(buf, "UTF-8");
-            int nl = s.indexOf('\n');
-            if (nl > 0 && skip > 0) s = s.substring(nl + 1);
-            return s;
-        } catch (Throwable t) {
-            return "";
-        }
-    }
 
     /**
      * 清空日志。

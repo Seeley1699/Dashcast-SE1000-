@@ -142,13 +142,6 @@ public class MainActivity extends Activity {
          */
         MirrorController.loadOutputSize(this);
 
-        DashcastSenderService.setDisplayReadyListener(displayId ->
-                mainHandler.post(() -> onDisplayReady(displayId)));
-        DashcastSenderService.setStatsListener((fps, kbps, tiles, connected) ->
-                mainHandler.post(() -> {
-                    if (metrics != null) metrics.setText(String.valueOf(fps));
-                    if (upstream != null) upstream.setText(String.valueOf(kbps));
-                }));
 
         /* ══════════════════════════════════════════════════════════
          * UI 构建（2026-10-31 结构性重构）
@@ -617,21 +610,7 @@ public class MainActivity extends Activity {
         applyImmersive();
 
         setDotColor(R.color.content_secondary);
-        refreshCodecButtons();
-        /*
-         * 切档后刷新形状/适配按钮的**文案**（2026-11-04）。
-         *
-         * 这两个按钮在 H.264 下会显示「矩形（H264 固定）」「铺满（固定）」，
-         * 切回 BGRA 要还原成正常文案。
-         * 原来只有 applyAlphaDependentAvailability() 改它们的 enabled/alpha，
-         * 没改 text —— 切档后按钮虽然可点了，文案却还留着「（固定）」后缀。
-         */
-        if (maskBtnShape != null) {
-            ((TextView) maskBtnShape.getChildAt(0)).setText(shapeLabel());
-        }
-        if (maskBtnFit != null) {
-            ((TextView) maskBtnFit.getChildAt(0)).setText(fitLabel());
-        }
+
         mirror.setMapMode(this, MirrorController.loadMapMode(this));
         updateMapModeBtn();
 
@@ -651,38 +630,10 @@ public class MainActivity extends Activity {
             updateViewBtns();
         }
         updateTargetHint();
-        refreshCodecButtons();
-        /*
-         * 切档后刷新形状/适配按钮的**文案**（2026-11-04）。
-         *
-         * 这两个按钮在 H.264 下会显示「矩形（H264 固定）」「铺满（固定）」，
-         * 切回 BGRA 要还原成正常文案。
-         * 原来只有 applyAlphaDependentAvailability() 改它们的 enabled/alpha，
-         * 没改 text —— 切档后按钮虽然可点了，文案却还留着「（固定）」后缀。
-         */
-        if (maskBtnShape != null) {
-            ((TextView) maskBtnShape.getChildAt(0)).setText(shapeLabel());
-        }
-        if (maskBtnFit != null) {
-            ((TextView) maskBtnFit.getChildAt(0)).setText(fitLabel());
-        }
+
 
         setDotColor(R.color.content_secondary);
-        refreshCodecButtons();
-        /*
-         * 切档后刷新形状/适配按钮的**文案**（2026-11-04）。
-         *
-         * 这两个按钮在 H.264 下会显示「矩形（H264 固定）」「铺满（固定）」，
-         * 切回 BGRA 要还原成正常文案。
-         * 原来只有 applyAlphaDependentAvailability() 改它们的 enabled/alpha，
-         * 没改 text —— 切档后按钮虽然可点了，文案却还留着「（固定）」后缀。
-         */
-        if (maskBtnShape != null) {
-            ((TextView) maskBtnShape.getChildAt(0)).setText(shapeLabel());
-        }
-        if (maskBtnFit != null) {
-            ((TextView) maskBtnFit.getChildAt(0)).setText(fitLabel());
-        }
+
         loadTargetPref();
         updateTargetHint();
 
@@ -700,20 +651,8 @@ public class MainActivity extends Activity {
          */
         MirrorController.loadCodec(this);
         refreshCodecButtons();
-        /*
-         * 切档后刷新形状/适配按钮的**文案**（2026-11-04）。
-         *
-         * 这两个按钮在 H.264 下会显示「矩形（H264 固定）」「铺满（固定）」，
-         * 切回 BGRA 要还原成正常文案。
-         * 原来只有 applyAlphaDependentAvailability() 改它们的 enabled/alpha，
-         * 没改 text —— 切档后按钮虽然可点了，文案却还留着「（固定）」后缀。
-         */
-        if (maskBtnShape != null) {
-            ((TextView) maskBtnShape.getChildAt(0)).setText(shapeLabel());
-        }
-        if (maskBtnFit != null) {
-            ((TextView) maskBtnFit.getChildAt(0)).setText(fitLabel());
-        }
+        refreshCodecLabels();
+
 
         if (MirrorController.isMirroring()) {
             running = true;
@@ -740,20 +679,8 @@ public class MainActivity extends Activity {
         updateMapModeBtn();
         updateTargetHint();
         refreshCodecButtons();
-        /*
-         * 切档后刷新形状/适配按钮的**文案**（2026-11-04）。
-         *
-         * 这两个按钮在 H.264 下会显示「矩形（H264 固定）」「铺满（固定）」，
-         * 切回 BGRA 要还原成正常文案。
-         * 原来只有 applyAlphaDependentAvailability() 改它们的 enabled/alpha，
-         * 没改 text —— 切档后按钮虽然可点了，文案却还留着「（固定）」后缀。
-         */
-        if (maskBtnShape != null) {
-            ((TextView) maskBtnShape.getChildAt(0)).setText(shapeLabel());
-        }
-        if (maskBtnFit != null) {
-            ((TextView) maskBtnFit.getChildAt(0)).setText(fitLabel());
-        }
+        refreshCodecLabels();
+
     }
 
     /**
@@ -767,14 +694,7 @@ public class MainActivity extends Activity {
      */
     @Override
     protected void onDestroy() {
-        try {
-            DashcastSenderService.setDisplayReadyListener(null);
-        } catch (Throwable ignored) {
-        }
-        try {
-            DashcastSenderService.setStatsListener(null);
-        } catch (Throwable ignored) {
-        }
+
         try {
             if (mirror != null && !sandboxKeepListenerOnDestroy()) {
                 mirror.setListener(null);
@@ -810,10 +730,59 @@ public class MainActivity extends Activity {
             }
 
             @Override
-            public void onStats(int fps, int kbps, int tiles) {
+            public void onStats(int fps, int kbps, int tiles, int capture) {
                 mainHandler.post(() -> {
                     if (metrics == null) return;
-                    metrics.setText(String.valueOf(fps));
+                    /*
+                     * **fps=0 但 capture>0 是「画面静止」，不是「链路死了」**
+                     * （2026-11-06 修）。
+                     *
+                     * dcapd2 的 fps 语义是"这一秒发出去了多少有变化的帧"：
+                     *   · 画面静止 → tiles=0 → frames=0 → fps=0
+                     *   · 但 capture 仍是 20（每秒确实抓了 20 帧）
+                     *
+                     * 原来直接把 0 打上去，用户看到「fps 0 / 上行 0」，
+                     * 第一反应就是"投屏断了"。实测日志证明链路是通的：
+                     *   大帧 270 图块 src=SCREEN   ← 第一帧全量送达
+                     *   STAT capture=20 tiles=0    ← 之后画面没变，无需发送
+                     *
+                     * 所以这里区分三种状态：
+                     *   ① capture==0            → 真的没在抓（进程死了/暂停）
+                     *   ② capture>0 && tiles==0 → 画面静止，链路正常
+                     *   ③ tiles>0               → 正常刷新
+                     */
+                    /*
+                     * **H.264 档的「静止」判据必须用 kbps，不能用 tiles**
+                     * （2026-11-06 修本轮的失误）。
+                     *
+                     * H.264 走的是 h264_enc_drain() → RTP/UDP，
+                     * 完全不走 enc_push() —— 而 tiles 只在 enc_push 里累加。
+                     * 所以 H.264 档下 tiles **恒为 0**，哪怕画面满速在推。
+                     *
+                     * 实测（01:22）：
+                     *   STAT fps=19 capture=20 tiles=0 kbps=216
+                     *   上行显示 56 KB/s（数据确实在发）
+                     * 而 fps 格却显示「静止」—— 这就是判据用错了。
+                     *
+                     * 正确判据：
+                     *   · BGRA 档：tiles>0 才算在推（tiles 是图块数）
+                     *   · H.264 档：kbps>0 就算在推（tiles 永远 0，没有意义）
+                     *
+                     * 用 kbps 做统一判据更稳：两种档位都只在真正发数据时非 0。
+                     */
+                    boolean alive = capture > 0;
+                    boolean pushing = (kbps > 0) || (tiles > 0);
+
+                    if (!alive) {
+                        metrics.setText("0");
+                        metrics.setTextColor(getColor(R.color.state_warn));
+                    } else if (!pushing) {
+                        metrics.setText("静止");
+                        metrics.setTextColor(getColor(R.color.content_secondary));
+                    } else {
+                        metrics.setText(String.valueOf(fps));
+                        metrics.setTextColor(getColor(R.color.accent_soft));
+                    }
                     if (upstream != null) upstream.setText(String.valueOf(kbps));
                 });
             }
@@ -1226,6 +1195,8 @@ public class MainActivity extends Activity {
             ((TextView) ((LinearLayout) v).getChildAt(0))
                     .setText("帧率 " + maskFps);
             refreshMask();
+            MirrorController mc = MirrorController.getActive();
+            if (mc != null) { mc.setFps(this, maskFps); }
         }), rowLp(1f));
         col.addView(fpsRow);
 
@@ -2150,6 +2121,7 @@ public class MainActivity extends Activity {
                     ? "✓ 已套用该 App 的历史尺寸：" + pkg
                     : "该 App 无历史尺寸，使用当前值 · " + pkg);
         }
+        if (MirrorController.getCodec() == MirrorController.CODEC_H264) { appCropPreview.syncMaskAspectNow(); }
         appCropPreview.setAppCropMode(true, mirror.getScreenPxSafe());
         appCropPreview.refresh();
         updateAppCropTexts();
@@ -2225,9 +2197,6 @@ public class MainActivity extends Activity {
         updateAppCropRatio();
     }
 
-    private int clamp(int v, int lo, int hi) {
-        return v < lo ? lo : (v > hi ? hi : v);
-    }
 
     /** 刷新比例提示（对比仪表比例） */
     private void updateAppCropRatio() {
@@ -3060,43 +3029,6 @@ public class MainActivity extends Activity {
     }
 
     /** 状态卡里的单格指标：上面大数字，下面小标签，各占 1/3 */
-    /**
-     * 状态卡里的单格指标：上面大数字，下面小标签，各占 1/3。
-     *
-     * 用外层 FrameLayout 固定高度 + 内部垂直居中的 LinearLayout，
-     * 比"嵌套 weight"可靠 —— 后者在 WRAP_CONTENT 父容器里会塌成 0 高。
-     */
-    private TextView statCell(LinearLayout parent, String label, String initVal) {
-        LinearLayout cell = new LinearLayout(this);
-        cell.setOrientation(LinearLayout.VERTICAL);
-        cell.setGravity(Gravity.CENTER);
-        cell.setLayoutParams(new LinearLayout.LayoutParams(0, dp(56), 1f));
-
-        TextView v = new TextView(this);
-        v.setText(initVal);
-        v.setTextSize(36);
-        v.setTextColor(getColor(R.color.accent_soft));
-        v.setTypeface(Typeface.DEFAULT_BOLD);
-        v.setGravity(Gravity.CENTER);
-        v.setIncludeFontPadding(false);
-        cell.addView(v, new LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT,
-                LinearLayout.LayoutParams.WRAP_CONTENT));
-
-        TextView lb = new TextView(this);
-        lb.setText(label);
-        lb.setTextSize(15);
-        lb.setTextColor(getColor(R.color.content_tertiary));
-        lb.setGravity(Gravity.CENTER);
-        lb.setIncludeFontPadding(false);
-        lb.setPadding(0, dp(4), 0, 0);
-        cell.addView(lb, new LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT,
-                LinearLayout.LayoutParams.WRAP_CONTENT));
-
-        parent.addView(cell);
-        return v;
-    }
 
     /**
      * 固定宽度的指标格（删掉「图块」后只剩两格，不能再用 1/3 权重均分）。
@@ -3176,20 +3108,8 @@ public class MainActivity extends Activity {
         if (cur == want) return;
         mirror.setCodec(want);
         refreshCodecButtons();
-        /*
-         * 切档后刷新形状/适配按钮的**文案**（2026-11-04）。
-         *
-         * 这两个按钮在 H.264 下会显示「矩形（H264 固定）」「铺满（固定）」，
-         * 切回 BGRA 要还原成正常文案。
-         * 原来只有 applyAlphaDependentAvailability() 改它们的 enabled/alpha，
-         * 没改 text —— 切档后按钮虽然可点了，文案却还留着「（固定）」后缀。
-         */
-        if (maskBtnShape != null) {
-            ((TextView) maskBtnShape.getChildAt(0)).setText(shapeLabel());
-        }
-        if (maskBtnFit != null) {
-            ((TextView) maskBtnFit.getChildAt(0)).setText(fitLabel());
-        }
+        refreshCodecLabels();
+
         setStatus("状态：编码档位已切换 · "
                 + (want == MirrorController.CODEC_H264 ? "H.264" : "BGRA+LZ4"));
 
@@ -3242,6 +3162,15 @@ public class MainActivity extends Activity {
     }
 
     /** 刷新二选一按钮的选中态（选中的用青绿实底 + 深字） */
+    /** 刷新「形状」「适配」按钮文案。原来这段在 6 处复制，统一抽到这里（2026-11-06）。 */
+    private void refreshCodecLabels() {
+        if (maskBtnShape != null) {
+            ((TextView) maskBtnShape.getChildAt(0)).setText(shapeLabel());
+        }
+        if (maskBtnFit != null) {
+            ((TextView) maskBtnFit.getChildAt(0)).setText(fitLabel());
+        }
+    }
     private void refreshCodecButtons() {
         mainHandler.post(() -> {
             boolean h264 = MirrorController.getCodec() == MirrorController.CODEC_H264;
@@ -3273,11 +3202,21 @@ public class MainActivity extends Activity {
         if (maskAlphaWarn == null) return;
 
         if (h264) {
+            /*
+             * **措辞：说"不做"，不说"不能"**（2026-11-06）。
+             *
+             * 原来写「不支持下列功能」—— 读起来像"这个 App 能力不够"，
+             * 实际上是**格式限制**：H.264 是 YUV420，本身没有 alpha 通道，
+             * 圆角/羽化这类"靠 alpha 挖洞"的效果没有可写入的地方。
+             *
+             * 换成"这套链路不做"：把限制说成设计选择，而不是能力缺陷。
+             * 用户知道"想要这些就切 LZ4"比知道"不支持"有用得多。
+             */
             maskAlphaWarn.setText(
-                    "⚠ 当前 H.264 档不支持下列功能（编码无 alpha 通道）：\n"
+                    "H.264 档这套链路不做形状类效果（编码是 YUV420，不带 alpha）：\n"
                             + "    圆角矩形 / 梯形 / 椭圆 / 四角圆角 / 梯形上下 / 羽化 / 边框\n"
-                            + "  这些控件已置灰。要用请切到「BGRA+LZ4」档。\n"
-                            + "  （矩形遮罩 + 铺满 在 H.264 下正常）");
+                            + "  要用这些，切到「BGRA+LZ4」档即可（带 alpha，全部可用）。\n"
+                            + "  矩形遮罩 + 铺满 在 H.264 下照常工作。");
             maskAlphaWarn.setVisibility(View.VISIBLE);
         } else {
             maskAlphaWarn.setText("✓ BGRA+LZ4 档：形状/圆角/羽化/边框 全部可用");
@@ -3732,10 +3671,6 @@ public class MainActivity extends Activity {
         }
     }
 
-    private String label(ResolveInfo ri) {
-        try { return ri.loadLabel(getPackageManager()).toString(); }
-        catch (Exception e) { return "目标App"; }
-    }
 
     /** [开始投屏] 建虚拟屏 + 推流到 CP：
      *  ① 启动 dashcastd（CP 接收端）
@@ -3818,17 +3753,6 @@ public class MainActivity extends Activity {
 
         appendLog("地图 HUD · 一键开投");
 
-        /*
-         * 上一场还在跑就先停干净。
-         * DashcastSenderService 的静态 sRunning 为 true 时，
-         * 直接 startForegroundService 会被跳过、回调永远不来。
-         */
-        if (DashcastSenderService.isRunning()) {
-            setStatus("状态：结束上一场投屏…");
-            stopServiceNow();
-            mainHandler.postDelayed(this::startHudCastInner, 800);
-            return;
-        }
 
         /* 直接进投屏流程（不校验 targetPkg） */
         startCastInner();
@@ -3863,16 +3787,7 @@ public class MainActivity extends Activity {
             return;
         }
 
-        // 上一场还在跑（服务的静态标志为准，Activity 的字段会被重建清零）。
-        // 这种情况直接 startForegroundService 会因为 sRunning==true 而跳过建屏，
-        // 回调永远不来 → UI 卡在"等待虚拟屏就绪…"。所以先停干净，再重开。
-        if (DashcastSenderService.isRunning()) {
-            DashLog.i(TAG, "上一场还在跑，先停掉再重开");
-            setStatus("状态：结束上一场投屏…");
-            stopServiceNow();
-            mainHandler.postDelayed(this::startCastInner, 500);
-            return;
-        }
+
         startCastInner();
     }
 
@@ -3887,11 +3802,7 @@ public class MainActivity extends Activity {
          */
         MirrorController.setHudSession(false);
 
-        if (DashcastSenderService.isRunning()) {
-            stopServiceNow();
-            mainHandler.postDelayed(this::startCastAfterHudStop, 800);
-            return;
-        }
+
         startCastInner();
     }
 
@@ -3986,22 +3897,6 @@ public class MainActivity extends Activity {
         }, "cp-start").start();
     }
 
-    /** 起推流服务。size 为 CP 实测屏幕尺寸，null 则用默认值 */
-    private void startCastService(int[] size) {
-        Intent svc = new Intent(this, DashcastSenderService.class);
-        svc.putExtra(DashcastSenderService.EXTRA_PROJECTION_CODE, Activity.RESULT_OK);
-        svc.putExtra(DashcastSenderService.EXTRA_PROJECTION_DATA, projectionData);
-        if (size != null) {
-            svc.putExtra(DashcastSenderService.EXTRA_WIDTH, size[0]);
-            svc.putExtra(DashcastSenderService.EXTRA_HEIGHT, size[1]);
-        }
-        if (Build.VERSION.SDK_INT >= 26) {
-            startForegroundService(svc);
-        } else {
-            startService(svc);
-        }
-        running = true;
-    }
 
     /** 弹系统的「开始录制或投放」授权框 —— 只有私有屏建不出来时的兜底路径才会到这儿 */
     private void requestProjection() {
@@ -4038,19 +3933,19 @@ public class MainActivity extends Activity {
     /** 虚拟屏就绪回调：把目标 App 搬进虚拟屏（而非物理仪表屏） */
     private void onDisplayReady(int displayId) {
         if (displayId < 0) {
+            /*
+             * **这个分支已经走不到了**（2026-11-07）。
+             *
+             * displayId 只由 DashcastSenderService 的 displayReadyListener 传进来，
+             * 而那个 Service 从未被 startService 启动过（isRunning() 恒 false），
+             * 所以 onDisplayReady 永远不会被调用。
+             *
+             * 保留这段只为兜住"万一以后有人恢复了那条链路"：
+             * 直接报错，不再尝试 MediaProjection 授权（那条链路依赖同一个 Service）。
+             */
             running = false;
-            // 只有"服务明确说缺 CAPTURE_VIDEO_OUTPUT"才去弹授权框。
-            // 之前是无条件先弹，结果正常路径也被拦一道。
-            if (DashcastSenderService.isProjectionRequired()
-                    && projectionData == null && !projectionTried) {
-                DashLog.i(TAG, "私有屏被拒（缺 CAPTURE_VIDEO_OUTPUT），退到 MediaProjection 授权");
-                leaveBusy();
-                requestProjection();
-                return;
-            }
-            String why = DashcastSenderService.getLastError();
-            setStatus("状态：虚拟屏创建失败"
-                    + (why == null || why.isEmpty() ? "" : "\n" + why));
+            DashLog.e(TAG, "onDisplayReady(" + displayId + ") —— 私有屏建立失败");
+            setStatus("状态：虚拟屏创建失败（displayId=" + displayId + "）");
             setDotColor(R.color.text_sub);
             leaveBusy();
             return;
@@ -4396,18 +4291,6 @@ public class MainActivity extends Activity {
         }
     }
 
-    /** 真正干活的停止动作：投递 ACTION_STOP（服务同步 release）+ stopService */
-    private void stopServiceNow() {
-        Intent stop = new Intent(this, DashcastSenderService.class);
-        stop.setAction(DashcastSenderService.ACTION_STOP);
-        try {
-            startService(stop);          // 服务在跑，这条只是投递指令
-        } catch (Throwable t) {
-            DashLog.w(TAG, "投递停止指令失败: " + t);
-        }
-        stopService(new Intent(this, DashcastSenderService.class));
-        running = false;
-    }
 
     private void setStatus(final String text) {
         mainHandler.post(() -> status.setText(text));

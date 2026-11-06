@@ -140,7 +140,7 @@ extern int  h264_enc_feed(const uint8_t *bgra, int sw, int sh);
  * H.264 档必须用它 —— 传整块画布会让编码器错位取样，未覆盖区域留旧像素 → 重影。 */
 extern int  h264_enc_feed_crop(const uint8_t *bgra, int sw, int sh,
                                int cx, int cy, int cw, int ch);
-extern void h264_enc_drain(void);
+extern int  h264_enc_drain(void);
 extern void h264_enc_stats(long *frames, long *bytes);
 extern void h264_enc_close(void);
 static int g_codec = 0;
@@ -582,8 +582,31 @@ static int frame_is_blank(const uint8_t *buf, int w, int h, int stride)
 }
 
 /** 缩成 480 宽的 PPM 落盘（PIL 可直接读） */
+/*
+ * **取证快照默认关闭**（2026-11-07）。
+ *
+ * dump_ppm 是排查"仪表上到底是 App 还是桌面"用的：
+ * 把画布/VD 帧/切换后画面各存一张 PPM，事后用看图软件确认。
+ *
+ * 但它每次投屏都写：
+ *   dc_canvas.ppm / dc_after.ppm / dc_vd1~3.ppm  ≈ 1.7MB
+ * 而且**从来不清理** —— /data/local/tmp 里堆着 5 个文件不放。
+ *
+ * 这些只在调事故时有用，日常投屏纯属浪费。
+ * 改成由文件开关控制：想取证就
+ *     adb shell touch /data/local/tmp/dc_debug_dump
+ * 不需要时删掉即可，默认不写一个字节。
+ */
+static int debug_dump_enabled(void)
+{
+    static int cached = -1;
+    if (cached < 0) cached = (access("/data/local/tmp/dc_debug_dump", F_OK) == 0) ? 1 : 0;
+    return cached;
+}
+
 static void dump_ppm(const char *path, const uint8_t *buf, int w, int h, int stride)
 {
+    if (!debug_dump_enabled()) return;
     if (!buf || w <= 0 || h <= 0 || stride < w * 4) return;
     int dw = 480;
     if (dw > w) dw = w;
@@ -2166,7 +2189,29 @@ int main(int argc, char **argv)
                 } else {
                     h264_enc_feed(canvas, outW, outH);
                 }
-                h264_enc_drain();
+                /*
+                 * **drain 失败要断连重连**（2026-11-07 补）。
+                 *
+                 * 以前这里无条件 frames++ —— 而 drain 内部 send_nal 失败时
+                 * 只是 LOGE 一句就 return，主循环完全不知道。
+                 * 结果：CP 断开后 H.264 档一直推空气，fps 显示正常、
+                 * 画面却是静止的，用户只能靠肉眼发现问题。
+                 *
+                 * 现在 drain 返回 -1 表示写码流失路，这里按 BGRA 分支
+                 * 同样的方式处理：断连 → 交给主循环顶部的 2 秒重连逻辑。
+                 * force_full=1 让重连后补一整帧，避免 CP 上留残影。
+                 */
+                if (h264_enc_drain() != 0) {
+                    LOGE("H.264 码流发送失败，断开控制连接等重连");
+                    h264_enc_close();
+                    g_h264_ready = 0;
+                    g_h264_tried = 0;      /* 允许重连后重新开编码器 */
+                    close(enc->fd);
+                    enc->fd = -1;
+                    connected = 0;
+                    force_full = 1;
+                    continue;
+                }
                 frames++;
             }
         } else if (do_push && connected) {
@@ -2232,5 +2277,16 @@ int main(int argc, char **argv)
     free(g_px_buf);
     free(canvas);
     enc_free(enc);
+    /*
+     * **遮罩缓冲也要释放**（2026-11-07 补）。
+     *
+     * 原来漏了 dc_layer_free(&g_mask) —— g_mask.alpha 是 dc_layer_build 里
+     * malloc 的，典型 528×416 ≈ 215KB，退出时不还就是白占。
+     *
+     * 严格说进程退出后 OS 会回收，不算"逻辑错误"；但 dcapd2 是按需
+     * pkill + 重启的（切帧率/切编码档都会重启），在进程生命周期内
+     * 这类遗漏会让内存统计越来越难看，也不好排查真正的泄漏。
+     */
+    dc_layer_free(&g_mask);
     return 0;
 }

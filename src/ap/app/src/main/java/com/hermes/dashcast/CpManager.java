@@ -52,7 +52,23 @@ public class CpManager {
     public volatile String lastPushError = "";
 
     public CpManager(Context context) {
-        this.context = context;
+        /*
+         * **一律转成 Application Context**（2026-11-07 修 Activity 泄漏）。
+         *
+         * 调用方传的是 Activity：
+         *     MainActivity.java:130        new CpManager(this)
+         *     LayerEditorActivity.java:60  new MirrorController(getApplicationContext(), new CpManager(this))
+         *     LayerEditorActivity.java:65  LayerConfig.attachCp(new CpManager(this))
+         *
+         * 而 LayerConfig.sCp 是 **static** 字段（LayerConfig.java:223），
+         * MirrorController 构造里又会 attachCp 一次 —— 于是 Activity
+         * 被静态字段永久持有，每次进编辑器 / 每次投屏都漏一个，
+         * 旧 Activity 连同它的 View 树都回收不掉。
+         *
+         * CpManager 只用 context 读 assets 和 SharedPreferences，
+         * Application Context 完全够用，转一下就能断掉这条引用链。
+         */
+        this.context = context == null ? null : context.getApplicationContext();
         this.localMd5 = computeLocalMd5();
     }
 
@@ -149,25 +165,39 @@ public class CpManager {
     /** 在已有 session 上执行命令（复用连接） */
     private String execOnSession(Session session, String command) throws Exception {
         ChannelExec channel = (ChannelExec) session.openChannel("exec");
-        channel.setCommand(command);
-        InputStream in = channel.getInputStream();
-        channel.connect(20000);
+        /*
+         * **必须 try/finally 保证 channel 断开**（2026-11-07 修 channel 泄漏）。
+         *
+         * 原来 channel.disconnect() 写在正常流程末尾 ——
+         * in.read() 抛 IOException（CP 重启、网络抖动、命令输出被截断）时，
+         * 这一行永远不执行，channel 就漏在 Session 里。
+         *
+         * JSch 一个 Session 的 channel 数是有上限的（默认约 100 个）。
+         * 漏够之后 openChannel 直接抛 "channel not opened"，
+         * 表现为「CP 连得上、命令全失败」，只能重启 App 才能恢复。
+         */
+        try {
+            channel.setCommand(command);
+            InputStream in = channel.getInputStream();
+            channel.connect(20000);
 
-        ByteArrayOutputStream out = new ByteArrayOutputStream();
-        byte[] buf = new byte[8192];
-        int n;
-        while (true) {
-            while ((n = in.read(buf)) > 0) {
-                out.write(buf, 0, n);
+            ByteArrayOutputStream out = new ByteArrayOutputStream();
+            byte[] buf = new byte[8192];
+            int n;
+            while (true) {
+                while ((n = in.read(buf)) > 0) {
+                    out.write(buf, 0, n);
+                }
+                if (channel.isClosed()) {
+                    if (in.available() > 0) continue;
+                    break;
+                }
+                try { Thread.sleep(50); } catch (InterruptedException ignored) {}
             }
-            if (channel.isClosed()) {
-                if (in.available() > 0) continue;
-                break;
-            }
-            try { Thread.sleep(50); } catch (InterruptedException ignored) {}
+            return out.toString("UTF-8");
+        } finally {
+            try { channel.disconnect(); } catch (Throwable ignored) {}
         }
-        channel.disconnect();
-        return out.toString("UTF-8");
     }
 
     /**

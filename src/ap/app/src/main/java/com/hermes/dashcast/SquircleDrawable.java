@@ -24,13 +24,14 @@ import android.graphics.drawable.Drawable;
  * 阴影来源：ShipSwift SWKPICard.swift:145
  *   .shadow(color: .black.opacity(0.04), radius: 6, x: 0, y: 2)
  *
- * ── 阴影为什么不用 setShadowLayer ──
+ * ── 阴影为什么不用 setShadowLayer（本类不画阴影，这条是给 StatusCardDrawable 的）──
  *   Paint.setShadowLayer 只在软件层（LAYER_TYPE_SOFTWARE）生效。
  *   Drawable 挂在 View 背景上，View 默认硬件加速，阴影会被直接忽略。
  *   给每个 View 关硬件加速会掉帧，车机上代价太大。
  *
- *   所以用「多层填充轮廓」：从外到内逐层收缩、透明度递增，
+ *   正确做法是「多层填充轮廓」：从外到内逐层收缩、透明度递增，
  *   叠起来就是从边缘向外淡出的柔和投影，全程硬件加速。
+ *   卡片阴影走的就是这条路子 —— 见 StatusCardDrawable.draw()。
  */
 public class SquircleDrawable extends Drawable {
 
@@ -54,9 +55,6 @@ public class SquircleDrawable extends Drawable {
     private final float extension;
 
     /* 阴影参数 */
-    private float shadowRadius = 0f;
-    private float shadowDy = 0f;
-    private int shadowColor = 0;
 
     private int alpha = 255;
 
@@ -87,14 +85,6 @@ public class SquircleDrawable extends Drawable {
         shadowPaint.setStyle(Paint.Style.FILL);
     }
 
-    /** 设置阴影（浅色 UI 的层级全靠它） */
-    public void setShadow(float radius, float dy, int color) {
-        this.shadowRadius = radius;
-        this.shadowDy = dy;
-        this.shadowColor = color;
-        invalidateSelf();
-    }
-
     @Override
     public void draw(Canvas canvas) {
         Rect b = getBounds();
@@ -109,31 +99,16 @@ public class SquircleDrawable extends Drawable {
         float h = bounds.height();
 
         /*
-         * ── ① 阴影：只在下方/右侧扩展 ──
+         * **本类不画阴影**（2026-11-07，原实现从未启用过）。
          *
-         * **关键约束**：Drawable 会被 View 裁剪到自身边界内。
-         * 阴影如果向左/向上扩展（bounds.left - grow），那部分直接被裁掉，
-         * 结果就是一条贴着卡片下沿的暗带 —— 既不是阴影，还把内容压扁。
+         * 历史上这里有一套多层偏移的阴影代码，但三个构造函数都不设置
+         * 阴影参数（shadowRadius 恒为 0），draw() 里的判断永远不成立 ——
+         * 也就是从来没画出来过。卡片阴影实际由 StatusCardDrawable 提供。
          *
-         * 所以阴影轮廓的左上角**钉在 bounds 原点**，只向右下两方向长，
-         * 靠 shadowDy 制造"投影在下方"的观感。
+         * 保留这条教训：Drawable 会被 View 裁剪到自身边界内，
+         * 阴影若向左/上扩展会被裁掉，只剩贴着下沿的一条暗带。
+         * 将来若要给本类加阴影，轮廓左上角必须钉在 bounds 原点。
          */
-        int baseAlpha = (shadowColor >>> 24) & 0xFF;
-        if (shadowRadius > 0f && baseAlpha > 0) {
-            int layers = Math.max(2, (int) shadowRadius);
-            for (int li = layers - 1; li >= 0; li--) {
-                float grow = li + 1f;
-                int a1 = (int) (baseAlpha * 0.55f * (1f - (float) li / layers));
-                if (a1 <= 0) continue;
-                shadowPaint.setColor(shadowColor);
-                shadowPaint.setAlpha(a1);
-                /* 轮廓：左/上不动，向右/下各长 grow */
-                buildPathInto(tmpPath, w + grow, h + grow, cornerRadius + grow * 0.5f);
-                tmpPath.offset(bounds.left, bounds.top + shadowDy);
-                canvas.drawPath(tmpPath, shadowPaint);
-            }
-        }
-
         /* ── ② 主路径 ── */
         buildPathInto(path, w, h, cornerRadius);
         path.offset(bounds.left, bounds.top);

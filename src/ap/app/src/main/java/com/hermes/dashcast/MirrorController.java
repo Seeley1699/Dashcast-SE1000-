@@ -34,12 +34,43 @@ public class MirrorController {
 
     private static final String TAG = "DashcastMirror";
 
+    /**
+     * 限流日志（2026-11-06）。ADB 命令失败常成串出现，其中部分 catch 在 300ms 循环里，
+     * 直接打日志会刷屏。同一 key 最多每 5 秒报一次，并带累计次数。
+     */
+    private static final java.util.Map<String, long[]> sWarnGate =
+            new java.util.concurrent.ConcurrentHashMap<>();
+
+    private static void warnThrottled(String key, String msg, Throwable t) {
+        long now = SystemClock.elapsedRealtime();
+        long[] slot = sWarnGate.computeIfAbsent(key, k -> new long[]{0, 0});
+        synchronized (slot) {
+            slot[1]++;
+            if (now - slot[0] < 5000) return;
+            slot[0] = now;
+            DashLog.w(TAG, msg + "（累计 " + slot[1] + " 次）: " + t);
+        }
+    }
+
     private static final String BIN = "/data/local/tmp/dcapd2";
-    private static final String BIN_MD5 = "f0ea833ddabc1bdfe071db9c404af51f";
+    private static final String BIN_MD5 = "40ee2998a9ea0f2af678aad96b887b50";
     private static final String PAUSE = "/data/local/tmp/dcapd2.pause";
     private static final String LOGF = "/data/local/tmp/dcapd2.log";
     /** 编码档位文件：App 写数字，dcapd2 每 500ms 轮询，运行时切档不重启进程 */
     private static final String CODEC_FILE = "/data/local/tmp/dc_codec";
+
+    /*
+     * **CP 接收端地址**（2026-11-07 从 DashcastSenderService 搬来）。
+     *
+     * 原来放在 DashcastSenderService 里，但那个 Service 从未被启动过
+     * （isRunning() 恒 false），整条推流链路已经是死的。
+     * 唯一还在用的是这两个常量 —— launchDaemon() 拼 dcapd2 启动命令时要用：
+     *     ./dcapd2 <...> 198.18.34.2 8444
+     *
+     * 搬到这里之后，DashcastSenderService 可以整文件删掉。
+     */
+    public static final String CP_HOST = "198.18.34.2";
+    public static final int CP_PORT = 8444;
 
     private static final String PREF_CODEC = "codec";
     private static final String PREF_FPS = "fps";
@@ -230,7 +261,16 @@ public class MirrorController {
     }
 
     private static final int DEFAULT_FPS = 30;
-    public static final int[] FPS_CHOICES = {60, DEFAULT_FPS, 25, 20, 15};
+    /*
+     * 帧率档位（2026-11-06 调整，2026-11-07 回归后补回）。
+     *
+     *   · 删掉 60 —— dcapd2 主屏抓帧实际能力上限就在 30 附近
+     *     （captureScreen 一帧 30~70ms），选 60 只会显示 60 实际跑 30
+     *   · 加 10  —— 最低功耗档，长时间跑或热天用
+     *
+     * 顺序即按钮循环顺序。
+     */
+    public static final int[] FPS_CHOICES = {DEFAULT_FPS, 25, 20, 15, 10};
 
     private static volatile int fps = DEFAULT_FPS;
     private static volatile int codec = CODEC_BGRA;
@@ -274,8 +314,19 @@ public class MirrorController {
         /** 状态行文字；ok=true 表示正常 */
         void onState(String msg, boolean ok);
 
-        /** 每秒一次：fps / 上行 KB/s / 图块数 */
-        void onStats(int fps, int kbps, int tiles);
+        /**
+         * 每秒一次统计上报。
+         *
+         * **capture 必须一起传下去**（2026-11-06 加）。
+         *
+         * dcapd2 的 fps 语义是"有变化并推送的帧率"，不是"抓帧帧率"：
+         *   · 画面静止时 tiles=0 → frames=0 → fps=0
+         *   · 但 capture 仍是 20（每秒确实抓了 20 帧）
+         *
+         * 界面只看 fps 会把"画面静止"误判成"链路死了"。
+         * 传 capture 下去，UI 才能在 fps=0 且 capture>0 时显示"静止"。
+         */
+        void onStats(int fps, int kbps, int tiles, int capture);
 
         /** 会话被系统结束（目标 App 退出等）：界面要把"运行中"复位 */
         default void onEnded(String reason) {}
@@ -647,7 +698,7 @@ public class MirrorController {
             VdMirror.setFeedFrames(false);
             try {
                 AdbShell.exec("rm -f /data/local/tmp/dcapd2.bg", CHUNK);
-            } catch (Throwable ignored) {
+            } catch (Throwable t) { warnThrottled("rm-bg", "清除后台标志失败", t);
             }
             return;
         }
@@ -673,7 +724,7 @@ public class MirrorController {
             VdMirror.setFeedFrames(false);
             try {
                 AdbShell.exec("rm -f /data/local/tmp/dcapd2.bg", CHUNK);
-            } catch (Throwable ignored) {
+            } catch (Throwable t) { warnThrottled("rm-bg", "清除后台标志失败", t);
             }
             return;
         }
@@ -683,7 +734,7 @@ public class MirrorController {
             vd.stop(false);
             try {
                 AdbShell.exec("rm -f /data/local/tmp/dcapd2.bg", CHUNK);
-            } catch (Throwable ignored) {
+            } catch (Throwable t) { warnThrottled("rm-bg", "清除后台标志失败", t);
             }
             /*
              * ══════════════════════════════════════════════════════════
@@ -724,7 +775,7 @@ public class MirrorController {
             republishVdCrop();
             try {
                 AdbShell.exec("touch /data/local/tmp/dcapd2.bg", CHUNK);
-            } catch (Throwable ignored) {
+            } catch (Throwable t) { warnThrottled("touch-bg", "设置后台标志失败（仪表可能掉到桌面）", t);
             }
         }
     }
@@ -746,7 +797,22 @@ public class MirrorController {
      * 且两个方法内部都没有会再拿这把锁的调用（vd.* 是另一个对象），
      * 不会自锁。
      */
-    private void exitBg() {
+    /*
+     * **必须是 synchronized**（2026-11-07 修：修饰符在某次重构中丢了）。
+     *
+     * 下面原注释就写着「加 synchronized 后两者互斥」，但代码里已经没有。
+     *
+     * 后果（原注释描述的正是这个）：
+     *   · 线程 A（loop）正在 enterBg 里建虚拟屏、setFeedFrames(true)
+     *   · 线程 B（判死路径）调 exitBg：bgMode=false、
+     *     vd.stop(true) 把刚建好的屏拆了、setFeedFrames(false)
+     *   · A 接着往下跑：把 App 搬进一块已经被拆掉的虚拟屏
+     *   → 日志「App 已转后台（虚拟屏 N）」紧跟「退出后台跟随模式」，
+     *     N 已经不存在，后续当然"无帧"。
+     *
+     * 锁对象是 this，与 enterBg 一致；两者内部都不会再拿这把锁，不会自锁。
+     */
+    private synchronized void exitBg() {
         if (!bgMode) return;
         bgMode = false;
         /* 退出跟随 = 上一轮观察窗口作废，下次 enterBg 会重新计时 */
@@ -894,7 +960,7 @@ public class MirrorController {
                     state("正在打开目标 App…", false);
                     try {
                         AdbShell.exec("am start --display 0 -n " + component, 6000);
-                    } catch (Throwable ignored) {
+                    } catch (Throwable t) { warnThrottled("am-start0", "拉到主屏失败", t);
                     }
                     graceAt[0] = SystemClock.elapsedRealtime();   /* 刚拉起，重新计时 */
                     sleep(1000);
@@ -1287,19 +1353,29 @@ public class MirrorController {
                         + " @ (" + cap[0] + "," + cap[1] + ")");
             }
 
+            /*
+             * **重启 dcapd2 会截断日志**（`> LOGF`），
+             * 所以切档前记的基线行号在这里失效（旧行号 > 新文件行数）。
+             *
+             * awaitCodecSwitched 里用 `tail -n +N`，N 大于总行数时输出为空 ——
+             * 那反而正好：新日志从第 1 行起，标记一旦出现就能被 grep 到。
+             * 但基线不会被清零，所以这里显式重置，避免后续误用。
+             */
+            sCodecLogBaseline = 0;
+
             String cmd = "rm -f " + PAUSE + "; pkill -x dcapd2; "
                     + "cd /data/local/tmp && nohup ./dcapd2 "
                     + s[0] + " " + s[1] + " "
                     + cap[0] + " " + cap[1] + " " + cap[2] + " " + cap[3] + " "
                     + getOutputW() + " " + getOutputH() + " "
-                    + DashcastSenderService.CP_HOST + " " + DashcastSenderService.CP_PORT
+                    + CP_HOST + " " + CP_PORT
                     + " " + fps + " " + codec
                     + " " + (hud ? HUD_PHYSICAL_INDEX : -1)   /* argv[13]：抓哪块屏 */
                     + " > " + LOGF + " 2>&1 &";
             try {
                 // 命令以 & 结尾，adbd 那边不会立刻关流，这里超时是正常现象
                 AdbShell.exec(cmd, 2500);
-            } catch (Throwable ignored) {
+            } catch (Throwable t) { warnThrottled("adhoc-cmd", "执行 ADB 命令失败", t);
             }
 
             // 轮询到 3 秒：车机负载高时 dcapd2 起来要一两秒，单次判定会误报失败
@@ -1325,7 +1401,7 @@ public class MirrorController {
             try {
                 AdbShell.exec("touch /data/local/tmp/dc_force", 2000);
                 DashLog.i(TAG, "已请求整屏全量重画");
-            } catch (Throwable ignored) {
+            } catch (Throwable t) { warnThrottled("dc-force", "触发强制重绘失败", t);
             }
         }, "force-full").start();
     }
@@ -1874,11 +1950,6 @@ public class MirrorController {
         }, "warm-screenpx").start();
     }
 
-    /** 清掉屏幕尺寸缓存（分辨率变化时调） */
-    public static void clearScreenPxCache() {
-        MirrorController c = sActive;
-        if (c != null) c.cachedScreenPx = null;
-    }
 
     /**
      * **目标 App 的窗口是否还在**（2026-11-06 方案 A）。
@@ -1892,18 +1963,40 @@ public class MirrorController {
      *   ② 按 HOME 时：窗口还在就别搬虚拟屏（搬不动系统 App，
      *      而且搬不动会导致仪表掉到桌面）
      */
+    /*
+     * **hasTargetWindow 必须限流缓存**（2026-11-07）。
+     *
+     * 主循环 sleep(300)，而 1188 行那个条件里 `fgIsTarget` 是缓存的
+     * （1.5 秒一次），只有它为 false 时才会求值到 hasTargetWindow() ——
+     * **按 HOME 之后 fgIsTarget 恰好就是 false**，也就是最需要快速响应的时刻。
+     *
+     * 原来每次都是真跑 `dumpsys window windows | grep | grep -c`（超时 5 秒），
+     * 结果：
+     *   · 循环周期从 300ms 劣化到 400~800ms
+     *   · 每秒多 3 条完整 dumpsys + 3 条 ADB 连接
+     *   · adbd 一旦卡住，整个 loop 陪它一起阻塞
+     *
+     * 窗口是否存在是慢变量（App 退出/销毁才会变），1.5 秒采样足够。
+     */
+    private static final long WINDOW_CHECK_MS = 1500;
+    private volatile long lastWindowCheckAt = 0;
+    private volatile boolean lastWindowCheckResult = false;
+
     private boolean hasTargetWindow() {
         if (pkg == null) return false;
+        long now = SystemClock.elapsedRealtime();
+        if (now - lastWindowCheckAt < WINDOW_CHECK_MS) return lastWindowCheckResult;
+        lastWindowCheckAt = now;
         try {
             String out = AdbShell.exec(
                     "dumpsys window windows | grep 'Window{' | grep -c '" + pkg + "'", 5000);
             if (out == null) return false;
             int n = 0;
             try { n = Integer.parseInt(out.trim().replaceAll("[^0-9]", "")); } catch (Throwable ignored) {}
-            return n > 0;
+            return lastWindowCheckResult = (n > 0);
         } catch (Throwable t) {
             DashLog.w(TAG, "查目标窗口失败: " + t);
-            return false;
+            return lastWindowCheckResult = false;
         }
     }
 
@@ -1971,7 +2064,7 @@ public class MirrorController {
         try {
             String out = AdbShell.exec("pidof dcapd2", CHUNK);
             return out != null && out.trim().length() > 0;
-        } catch (Throwable ignored) {
+        } catch (Throwable t) { warnThrottled("pidof-dc", "查 dcapd2 进程失败", t);
             return false;
         }
     }
@@ -1982,7 +2075,7 @@ public class MirrorController {
             String out = AdbShell.exec("pidof " + pkg, 4000);
             if (out != null) return out.trim().length() > 0;
             return false;
-        } catch (Throwable ignored) {
+        } catch (Throwable t) { warnThrottled("target-alive", "查目标存活失败", t);
             return true;   // 查不到就假设还活着，避免误判导致投屏被结束
         }
     }
@@ -2010,7 +2103,7 @@ public class MirrorController {
                 }
             }
             return null;
-        } catch (Throwable ignored) {
+        } catch (Throwable t) { warnThrottled("win-rect", "读窗口矩形失败", t);
             return null;
         }
     }
@@ -2167,8 +2260,8 @@ public class MirrorController {
     }
 
     public void setFps(Context c, int f) {
-        if (f < 5) f = 5;
-        if (f > 120) f = 120;
+        if (f < 10) f = 10;
+        if (f > 60) f = 60;
         /*
          * **帧率没变就别重启 dcapd2**（2026-11-05）。
          *
@@ -2201,7 +2294,7 @@ public class MirrorController {
 
     private static void loadFps(Context c) {
         int f = prefs(c).getInt(PREF_FPS, DEFAULT_FPS);
-        if (f < 5 || f > 120) f = DEFAULT_FPS;
+        if (f < 10 || f > 60) f = DEFAULT_FPS;
         fps = f;
     }
 
@@ -2273,10 +2366,31 @@ public class MirrorController {
                  * 只数**基线之后**的行 —— 日志里本来就有历史切换记录，
                  * 从头 grep 会永远命中，等于没等。
                  */
+                /*
+                 * **不能只等「编码档切换完成」那一句**（2026-11-06 追根因）。
+                 *
+                 * 那句话只在**运行时切档**（codec_poll 检测到文件变化）时打印。
+                 * 但 App 切档有两种路径：
+                 *
+                 *   ① 重启 dcapd2 —— 把 codec 作为 argv[12] 传进去，
+                 *      dcapd2 一启动 g_codec 就是目标值，codec_poll 里
+                 *      `want == g_codec` 直接 return 0，那句话**永远不出现**。
+                 *   ② 运行时轮询 —— 才走 codec_poll 那条路径，才会打印。
+                 *
+                 * 日志实证：dcapd2.log 里「编码档切换完成」出现 0 次，
+                 * 而 H.264 明明已经就绪：
+                 *   H.264 就绪 528x416 @20fps 2150kbps
+                 *
+                 * 所以判据改成「两种标记都算成功」：
+                 *   · 编码档切换完成        ← 路径 ②
+                 *   · H.264 就绪            ← 路径 ①（H.264 档的实际信号）
+                 *   · 编码档运行时切换      ← 路径 ② 的前半句
+                 */
+                String marker = "'编码档切换完成|H.264 就绪|编码档运行时切换'";
                 String cmd = baseline > 0
                         ? "tail -n +" + (baseline + 1) + " " + LOGF
-                            + " 2>/dev/null | grep -c '编码档切换完成'"
-                        : "tail -n 40 " + LOGF + " 2>/dev/null | grep -c '编码档切换完成'";
+                            + " 2>/dev/null | grep -cE " + marker
+                        : "tail -n 40 " + LOGF + " 2>/dev/null | grep -cE " + marker;
                 String out = AdbShell.exec(cmd, 2000);
                 if (out != null) {
                     int n = 0;
@@ -2419,7 +2533,7 @@ public class MirrorController {
             String out = AdbShell.exec("tail -3 " + LOGF, 4000);
             if (out == null) return;
             parseStats(out);
-        } catch (Throwable ignored) {
+        } catch (Throwable t) { warnThrottled("parse-stats", "解析统计失败", t);
         }
     }
 
@@ -2457,7 +2571,7 @@ public class MirrorController {
             }
             if (last == null) return;
 
-            if (listener != null) listener.onStats(f, k, t);
+            if (listener != null) listener.onStats(f, k, t, cap);
 
             /*
              * ══════════════════════════════════════════════════════════════
@@ -2525,7 +2639,7 @@ public class MirrorController {
                     }
                 }, "cp-log").start();
             }
-        } catch (Throwable ignored) {
+        } catch (Throwable t) { warnThrottled("read-stats", "读统计异常", t);
         }
     }
 
@@ -2542,7 +2656,7 @@ public class MirrorController {
     private void clearPause() {
         try {
             AdbShell.exec("rm -f " + PAUSE, CHUNK);
-        } catch (Throwable ignored) {
+        } catch (Throwable t) { warnThrottled("rm-pause", "清除暂停标志失败", t);
         }
     }
 

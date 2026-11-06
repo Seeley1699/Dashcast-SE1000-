@@ -975,9 +975,27 @@ public class LayerPreviewView extends View {
     }
 
     /** 供外部强制同步一次遮罩比例（绕过拖拽的路径要调） */
+    /**
+     * 立刻把遮罩比例对齐到截取区比例（并**落盘**）。
+     *
+     * **必须落盘**（2026-11-06 修）。
+     *
+     * 原来这里只改内存里的 cfg：syncMaskAspectToCrop() 改宽高、
+     * sanitize() 夹边界、invalidate() 重绘 —— 看起来是生效了，
+     * 但 MirrorController 校验比例时读的是 **prefs**：
+     *
+     *     LayerConfig.loadFromPrefs(ctx, ...) → 比 w/h 与遮罩比例
+     *
+     * 内存改了、prefs 没改 → 它读到的还是旧值，于是日志一直报
+     *   「H.264 截取比例与遮罩不一致 src=1.400 box=1.269 偏差 10.3%」
+     * 而 dcapd2 照旧把内容拉伸铺满遮罩 —— 用户看到画面变形。
+     *
+     * 加上 saveToPrefs 之后，两条读取路径看到的是同一份数据。
+     */
     public void syncMaskAspectNow() {
         syncMaskAspectToCrop();
         cfg.sanitize();
+        cfg.saveToPrefs(getContext());
         invalidate();
     }
 
@@ -995,18 +1013,6 @@ public class LayerPreviewView extends View {
         return snapEnabled;
     }
 
-    /** 让遮罩一键铺满整块画布（画布尺寸已跟着仪表真实分辨率走） */
-    public void fillCanvas() {
-        cfg.x = 0;
-        cfg.y = 0;
-        cfg.w = cfg.canvasW;
-        cfg.h = cfg.canvasH;
-        cfg.fit = 0;
-        cfg.enabled = true;
-        cfg.sanitize();
-        invalidate();
-        notifyChanged();
-    }
 
     /** 画布尺寸变了（CP 分辨率换过）→ 重新夹一遍遮罩 */
     public void setCanvasSize(int w, int h) {

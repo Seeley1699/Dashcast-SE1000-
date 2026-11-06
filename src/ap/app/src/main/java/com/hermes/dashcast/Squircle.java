@@ -72,37 +72,6 @@ public final class Squircle {
         return border(fillColorRes, R.color.surface_border, 1f, R_CARD);
     }
 
-    /**
-     * 卡片（ShipSwift SWKPICard 规范）：白底 + 极淡描边 + 阴影。
-     *
-     * SWKPICard.swift:139-149:
-     *   .padding(14)
-     *   RoundedRectangle(cornerRadius: 16).fill(systemBackground)
-     *   .shadow(.black.opacity(0.04), radius: 6, y: 2)
-     *   .overlay(RoundedRectangle(16).stroke(tint.opacity(0.15), 1))
-     *
-     * **阴影是浅色 UI 唯一的层级线索** —— 白卡片浮在 #F5F5F5 页面上，
-     * 没有阴影就完全分不出边界。
-     */
-    public Drawable cardShadow(int fillColorRes) {
-        SquircleDrawable d = new SquircleDrawable(
-                col(fillColorRes), px(R_CARD),
-                col(R.color.surface_border), px(1f));
-        /* SWKPICard: radius 6, y 2 */
-        d.setShadow(px(6f), px(2f), col(R.color.card_shadow));
-        return d;
-    }
-
-    /** 卡片：填充 + 1dp 描边 + 按下态浅一档 */
-    public Drawable cardStateful(int fillColorRes, int pressColorRes) {
-        StateListDrawable sl = new StateListDrawable();
-        sl.addState(new int[]{android.R.attr.state_pressed},
-                border(pressColorRes, R.color.surface_border, 1f, R_CARD));
-        sl.addState(new int[]{},
-                border(fillColorRes, R.color.surface_border, 1f, R_CARD));
-        return sl;
-    }
-
     /** 主按钮：实底强调色（按下深一档） */
     public Drawable primaryButton() {
         StateListDrawable sl = new StateListDrawable();
@@ -136,10 +105,5 @@ public final class Squircle {
     /** 透明填充 + 描边（危险按钮用） */
     public Drawable borderTransparent(int strokeColorRes, float strokeDp, float radiusDp) {
         return new SquircleDrawable(0, px(radiusDp), col(strokeColorRes), px(strokeDp));
-    }
-
-    /** 小标签（Tab / badge） */
-    public Drawable tab(int fillColorRes) {
-        return border(fillColorRes, R.color.surface_border, 1f, R_TAB);
     }
 }

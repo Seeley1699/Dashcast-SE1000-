@@ -312,8 +312,28 @@ int h264_enc_open(int tcp_fd, int dw, int dh, int kbps, int fps) {
     media_status_t st = AMediaCodec_configure(g_enc, fmt, NULL, NULL,
                                               AMEDIACODEC_CONFIGURE_FLAG_ENCODE);
     AMediaFormat_delete(fmt);
-    if (st != AMEDIA_OK) { LOGE("encoder configure 失败 %d", (int) st); return -1; }
-    if (AMediaCodec_start(g_enc) != AMEDIA_OK) { LOGE("encoder start 失败"); return -1; }
+    /*
+     * **失败路径必须把 g_enc 释放掉**（2026-11-07 修资源泄漏）。
+     *
+     * 原来这两条只 `return -1`，g_enc 仍是非 NULL 的悬挂实例：
+     *   · 下次 h264_enc_open() 在 309 行直接覆盖它 → 前一个 codec 永久泄漏
+     *   · 车机上反复切 H.264 档会持续消耗 MediaCodec 实例
+     *   · 最终 createEncoderByType 返回 NULL，切档彻底失效（只有重启 App 能恢复）
+     *
+     * h264_enc_close() 里会判断 g_enc 再删，所以这里先置 NULL 就不会重复释放。
+     */
+    if (st != AMEDIA_OK) {
+        LOGE("encoder configure 失败 %d", (int) st);
+        AMediaCodec_delete(g_enc);
+        g_enc = NULL;
+        return -1;
+    }
+    if (AMediaCodec_start(g_enc) != AMEDIA_OK) {
+        LOGE("encoder start 失败");
+        AMediaCodec_delete(g_enc);
+        g_enc = NULL;
+        return -1;
+    }
 
     /* 编码器会把它真正接受的 stride / slice-height / color-format 报回来，
      * 必须按它给的写，不能想当然用 w*h。 */
@@ -399,8 +419,18 @@ int h264_enc_feed(const uint8_t *bgra, int sw, int sh) {
 }
 
 /* 把编码器里已经好了的帧全部取出来发走 */
-void h264_enc_drain(void) {
-    if (!g_enc) return;
+/*
+ * **返回 0=正常，-1=写码流失路（链路断了）**（2026-11-07 改）。
+ *
+ * 原来是 void：send_access_unit 失败时只 LOGE 一句就 return，
+ * 主循环完全不知道 —— dcapd2.c 那边照常 frames++，fps 统计虚高，
+ * 而画面其实早就没在推了。
+ *
+ * 对比 BGRA 分支（enc_push 返回 -1 时主循环会断连重连），
+ * H.264 档缺这条恢复路径：CP 断开后一直推空气，用户看不出问题。
+ */
+int h264_enc_drain(void) {
+    if (!g_enc) return 0;
     for (;;) {
         AMediaCodecBufferInfo info;
         ssize_t oi = AMediaCodec_dequeueOutputBuffer(g_enc, &info, 0);
@@ -429,7 +459,8 @@ void h264_enc_drain(void) {
             } else {
                 if (send_access_unit(p, n) != 0) {
                     LOGE("写码流失路（CP 断了？）");
-                    return;
+                    AMediaCodec_releaseOutputBuffer(g_enc, oi, false);
+                    return -1;      /* 让主循环断连重连 */
                 }
                 g_frames++;
                 g_stat_frames++;
@@ -453,6 +484,7 @@ void h264_enc_drain(void) {
             g_stat_bytes = g_bytes;
         }
     }
+    return 0;
 }
 
 void h264_enc_stats(long *frames, long *bytes) {

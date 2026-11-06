@@ -24,7 +24,7 @@ import java.util.Locale;
  * LayerEditorActivity —— 可视化图层布局编辑器
  *
  * 上半屏是实时预览（拖拽移动、拖角缩放，网格吸附），下半屏是参数面板：
- * 网格 / 形状 / DPI / 边框 / 四角圆角 / 梯形上下沿 / 羽化。
+ * 网格 / 形状 / 边框 / 四角圆角 / 梯形上下沿 / 羽化。
  *
  * 调参即时写 /data/local/tmp/dcapd2.layer，dcapd2 每 500ms 查 mtime，
  * 所以仪表上能边调边看 —— 不用重启抓帧进程。
@@ -42,9 +42,9 @@ public class LayerEditorActivity extends Activity {
     private TextView infoText;
 
     /* 参数控件 */
-    private SeekBar sbGrid, sbDpi, sbBorder, sbTl, sbTr, sbBl, sbBr,
+    private SeekBar sbGrid, sbBorder, sbTl, sbTr, sbBl, sbBr,
                     sbTrapTop, sbTrapBot, sbFeather;
-    private TextView tvGrid, tvDpi, tvBorder, tvTl, tvTr, tvBl, tvBr,
+    private TextView tvGrid, tvBorder, tvTl, tvTr, tvBl, tvBr,
                      tvTrapTop, tvTrapBot, tvFeather;
     private Button btnShape, btnFit, btnFps;
     /** 帧率草稿：改了先存这里，点「保存并应用」才提交 */
@@ -59,14 +59,19 @@ public class LayerEditorActivity extends Activity {
         pendingFps = MirrorController.getFps();   /* 草稿初值 = 当前实际值 */
         mCtl = new MirrorController(getApplicationContext(), new CpManager(this));
 
-        /* 注入 CpManager，让 cfg.pushAsync() 能同步 ivi 图层矩形；
-         * 进编辑器时也同步一次，保证"打开就能看到当前效果"。 */
-        try {
-            LayerConfig.attachCp(new CpManager(this));
-            /* 只改内存，点「保存」才落盘并同步仪表 */
-        } catch (Throwable t) {
-            DashLog.w("DashcastLayerUI", "同步图层矩形失败: " + t);
-        }
+        /*
+         * **不要在这里再 new 一个 CpManager**（2026-11-07 去冗余）。
+         *
+         * 上面第 60 行 `new MirrorController(getApplicationContext(), new CpManager(this))`
+         * 的构造里已经调过 LayerConfig.attachCp(cp)（MirrorController.java:396），
+         * CpManager 也被 mCtl 持有着。这里再 new 一个是白建：
+         *   · 多算一次 assets 的 MD5（computeLocalMd5 在构造里跑，几十毫秒）
+         *   · 多占一份 JSch 状态
+         *   · 而且是同一个静态字段 sCp 被覆盖两次
+         *
+         * 注释里原本想要的"进编辑器时同步一次图层矩形"，
+         * 由 mCtl 构造里那次 attachCp + 后续 pushAsync 覆盖，不需要额外动作。
+         */
 
         ScrollView scroll = new ScrollView(this);
         scroll.setFillViewport(true);
@@ -119,7 +124,7 @@ public class LayerEditorActivity extends Activity {
         infoText.setPadding(dp(4), dp(6), 0, dp(10));
         root.addView(infoText);
 
-        /* ── 形状 + 网格 + DPI ── */
+        /* ── 形状 + 网格 ── */
         root.addView(section("形状与网格"));
 
         LinearLayout row1 = row();
@@ -153,10 +158,6 @@ public class LayerEditorActivity extends Activity {
         sbGrid = addSlider(root, "网格", 4, 128, cfg.grid, "px",
                 v -> { cfg.grid = v; refresh(); });
         tvGrid = lastSliderValue;
-
-        sbDpi = addSlider(root, "DPI", 80, 480, cfg.dpi, "",
-                v -> { cfg.dpi = v; refresh(); });
-        tvDpi = lastSliderValue;
 
         /* ── 边框与圆角（两列网格，省纵向空间） ── */
         root.addView(section("边框与圆角"));
@@ -437,7 +438,6 @@ public class LayerEditorActivity extends Activity {
     /** 把 cfg 数值回写到控件（"恢复全屏"等批量改动后调用） */
     private void syncControls() {
         sbGrid.setProgress(cfg.grid - 4);
-        sbDpi.setProgress(cfg.dpi - 80);
         sbBorder.setProgress(cfg.border);
         sbTl.setProgress(cfg.rTl);
         sbTr.setProgress(cfg.rTr);
@@ -447,7 +447,6 @@ public class LayerEditorActivity extends Activity {
         sbTrapBot.setProgress(cfg.trapBot);
         sbFeather.setProgress(cfg.feather);
         tvGrid.setText(cfg.grid + "px");
-        tvDpi.setText("" + cfg.dpi);
         tvBorder.setText("" + cfg.border);
         tvTl.setText(cfg.rTl + "°");
         tvTr.setText(cfg.rTr + "°");

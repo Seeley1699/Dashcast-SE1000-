@@ -56,10 +56,6 @@
             </intent-filter>
         </activity>
 
-        <service
-            android:name=".DashcastSenderService"
-            android:foregroundServiceType="mediaProjection|dataSync"
-            android:exported="false" />
 
         <!-- 镜像模式：只用来把进程钉在前台，逻辑在 Activity 进程里 -->
         <service

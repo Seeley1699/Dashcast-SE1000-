@@ -76,11 +76,36 @@ private static final int CMD_VCROP = 0x50564344;
 /* 'DCSR':主屏抓取区热更新(16 字节 x,y,w,h,屏幕坐标) */
 private static final int CMD_SRC = 0x52534344;
 
-    private static final long MIN_INTERVAL = 33;   // 30fps 上限，省 CPU（dcapd2 还会再限一次）
+    /*
+     * **帧间隔必须跟着用户设的 fps 走**（2026-11-06 修）。
+     *
+     * 原来写死 33ms（= 30fps 上限）。后果：
+     *   · 用户设 60 → 仍被压到 30，调了白调
+     *   · 用户设 25/20/15/10 → 仍然是 30，比想要的更快，白耗电和带宽
+     *
+     * 也就是说后台跟随时帧率永远是 30，那一排帧率按钮只对主屏模式有效。
+     *
+     * 改成按 MirrorController.getFps() 实时算：
+     *   interval = 1000 / fps
+     * 30fps → 33ms，15fps → 66ms，10fps → 100ms，与主屏路径一致。
+     * 用 volatile 读，改帧率后下一帧就生效，不用重启进程。
+     */
+    private static long frameIntervalMs() {
+        int f = MirrorController.getFps();
+        if (f < 1) f = 30;
+        return Math.max(1, 1000L / f);
+    }
 
-    /** flags 的取舍见 DashcastSenderService.createVirtualDisplay 的注释：
-     *  只要不带 AUTO_MIRROR 就不需要任何权限。PUBLIC|OWN_CONTENT_ONLY 是
-     *  给"别的 App 的 task 要搬进来"留的一档 —— 私有屏不一定收外人。 */
+    /*
+     * **flags 的取舍**（原注释引自已删除的 DashcastSenderService，2026-11-07 内联）：
+     *
+     * 只要不带 AUTO_MIRROR 就不需要任何权限 —— 这是本 App 零授权投屏的关键。
+     * createVirtualDisplay 本身是公开 API，flags 里一旦没有 AUTO_MIRROR，
+     * 系统就不会去校验 CAPTURE_VIDEO_OUTPUT。
+     *
+     * PUBLIC|OWN_CONTENT_ONLY 这一档是给"别的 App 的 task 要搬进来"留的：
+     * 私有屏不一定收外人，加 PUBLIC 才能把目标 App 的栈搬上去。
+     */
     private static final int PUB = DisplayManager.VIRTUAL_DISPLAY_FLAG_PUBLIC;
     private static final int OWN = DisplayManager.VIRTUAL_DISPLAY_FLAG_OWN_CONTENT_ONLY;
 
@@ -115,6 +140,24 @@ private static final int CMD_SRC = 0x52534344;
         this.ctx = ctx.getApplicationContext();
     }
 
+
+    /**
+     * **pkg 的 task 是否还在本机虚拟屏上**（2026-11-06）。
+     *
+     * 用途：主循环的"目标回前台 → exitBg"判定需要二次确认。
+     *
+     * 日志实证（dashcast-7.log）：move-stack 已把 task 搬到虚拟屏 10，
+     * 但 foregroundPkg() 仍返回 com.ecarx.navi，
+     * 导致每 3 秒就误判一次"目标回前台"，退出后台跟随 ——
+     * 用户看到的"锁不住"就是这个循环。
+     *
+     * task 的实际所在屏是可以直接查到的（am stack list），
+     * 比 dumpsys 的焦点字段可靠。所以这里把判断交给它。
+     */
+    public boolean isTaskOnOurDisplay(String pkg) {
+        if (displayId < 0) return false;
+        return taskOnDisplay(pkg, displayId);
+    }
     public int getDisplayId() {
         return displayId;
     }
@@ -506,10 +549,38 @@ private static final int CMD_SRC = 0x52534344;
                 ? component.substring(0, component.indexOf('/')) : component;
 
         /*
+         * ══════════════════════════════════════════════════════════════
+         * **已经在目标屏上就别再搬**（2026-11-06 修「按 HOME 后投到 home」）
+         * ══════════════════════════════════════════════════════════════
+         *
+         * 日志实证（dashcast-4.log 13:21:28）：
+         *   move-stack 1102110 → 8: Exception ...
+         *       java.lang.IllegalArgumentException: Trying to move stack
+         *   move-stack 返回异常内容，退回 am start --display
+         *   App 已转后台（虚拟屏 8）              ← 仍然报成功
+         *
+         * 那句话的真意是"这个 stack 已经在 display 8 上了，不用再搬"，
+         * 不是故障。但代码把它当失败，退到 `am start --display 8` ——
+         * **重启了一个本来就在位的 App**。
+         *
+         * 重启的后果正是用户看到的现象：
+         *   · App 在主屏重新拉起一个实例 → 虚拟屏里内容错乱
+         *   · 主屏上出现 App 但很快又被 HOME 盖成桌面
+         *   · 仪表上跟着出现桌面
+         *
+         * 修法：先查一次「这个 pkg 的 task 是不是已经在 displayId 上」。
+         * 是的话直接返回成功，不搬、不重启。
+         */
+        if (taskOnDisplay(pkg, displayId)) {
+            DashLog.i(TAG, pkg + " 的 task 已在虚拟屏 " + displayId + "，无需搬运");
+            return true;
+        }
+
+        /*
          * ① 找 task：**不排除任何 display**。
          *    App 现在可能还在主屏（displayId=0），正是要把它搬走的时候。
          *    原来 findTaskId(pkg, displayId) 排除"已在目标屏"，是对的，
-         *    但那种情况本来就该跳过 —— 这里改成分开判断。
+         *    但那种情况本来就该跳过 —— 上面已经处理了。
          */
         int taskId = -1;
         for (int attempt = 1; attempt <= 3; attempt++) {
@@ -530,9 +601,28 @@ private static final int CMD_SRC = 0x52534344;
                 DashLog.i(TAG, "move-stack " + taskId + " → " + displayId + ": "
                         + (r == null ? "null" : r.trim().replace('\n', ' ')));
                 if (r != null && !r.contains("Exception") && !r.contains("Error")) {
-                    return true;
+                    /*
+                     * **返回空/正常也要复核**（2026-11-06）。
+                     *
+                     * `am display move-stack` 在"栈已经在目标屏上"、
+                     * 或系统拒绝但没抛异常时，都可能返回空字符串。
+                     * 原来一律 return true，上层据此 touch dcapd2.bg
+                     * 进入跟随模式，可虚拟屏里其实没有 App ——
+                     * 于是"跟随成功但拿不到帧"。
+                     *
+                     * 回读 am stack list 确认任务真的落到 displayId 上。
+                     */
+                    if (taskOnDisplay(pkg, displayId)) {
+                        DashLog.i(TAG, "move-stack 复核通过：" + pkg
+                                + " 的 task 已在虚拟屏 " + displayId);
+                        return true;
+                    }
+                    DashLog.w(TAG, "move-stack 返回正常但复核失败："
+                            + pkg + " 的 task 不在虚拟屏 " + displayId
+                            + "，退回 am start --display");
+                } else {
+                    DashLog.w(TAG, "move-stack 返回异常内容，退回 am start --display");
                 }
-                DashLog.w(TAG, "move-stack 返回异常内容，退回 am start --display");
             } catch (Throwable t) {
                 DashLog.w(TAG, "move-stack 抛异常: " + t);
             }
@@ -705,7 +795,7 @@ private static final int CMD_SRC = 0x52534344;
 
             try {
                 long now = SystemClock.elapsedRealtime();
-                if (now - lastSend < MIN_INTERVAL) return;   // 跳帧
+                if (now - lastSend < frameIntervalMs()) return;   // 按当前 fps 跳帧
 
                 /*
                  * **关闭窗口期必须再查一次 sending**（2026-11-05）。
@@ -726,8 +816,23 @@ private static final int CMD_SRC = 0x52534344;
                 if (!sending) return;
                 /* 只有真的在虚拟屏模式才喂帧 —— 否则 dcapd2 会切到空的 VD 源 */
                 if (!sFeedFrames || !ensureConnected()) return;
+                /*
+                 * **lastSend 必须记「发送完成」的时刻**（2026-11-06 修帧率偏低）。
+                 *
+                 * 原来记的是进入回调那一刻的 now。于是实际周期是：
+                 *     进回调 → sendFrame（拷贝+压缩+写socket，几到几十毫秒）
+                 *     → 下次进回调，距离 lastSend 已过 ≈ 间隔 + 这次的发送耗时
+                 *
+                 * 日志实测（dashcast-11.log）：
+                 *   设 30fps → 7 秒发 150 帧 ≈ 21fps（理论 30）
+                 *   设 10fps → 18 秒发 150 帧 ≈ 8.3fps（理论 10）
+                 * 都只有设定的 70~83%，就是这个原因。
+                 *
+                 * 改成在 sendFrame 之后再取时间。这样「间隔 + 发送耗时」
+                 * 的起点是发送完成，周期才真正贴近 1000/fps。
+                 */
                 sendFrame(img);
-                lastSend = now;
+                lastSend = SystemClock.elapsedRealtime();
                 sentFrames++;
                 if (sentFrames == 1 || sentFrames % 150 == 0) {
                     DashLog.i(TAG, "已发 " + sentFrames + " 帧 → dcapd2");

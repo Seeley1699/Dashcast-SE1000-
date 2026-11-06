@@ -251,6 +251,20 @@ static float shape_distance(const dc_layer_cfg_t *c, float px, float py)
 int dc_layer_build(dc_layer_mask_t *m, const dc_layer_cfg_t *cfg)
 {
     if (!m) return -1;
+    /*
+     * **先把旧 alpha 释放掉再 memset**（2026-11-07 修内存泄漏）。
+     *
+     * 原来直接 memset(m, 0, sizeof(*m)) 会把 m->alpha 指针清零 ——
+     * 旧缓冲既没 free、指针也丢了，成永久泄漏。
+     *
+     * 调用方 dcapd2.c:379 在**正常重载路径**上直接调本函数，
+     * 只有两条错误分支（load_file 失败 / enabled=0）会先调 dc_layer_free。
+     * 也就是「用户每改一次遮罩、每切一次编码档」都漏一块 w×h 字节。
+     *
+     * 遮罩典型 528×416 ≈ 215KB，改十次就是 2MB，长时间跑会累积。
+     * 函数自己负责释放旧缓冲，语义更安全：调用方不用记得先 free。
+     */
+    free(m->alpha);
     memset(m, 0, sizeof(*m));
     if (!cfg) return -1;
 

@@ -107,20 +107,15 @@ public class MiuixSeekBar extends SeekBar {
         }
     }
 
-    public void setActiveColor(int c) {
-        activeColor = c;
-        invalidate();
-    }
-
-    public void setInactiveColor(int c) {
-        inactiveColor = c;
-        invalidate();
-    }
-
-    public void setKnobColor(int c) {
-        knobColor = c;
-        invalidate();
-    }
+    /*
+     * **三个 setColor 已删**（2026-11-07，全项目零调用）。
+     *
+     * 它们只是把字段改掉再 invalidate()，没有其他逻辑。
+     * 颜色的唯一来源是构造函数里那三行（从 colors.xml 读）。
+     * 想换色就改 colors.xml，比留一套没人用的外部 API 清爽。
+     *
+     * 字段本身保留 —— onDraw 的 trackPaint / knobPaint 还在用。
+     */
 
     @Override
     protected synchronized void onDraw(Canvas canvas) {

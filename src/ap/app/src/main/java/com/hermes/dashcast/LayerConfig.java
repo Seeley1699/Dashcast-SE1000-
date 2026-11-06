@@ -41,7 +41,6 @@ public final class LayerConfig {
     public int x = 0, y = 0, w = 1920, h = 532;
     public int grid = 32;          /* 拖拽吸附步长（仅 UI） */
     public int shape = SHAPE_ROUND;
-    public int dpi = 160;          /* 仅 UI 元数据 */
 
     public int border = 0;         /* 边框宽度 px */
     public int rTl = 24, rTr = 24, rBl = 24, rBr = 24;   /* 四角圆角 */
@@ -128,7 +127,6 @@ public final class LayerConfig {
         sb.append("h=").append(rr[3]).append('\n');
         sb.append("grid=").append(grid).append('\n');
         sb.append("shape=").append(shape).append('\n');
-        sb.append("dpi=").append(dpi).append('\n');
         sb.append("border=").append(border).append('\n');
         sb.append("r_tl=").append(rTl).append('\n');
         sb.append("r_tr=").append(rTr).append('\n');
@@ -221,44 +219,6 @@ public final class LayerConfig {
         }, "layer-push").start();
     }
 
-    /** 旧版异步下发实现（保留注释供追溯，逻辑已并入 applyFully） */
-    private void pushAsyncLegacy() {
-        final LayerConfig snapshot = this;
-        new Thread(() -> {
-            try {
-                snapshot.push();
-            } catch (Throwable t) {
-                DashLog.e(TAG, "下发配置失败", t);
-            }
-            /* 图层矩形同步：只在投屏中做（未投屏 layer 99 不存在） */
-            if (sCp == null || !sCasting) {
-                DashLog.i(TAG, "配置已保存（未投屏，跳过图层矩形同步）");
-                return;
-            }
-            try {
-                /*
-                 * **destination 必须按编码档算，不能直接用遮罩矩形**。
-                 *
-                 * 原来两个分支都是 setLayerRect(遮罩 x/y/w/h)，结果是：
-                 * AP 端把画面画在画布的遮罩坐标上，CP 端又把整块
-                 * 1920×532 画布压缩到同一块矩形 → 仪表上"正常画面 +
-                 * 缩小副本"叠加 = 重影。用户反馈"保存遮罩后必现"就是这个。
-                 *
-                 * BGRA 有 alpha → destination = 整屏，靠画布透明挖洞
-                 * H.264 无 alpha → destination = 遮罩矩形，图层本身缩进那块
-                 */
-                int[] dest = (snapshot.enabled && snapshot.w > 0 && snapshot.h > 0)
-                        ? LayerGeometry.destinationFor(MirrorController.getCodec(),
-                              new int[]{snapshot.x, snapshot.y, snapshot.w, snapshot.h},
-                              snapshot.canvasW, snapshot.canvasH)
-                        : new int[]{0, 0, snapshot.canvasW, snapshot.canvasH};
-                sCp.setLayerRect(dest[0], dest[1], dest[2], dest[3]);
-            } catch (Throwable t) {
-                DashLog.w(TAG, "同步图层矩形失败: " + t);
-            }
-        }, "layer-push").start();
-    }
-
     /** CpManager 引用（编辑器/控制器初始化时注入，用于同步图层矩形） */
     private static volatile CpManager sCp;
 
@@ -271,11 +231,6 @@ public final class LayerConfig {
     public static boolean isCasting() { return sCasting; }
 
     public static void attachCp(CpManager cp) { sCp = cp; }
-
-    /** 异步清除配置文件 */
-    public static void clearAsync() {
-        new Thread(LayerConfig::clear, "layer-clear").start();
-    }
 
     /** 删掉配置文件 = 恢复旧行为（全屏不透明） */
     public static void clear() {
@@ -303,7 +258,6 @@ public final class LayerConfig {
         e.putBoolean("layer_canvas_fill", canvasFill);
         e.putInt("layer_grid", grid);
         e.putInt("layer_shape", shape);
-        e.putInt("layer_dpi", dpi);
         e.putInt("layer_border", border);
         e.putInt("layer_r_tl", rTl);
         e.putInt("layer_r_tr", rTr);
@@ -415,7 +369,6 @@ public final class LayerConfig {
         }
         c.grid       = p.getInt("layer_grid", 32);
         c.shape      = p.getInt("layer_shape", SHAPE_ROUND);
-        c.dpi        = p.getInt("layer_dpi", 160);
         c.border     = p.getInt("layer_border", 0);
         c.rTl        = p.getInt("layer_r_tl", 24);
         c.rTr        = p.getInt("layer_r_tr", 24);
@@ -753,43 +706,6 @@ public final class LayerConfig {
         if (fit != 0) fit = 1;
     }
 
-    /**
-     * **把遮罩宽高对齐到 16 的整数倍 —— 只在 H.264 档需要**。
-     *
-     * ══════════════════════════════════════════════════════════════
-     * 为什么只有 H.264 需要
-     * ══════════════════════════════════════════════════════════════
-     *   · H.264：MediaCodec 硬编要求宽高是 16 的倍数（YUV420 宏块），
-     *            dcapd2 里是 `g_enc_w = (bw / 16) * 16`（向下取整）。
-     *            不对齐 → 编码尺寸比遮罩小 → 比例漂移 → 合成器拉伸变形。
-     *             遮罩 1920×532 → 编码 1920×528（3.64:1 vs 3.61:1）
-     *   · BGRA：直接传 RGB 原始像素，**没有任何对齐要求**，
-     *            遮罩 1920×532 就是 1920×532，1:1 零损失。
-     *
-     * ══════════════════════════════════════════════════════════════
-     * 为什么不在 sanitize() 里无条件对齐（踩过的坑）
-     * ══════════════════════════════════════════════════════════════
-     *   一开始写成无条件对齐，结果 BGRA 用户的遮罩也被砍：
-     *     1920×532 → 1920×528，白白矮 4px，用户精调的位置被破坏。
-     *   而这个 4px 对 BGRA 毫无必要 —— 它压根不经过编码器。
-     *
-     * 所以拆成独立方法，由**下发前**按当前编码档决定是否调用。
-     * cfg 里始终保存用户原始尺寸，只有真正要给 H.264 编码时才降级。
-     */
-    public void alignForCodec(int codec) {
-        /* CODEC_H264 = 2（与 dashcast_proto.h 一致） */
-        if (codec != 2) return;
-
-        if (w >= 16) w = (w / 16) * 16;
-        if (h >= 16) h = (h / 16) * 16;
-
-        /* 对齐后可能压到边界外，往回收 */
-        if (x + w > canvasW) x = Math.max(0, canvasW - w);
-        if (y + h > canvasH) y = Math.max(0, canvasH - h);
-        if (x < 0) x = 0;
-        if (y < 0) y = 0;
-    }
-
     /** 返回按编码档对齐后的 {x,y,w,h}，不改自身（给下发用） */
     public int[] rectForCodec(int codec) {
         int rx = x, ry = y, rw = w, rh = h;
@@ -812,7 +728,6 @@ public final class LayerConfig {
         x = o.x;  y = o.y;  w = o.w;  h = o.h;
         grid = o.grid;
         shape = o.shape;
-        dpi = o.dpi;
         border = o.border;
         rTl = o.rTl;  rTr = o.rTr;  rBl = o.rBl;  rBr = o.rBr;
         trapTop = o.trapTop;  trapBot = o.trapBot;
