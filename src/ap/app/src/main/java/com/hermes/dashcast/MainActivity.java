@@ -196,7 +196,7 @@ public class MainActivity extends Activity {
         /* ══ 左栏 ══ */
         LinearLayout left = new LinearLayout(this);
         left.setOrientation(LinearLayout.VERTICAL);
-        left.setPadding(dp(20), dp(14), dp(12), dp(14));
+        left.setPadding(dp(20), dp(12), dp(12), dp(12));
         page.addView(left, new LinearLayout.LayoutParams(dp(700),
                 LinearLayout.LayoutParams.MATCH_PARENT));
 
@@ -235,7 +235,7 @@ public class MainActivity extends Activity {
         statusBadge.setTextSize(16);
         statusBadge.setTextColor(getColor(R.color.content_secondary));
         statusBadge.setTypeface(Typeface.DEFAULT_BOLD);
-        statusBadge.setPadding(dp(12), dp(5), dp(12), dp(5));
+        statusBadge.setPadding(dp(12), dp(4), dp(12), dp(4));
         statusBadge.setBackgroundResource(R.drawable.badge_idle);
         titleRow.addView(statusBadge);
         left.addView(titleRow);
@@ -259,7 +259,7 @@ public class MainActivity extends Activity {
                 getColor(R.color.surface_border),
                 getColor(R.color.state_idle),
                 dpFloat(Squircle.R_CARD), dpFloat(5)));
-        statusCard.setPadding(dp(24), dp(14), dp(20), dp(14));
+        statusCard.setPadding(dp(24), dp(12), dp(20), dp(12));
         LinearLayout.LayoutParams scLp = new LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT,
                 LinearLayout.LayoutParams.WRAP_CONTENT);
@@ -369,7 +369,7 @@ public class MainActivity extends Activity {
         targetHint.setTextSize(16);
         targetHint.setTextColor(getColor(R.color.content_secondary));
         targetHint.setGravity(Gravity.CENTER);
-        targetHint.setPadding(dp(10), dp(6), dp(10), dp(6));
+        targetHint.setPadding(dp(10), dp(8), dp(10), dp(8));
         targetHint.setBackgroundResource(R.drawable.chip_bg);
         LinearLayout.LayoutParams thLp = new LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT,
@@ -504,7 +504,7 @@ public class MainActivity extends Activity {
         /* ── 运行日志（占满剩余高度）── */
         left.addView(sectionLabel("运行日志"));
         LinearLayout logCard = card();
-        logCard.setPadding(dp(14), dp(8), dp(14), dp(8));
+        logCard.setPadding(dp(12), dp(8), dp(12), dp(8));
         LinearLayout.LayoutParams lcLp = new LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f);
         logCard.setLayoutParams(lcLp);
@@ -562,7 +562,7 @@ public class MainActivity extends Activity {
         logView.setTextColor(getColor(R.color.content_tertiary));
         logView.setTypeface(Typeface.MONOSPACE);
         logView.setLineSpacing(0f, 1.5f);
-        logView.setPadding(0, dp(6), 0, 0);
+        logView.setPadding(0, dp(8), 0, 0);
         logView.setGravity(Gravity.TOP);
         logCard.addView(logView, new LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f));
@@ -599,7 +599,7 @@ public class MainActivity extends Activity {
          *
          * 回到 14dp：heading 文字本身有行高，14dp 足够不贴状态栏。
          */
-        right.setPadding(dp(12), dp(14), dp(20), dp(14));
+        right.setPadding(dp(12), dp(12), dp(20), dp(12));
         rightScroll.addView(right, new ScrollView.LayoutParams(
                 ScrollView.LayoutParams.MATCH_PARENT,
                 ScrollView.LayoutParams.WRAP_CONTENT));
@@ -1017,7 +1017,7 @@ public class MainActivity extends Activity {
         maskInfo = new TextView(this);
         maskInfo.setTextSize(15);
         maskInfo.setTextColor(getColor(R.color.content_tertiary));
-        maskInfo.setPadding(dp(2), dp(5), 0, dp(8));
+        maskInfo.setPadding(dp(2), dp(4), 0, dp(8));
         col.addView(maskInfo);
 
         /* ── 三个预设槽：点=应用，长按=保存当前，再长按=清空 ── */
@@ -1026,7 +1026,7 @@ public class MainActivity extends Activity {
         LinearLayout.LayoutParams prLp = new LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT,
                 LinearLayout.LayoutParams.WRAP_CONTENT);
-        prLp.setMargins(0, 0, 0, dp(6));
+        prLp.setMargins(0, 0, 0, dp(8));
         presetRow.setLayoutParams(prLp);
 
         maskPresetBtns = new LinearLayout[LayerConfig.PRESET_COUNT];
@@ -1035,7 +1035,7 @@ public class MainActivity extends Activity {
             LinearLayout btn = chipButton("", null);
             btn.setLayoutParams(new LinearLayout.LayoutParams(0, dp(52), 1f));
             ((LinearLayout.LayoutParams) btn.getLayoutParams())
-                    .setMargins(dp(3), 0, dp(3), 0);
+                    .setMargins(dp(4), 0, dp(4), 0);
             maskPresetBtns[slot] = btn;
 
             /* 短按：应用该预设（空槽提示保存方式） */
@@ -1247,7 +1247,7 @@ public class MainActivity extends Activity {
         maskAlphaWarn = new TextView(this);
         maskAlphaWarn.setTextSize(13);
         maskAlphaWarn.setTextColor(getColor(R.color.state_warn));
-        maskAlphaWarn.setPadding(dp(4), dp(6), dp(4), dp(2));
+        maskAlphaWarn.setPadding(dp(4), dp(8), dp(4), dp(2));
         maskAlphaWarn.setLineSpacing(0, 1.15f);
         col.addView(maskAlphaWarn);
 
@@ -1339,7 +1339,7 @@ public class MainActivity extends Activity {
         cornerLockBox.setText("同步");
         cornerLockBox.setTextSize(15);
         cornerLockBox.setTextColor(getColor(R.color.content_secondary));
-        cornerLockBox.setPadding(dp(6), dp(4), 0, dp(4));
+        cornerLockBox.setPadding(dp(8), dp(4), 0, dp(4));
         cornerLockBox.setMinHeight(dp(40));
         cornerLockBox.setChecked(getSharedPreferences(PREF, MODE_PRIVATE)
                 .getBoolean("corner_locked", true));
@@ -1582,7 +1582,7 @@ public class MainActivity extends Activity {
         btnToggle.setBackgroundResource(R.drawable.btn_selected);
         btnToggle.setAllCaps(false);
         btnToggle.setIncludeFontPadding(false);
-        btnToggle.setPadding(dp(14), 0, dp(14), 0);
+        btnToggle.setPadding(dp(12), 0, dp(12), 0);
         btnToggle.setLayoutParams(new LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.WRAP_CONTENT, dp(44)));
         head.addView(btnToggle);
@@ -1626,7 +1626,7 @@ public class MainActivity extends Activity {
         /* 13 → 16sp：这行是功能总开关，字大一点才好找、好点（2026-11-04） */
         appCropEnableBox.setTextSize(16);
         appCropEnableBox.setTextColor(getColor(R.color.content_primary));
-        appCropEnableBox.setPadding(dp(6), dp(8), 0, dp(8));
+        appCropEnableBox.setPadding(dp(8), dp(8), 0, dp(8));
         appCropEnableBox.setMinHeight(dp(44));
         boolean enablePref = getSharedPreferences(PREF, MODE_PRIVATE)
                 .getBoolean("app_crop_enabled", false);
@@ -1800,7 +1800,7 @@ public class MainActivity extends Activity {
         appCropHint = new TextView(this);
         appCropHint.setTextSize(13);
         appCropHint.setTextColor(getColor(R.color.content_tertiary));
-        appCropHint.setPadding(dp(4), dp(6), 0, 0);
+        appCropHint.setPadding(dp(4), dp(8), 0, 0);
         body.addView(appCropHint);
 
         /*
@@ -1829,7 +1829,7 @@ public class MainActivity extends Activity {
                 R.color.surface_deep, R.color.surface_border, 1f, Squircle.R_TAB));
         LinearLayout.LayoutParams cropLp = new LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT, dp(380));   /* 420→380，给下方控件留空间 */
-        cropLp.setMargins(0, dp(6), 0, dp(4));
+        cropLp.setMargins(0, dp(8), 0, dp(4));
         cropBox.setLayoutParams(cropLp);
         cropBox.addView(appCropPreview, new FrameLayout.LayoutParams(
                 FrameLayout.LayoutParams.MATCH_PARENT,
@@ -1847,7 +1847,7 @@ public class MainActivity extends Activity {
         appCropRatio = new TextView(this);
         appCropRatio.setTextSize(13);
         appCropRatio.setTextColor(getColor(R.color.content_secondary));
-        appCropRatio.setPadding(dp(4), dp(6), 0, dp(4));
+        appCropRatio.setPadding(dp(4), dp(8), 0, dp(4));
         body.addView(appCropRatio);
 
         /*
@@ -2968,7 +2968,7 @@ public class MainActivity extends Activity {
         t.setTextColor(getColor(R.color.content_accent));
         t.setTypeface(Typeface.DEFAULT_BOLD);
         t.setLetterSpacing(0.06f);
-        t.setPadding(dp(4), dp(12), 0, dp(5));
+        t.setPadding(dp(4), dp(12), 0, dp(4));
         return t;
     }
 
@@ -3029,7 +3029,7 @@ public class MainActivity extends Activity {
         LinearLayout.LayoutParams icLp = new LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.WRAP_CONTENT,
                 LinearLayout.LayoutParams.WRAP_CONTENT);
-        icLp.setMargins(0, 0, dp(6), 0);
+        icLp.setMargins(0, 0, dp(8), 0);
         ic.setLayoutParams(icLp);
         btn.addView(ic);
 
@@ -3055,7 +3055,7 @@ public class MainActivity extends Activity {
         btn.setLayoutParams(new LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT, dp(62)));
         LinearLayout.LayoutParams selfLp = (LinearLayout.LayoutParams) btn.getLayoutParams();
-        selfLp.setMargins(dp(4), dp(5), dp(4), dp(5));
+        selfLp.setMargins(dp(4), dp(4), dp(4), dp(4));
         return btn;
     }
 
@@ -3089,7 +3089,7 @@ public class MainActivity extends Activity {
         lb.setTextColor(getColor(R.color.content_tertiary));
         lb.setGravity(Gravity.CENTER);
         lb.setIncludeFontPadding(false);
-        lb.setPadding(0, dp(3), 0, 0);
+        lb.setPadding(0, dp(4), 0, 0);
         cell.addView(lb, new LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT,
                 LinearLayout.LayoutParams.WRAP_CONTENT));
@@ -3133,7 +3133,7 @@ public class MainActivity extends Activity {
         lb.setTextColor(getColor(R.color.content_tertiary));
         lb.setGravity(Gravity.CENTER);
         lb.setIncludeFontPadding(false);
-        lb.setPadding(0, dp(3), 0, 0);
+        lb.setPadding(0, dp(4), 0, 0);
         cell.addView(lb, new LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT,
                 LinearLayout.LayoutParams.WRAP_CONTENT));
@@ -3146,7 +3146,7 @@ public class MainActivity extends Activity {
                               View.OnClickListener listener, float weight) {
         Button b = makeButton(text, bgRes, colorRes, listener);
         LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(0, dp(62), weight);
-        lp.setMargins(dp(5), dp(6), dp(5), dp(6));
+        lp.setMargins(dp(4), dp(8), dp(4), dp(8));
         b.setLayoutParams(lp);
         return b;
     }
@@ -3561,7 +3561,7 @@ public class MainActivity extends Activity {
         t.setTextSize(16);
         t.setTextColor(getColor(R.color.accent));
         t.setTypeface(Typeface.DEFAULT_BOLD);
-        t.setPadding(dp(4), dp(14), 0, dp(8));
+        t.setPadding(dp(4), dp(12), 0, dp(8));
         return t;
     }
 
@@ -3613,7 +3613,7 @@ public class MainActivity extends Activity {
         cell.setOrientation(LinearLayout.VERTICAL);
         cell.setGravity(Gravity.CENTER);
         cell.setBackgroundResource(R.drawable.app_cell);
-        cell.setPadding(dp(6), dp(10), dp(6), dp(8));
+        cell.setPadding(dp(8), dp(10), dp(8), dp(8));
         cell.setClickable(true);
         cell.setFocusable(true);
 
@@ -3638,7 +3638,7 @@ public class MainActivity extends Activity {
         LinearLayout.LayoutParams nameLp = new LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT,
                 LinearLayout.LayoutParams.WRAP_CONTENT);
-        nameLp.setMargins(0, dp(6), 0, 0);
+        nameLp.setMargins(0, dp(8), 0, 0);
         name.setLayoutParams(nameLp);
         cell.addView(name);
 
