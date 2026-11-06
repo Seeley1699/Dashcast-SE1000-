@@ -81,6 +81,17 @@ using namespace android;
 #define VDFRAME_MAGIC 0x56444631u   /* 'VDF1'：App 侧 VD 帧的包头 */
 #define CMD_BG        0x47424344u   /* 'DCBG'：4 字节控制命令 —— 立刻停抓主屏 */
 #define CMD_VCROP     0x50564344u   /* 'DCVP'：后台跟随时的源裁剪框（16 字节） */
+/*
+ * 'DCSR'（2026-11-05 新增）：**主屏抓取区热更新**（16 字节 x,y,w,h）。
+ *
+ * 问题：改「截取 App 页面」或「按比例框选」时，Java 侧只能 pkill 再重启
+ *      进程才能换抓取区 —— 每次重启 TCP 8444 断开、8450 帧源也断，
+ *      日志里满屏 Broken pipe / ECONNREFUSED，画面还闪一下黑。
+ *
+ * 而 g_src_* 本来就是全局变量（captureScreen 每帧读它），
+ * 所以只要给个命令能改这四个数，就完全不用重启进程。
+ */
+#define CMD_SRC       0x52534344u   /* 'DCSR'：主屏抓取区（16 字节） */
 
 /*
  * 后台跟随（VD 源）时的裁剪框 —— 2026-11-03 修「按 HOME 回桌面后截取失效」。
@@ -152,7 +163,6 @@ static int g_target_display = -1;
 
 /* —— 取证用：切模式那一下"仪表上到底是什么"无从远观，只能把帧拍下来 ——
  * 只在排查问题时落盘（每次切模式 3 张，几毫秒），平时不写。 */
-static uint8_t     *g_canvas    = NULL;
 static int          g_outW = 0, g_outH = 0;
 static int          g_vd_dump   = 0;      /* 已落盘的 VD 帧数（最多 3） */
 static long long    g_switch_ms = 0;      /* 收到 DCBG 的时刻 */
@@ -164,6 +174,52 @@ static int          g_after_dumped = 0;
 static int          g_dst_x = 0, g_dst_y = 0, g_dst_w = 0, g_dst_h = 0;
 static int          g_cap_w = 0, g_cap_h = 0;   /* 抓帧尺寸，重算映射用 */
 static int          g_src_x = 0, g_src_y = 0, g_src_w = 0, g_src_h = 0;  /* 抓帧内源矩形 */
+
+/*
+ * **本次真正做 blit 的源宽高**（2026-11-05 新增）。
+ *
+ * 为什么还要单独一组：g_src_w/h 是抓帧缓冲的整块尺寸，
+ * 而实际 blit 的源是「整块减去自动裁黑边」的 bsw×srcH2 ——
+ * 两者可能不同（detect_crop_columns 会裁掉内容两侧的黑边）。
+ *
+ * recompute_dst() 里 fit=1（等比居中）要按**真实源比例**算，
+ * 用 g_src_ 会偏，导致等比模式下画面被拉伸或留错边。
+ * BGRA 档默认 fit=0 走铺满，看不出问题；fit=1 立刻暴露。
+ */
+static int          g_blit_src_w = 0, g_blit_src_h = 0;
+
+/*
+ * **主屏抓取区（屏幕坐标）** —— 'DCSR' 热更新改的就是这四个。
+ *
+ * 和 g_src_* 的区别（很容易搞混，两者语义不同）：
+ *   g_src_*  = 抓帧缓冲里的坐标。因为 crop 已经把目标区域渲染成
+ *              g_cap_w×g_cap_h，这块永远是 0,0,g_cap_w,g_cap_h。
+ *   g_crop_* = **屏幕坐标**下"抓屏幕哪一块"，也就是传给
+ *              captureScreen 的那个 Rect，和启动时 argv[3..6] 同一套。
+ *
+ * 原来没有后者，热更新把屏幕坐标写进 g_src_* 就全乱了：
+ *   · recompute_dst 拿它当"抓帧内源矩形"算缩放 → 比例错
+ *   · 主循环又不读它 → 改了等于没改
+ * 所以拆成独立一组，职责清楚。
+ */
+static int          g_crop_x = 0, g_crop_y = 0, g_crop_w = 0, g_crop_h = 0;
+
+/*
+ * 画布指针 —— 取证用。
+ *
+ * 'DCBG'（App 按 HOME）那一刻把整块画布 dump 成 ppm，
+ * 之后跟桌面/App 的截图一比，就知道漏上仪表的是谁。
+ * 只在排查问题时写，平时是一次赋值，可忽略。
+ */
+static uint8_t     *g_canvas = NULL;
+/*
+ * 物理屏尺寸（= 命令行 argv[1] / argv[2]）。
+ *
+ * 原来是 main() 的局部 const int dispW/dispH，
+ * 但 'DCSR' 热更新时要把新抓取区夹到这范围内，
+ * 控制线程拿不到 main 的局部变量，所以提成全局。
+ */
+static int          g_scr_w = 0, g_scr_h = 0;
 
 static int          g_vd_live   = 0;      /* 切到 VD 之后有没有出过"真画面" */
 static int          g_vd_blank  = 0;      /* 连续丢掉的空白帧数 */
@@ -393,12 +449,22 @@ static void recompute_dst(void)
         dw = boxW;
         dh = boxH;
     } else {
-        /* 等比缩放 */
-        double sc = (double) boxW / (double) g_src_w;
-        double sc2 = (double) boxH / (double) g_src_h;
+        /*
+         * 等比缩放 —— 按**真实 blit 源尺寸**算（不是抓帧缓冲整块）。
+         *
+         * g_blit_src_w/h 在每帧 blit 前被更新为「整块减去自动裁黑边」后的
+         * 实际宽高；拿不到时（首帧之前）退回 g_src_。
+         * 用错的话 fit=1（等比居中）会按偏大的源算比例，
+         * 画面被压扁/留边错位。
+         */
+        int sw_ref = g_blit_src_w > 0 ? g_blit_src_w : g_src_w;
+        int sh_ref = g_blit_src_h > 0 ? g_blit_src_h : g_src_h;
+        if (sw_ref <= 0 || sh_ref <= 0) { sw_ref = g_src_w; sh_ref = g_src_h; }
+        double sc = (double) boxW / (double) sw_ref;
+        double sc2 = (double) boxH / (double) sh_ref;
         if (sc2 < sc) sc = sc2;
-        dw = (int) (g_src_w * sc);
-        dh = (int) (g_src_h * sc);
+        dw = (int) (sw_ref * sc);
+        dh = (int) (sh_ref * sc);
         if (dw > boxW) dw = boxW;
         if (dh > boxH) dh = boxH;
     }
@@ -410,7 +476,9 @@ static void recompute_dst(void)
 
     if (dx != g_dst_x || dy != g_dst_y || dw != g_dst_w || dh != g_dst_h) {
         LOGI("画面映射: 源 %dx%d → 画布 %d,%d %dx%d（%s）",
-             g_src_w, g_src_h, dx, dy, dw, dh,
+             g_blit_src_w > 0 ? g_blit_src_w : g_src_w,
+             g_blit_src_h > 0 ? g_blit_src_h : g_src_h,
+             dx, dy, dw, dh,
              g_mask_ready ? (g_mask.cfg.fit ? "遮罩内等比" : "铺满遮罩")
                           : "画布居中");
     }
@@ -682,8 +750,101 @@ static int proxy_read_msg(void)
         LOGI("VD 截取区 → %d,%d %d×%d（虚拟屏帧 %dx%d）",
              g_vd_crop_x, g_vd_crop_y, g_vd_crop_w, g_vd_crop_h,
              g_px_w, g_px_h);
-        g_vd_live = 0;      /* 换了裁剪框，重新等一帧真画面 */
-        g_vd_blank = 0;
+        /*
+         * **不要重置 g_vd_live / g_vd_blank**（2026-11-05 修复「改截取框后卡几秒」）。
+         *
+         * 原来这里写成 `g_vd_live = 0; g_vd_blank = 0;` ——
+         * 注释的本意是"换了裁剪框，重新等一帧真画面"。
+         * 但空屏判定只在 `!g_vd_live` 时才生效，把它清零等于：
+         *   · 下一帧若恰好偏暗（App 是深色主题、刚切后台还在重绘）
+         *   · 就进 frame_is_blank 分支 → 丢帧 → 最多要等 150 帧（约 5 秒）
+         * 用户体感"改完截取框，仪表黑/卡好几秒才出画面"。
+         *
+         * 而换裁剪框**根本没有换帧源** —— 虚拟屏还是那块、
+         * ImageReader 还在出同一张图，没有"等首帧"的必要。
+         * 所以这里保持 live 状态不动，下一帧照常推。
+         */
+        return 2;
+    }
+    /*
+     * 'DCSR' + x,y,w,h（16 字节，**主屏屏幕坐标**）—— 主屏抓取区热更新。
+     *
+     * 见 CMD_SRC 宏处注释：改了截取框不用重启进程，
+     * g_src_* 是全局变量，captureScreen 每帧都读它。
+     *
+     * 还要顺带重算两样东西：
+     *   · g_cap_w/h —— 抓帧尺寸，做画面映射时要除以它
+     *   · 图层遮罩尺寸 —— 新抓取区的比例和遮罩不匹配时要重排
+     * 所以置 g_mask_stat_ms = 0 强制下一轮重新加载遮罩配置。
+     */
+    if (w4 == CMD_SRC) {
+        uint32_t c[4];
+        if (read_full(g_proxy_fd, c, sizeof(c)) != 0) return 0;
+        int nx = (int) c[0], ny = (int) c[1];
+        int nw = (int) c[2], nh = (int) c[3];
+
+        /* 夹到屏幕内，避免越界抓帧 */
+        if (nx < 0) nx = 0;
+        if (ny < 0) ny = 0;
+        if (nw < 16) nw = 16;
+        if (nh < 16) nh = 16;
+        if (g_scr_w > 0 && nx + nw > g_scr_w) nw = g_scr_w - nx;
+        if (g_scr_h > 0 && ny + nh > g_scr_h) nh = g_scr_h - ny;
+        if (nw < 16) nw = 16;
+        if (nh < 16) nh = 16;
+
+        if (nx == g_crop_x && ny == g_crop_y && nw == g_crop_w && nh == g_crop_h) {
+            LOGI("主屏抓取区未变（%d,%d %dx%d），跳过", nx, ny, nw, nh);
+            return 2;
+        }
+
+        /*
+         * **只改「抓屏幕哪一块」和「抓帧尺寸」**（2026-11-05 修画面错位）。
+         *
+         * g_src_* 是「抓帧缓冲里的源矩形」，语义是 0,0,g_cap_w,g_cap_h，
+         * 不能塞屏幕坐标进去 —— 那会让 recompute_dst 的缩放比全错。
+         */
+        g_crop_x = nx; g_crop_y = ny; g_crop_w = nw; g_crop_h = nh;
+        {
+            /* 和启动时同一套算法：抓帧宽 = min(CAPTURE_W, 源宽) */
+            int cw = CAPTURE_W;
+            if (cw > nw) cw = nw;
+            int chh = (int) ((long long) nh * cw / nw);
+            if (chh < 2) chh = 2;
+            chh &= ~1;
+            g_cap_w = cw;
+            g_cap_h = chh;
+            /* 抓帧内源矩形恒为整块（crop 已经把目标区域渲染成 cap 尺寸） */
+            g_src_x = 0; g_src_y = 0;
+            g_src_w = cw; g_src_h = chh;
+            /*
+             * **真实 blit 源尺寸也要重置**（2026-11-05）。
+             *
+             * recompute_dst() 的等比分支优先用 g_blit_src_w/h，
+             * 那是「上一帧实际 blit 的源」（可能还被自动裁黑边减小过）。
+             * 换抓取区后它和新源完全无关，不重置就等于
+             * 拿旧尺寸算新比例 —— fit=1 时画面必然偏。
+             * 置 0 让 recompute_dst 退回用 g_src_（刚更新的新值）；
+             * 下一帧 blit 前会再按真实值覆盖。
+             */
+            g_blit_src_w = 0;
+            g_blit_src_h = 0;
+        }
+        /*
+         * 强制下一轮重新加载遮罩（尺寸可能变了），并且**重算编码尺寸**。
+         *
+         * 原来只调了 recompute_dst()，漏了 recompute_enc_size() ——
+         * H.264 档的编码尺寸是按遮罩算的，遮罩没变时它会停在上一个值；
+         * 而抓帧尺寸变了之后，h264_enc_feed_crop 用的采样比就和新画面
+         * 对不上，表现为"改完截取框，H.264 下画面被拉伸/错位"。
+         * 顺手一起算，成本可以忽略。
+         */
+        g_mask_stat_ms = 0;
+        recompute_dst();
+        recompute_enc_size(g_outW, g_outH);
+        LOGI("主屏抓取区热更新 → %d,%d %dx%d（屏幕 %dx%d，抓帧 %dx%d）",
+             g_crop_x, g_crop_y, g_crop_w, g_crop_h, g_scr_w, g_scr_h,
+             g_cap_w, g_cap_h);
         return 2;
     }
 
@@ -1232,10 +1393,39 @@ static void detect_crop_columns(const uint8_t *buf, int stride_px,
  */
 static void blit_bilinear(const uint8_t *cap, int cap_stride_px, int cap_w, int cap_h,
                           int sx, int sy, int sw, int sh,
-                          uint8_t *out, int out_w,
+                          uint8_t *out, int out_w, int out_h,
                           int dx, int dy, int dw, int dh)
 {
     if (sw <= 0 || sh <= 0 || dw <= 0 || dh <= 0) return;
+    if (cap_w <= 0 || cap_h <= 0 || out_w <= 0 || out_h <= 0) return;
+
+    /*
+     * ══════════════════════════════════════════════════════════════
+     * **入口统一夹紧：源矩形和输出矩形都必须在缓冲内**（2026-11-05）
+     * ══════════════════════════════════════════════════════════════
+     *
+     * 原来只夹了 x1/y1（`if (x1 >= cap_w) x1 = cap_w - 1`），
+     * 没夹 x0/y0 —— 一旦 sx+sw 超出 cap_w，x0 就可能 >= cap_w，
+     * 下面 `r0 + cx0 * 4` 直接越界读（读到别的内存，画面花屏甚至崩）。
+     *
+     * 输出侧同样没夹：dy+y >= out_h 或 dx+dw > out_w 时，
+     * `orow + x*4` 会写穿画布尾部 —— 破坏堆内存。
+     *
+     * 平时参数一致时走不到越界分支，但**热更新（DCSR/DCVP）会改尺寸**
+     * 而画布不变，参数一时不一致就会踩到，所以必须在这里兜住。
+     * 代价是几次整数比较，可忽略。
+     */
+    if (sx < 0) { sw += sx; sx = 0; }
+    if (sy < 0) { sh += sy; sy = 0; }
+    if (sx + sw > cap_w) sw = cap_w - sx;
+    if (sy + sh > cap_h) sh = cap_h - sy;
+    if (sw <= 0 || sh <= 0) return;
+
+    if (dx < 0) { dw += dx; dx = 0; }
+    if (dy < 0) { dh += dy; dy = 0; }
+    if (dx + dw > out_w) dw = out_w - dx;
+    if (dy + dh > out_h) dh = out_h - dy;
+    if (dw <= 0 || dh <= 0) return;
 
     static int *x0_tab = NULL, *x1_tab = NULL;
     static unsigned *wx_tab = NULL;
@@ -1354,6 +1544,12 @@ int main(int argc, char **argv)
         usage(argv[0]);
         return 2;
     }
+    /*
+     * 把屏幕尺寸提到全局 —— 'DCSR' 热更新时要把新抓取区夹进这范围。
+     */
+    g_scr_w = dispW;
+    g_scr_h = dispH;
+
 
     signal(SIGINT, on_signal);
     signal(SIGTERM, on_signal);
@@ -1415,6 +1611,8 @@ int main(int argc, char **argv)
      * 这里不再写死 dx/dy/dw/dh —— 那是"画面永远停在中间一块"的根因。 */
     g_cap_w = capW; g_cap_h = capH;
     g_src_x = sx; g_src_y = sy; g_src_w = sw; g_src_h = sh;
+    /* 屏幕坐标的抓取区（argv[3..6]），'DCSR' 热更新改的就是它 */
+    g_crop_x = srcX; g_crop_y = srcY; g_crop_w = srcW; g_crop_h = srcH;
     g_outW = outW; g_outH = outH;
     recompute_dst();          /* 先按"无遮罩"算出画布居中的默认值 */
 
@@ -1615,8 +1813,14 @@ int main(int argc, char **argv)
                             if (vy + vh > g_px_h) vh = g_px_h - vy;
                             if (vw < 4 || vh < 4) { vx = 0; vy = 0; vw = g_px_w; vh = g_px_h; }
                         }
+                        /* 同上：记录真实源尺寸，等比模式才按对的来源算比例 */
+                        if (vw != g_blit_src_w || vh != g_blit_src_h) {
+                            g_blit_src_w = vw;
+                            g_blit_src_h = vh;
+                            recompute_dst();
+                        }
                         blit_bilinear(g_px_buf, g_px_stride, g_px_w, g_px_h,
-                                      vx, vy, vw, vh, canvas, outW,
+                                      vx, vy, vw, vh, canvas, outW, outH,
                                       g_dst_x, g_dst_y, g_dst_w, g_dst_h);
                         applied++;
                         do_push = 1;
@@ -1654,10 +1858,39 @@ int main(int argc, char **argv)
                  * 而 g_src_* 是抓帧坐标（capW×capH），所以这里统一用
                  * srcX/srcY/srcW/srcH（它们本来就是屏幕坐标）。
                  */
-                int cropX = srcX, cropY = srcY, cropW = srcW, cropH = srcH;
+                /*
+                 * ══════════════════════════════════════════════════════
+                 * **每帧都从全局变量取值，不读启动时的局部量**（2026-11-05）
+                 * ══════════════════════════════════════════════════════
+                 *
+                 * 原来这里写的是 `srcX, srcY, srcW, srcH` 加 `capW, capH`
+                 * —— 全是 main() 开头的**局部常量**。
+                 * 所以 'DCSR' 热更新虽然改了全局量，
+                 * 抓帧循环压根不看，**改了等于没改**：
+                 *   · 日志显示"主屏抓取区热更新 → 2016×1440 @(318,0)"
+                 *   · 实际 captureScreen 还是旧矩形
+                 *   用户看到的就是"截取框改了但画面没变"。
+                 *
+                 * 现在统一用 g_crop_ 一组（屏幕坐标）和 g_cap_ 一组（抓帧尺寸），
+                 * 启动时它们已经被初始化成和原来局部量相同的值，
+                 * 行为不变；热更新之后才真的生效。
+                 *
+                 * 注意：注释里别写 "g_src_*舍 g_cap_*" 这种带星号斜杠的组合，
+                 * 里面的 "星号+斜杠" 会提前结束块注释 —— 后面整段中文
+                 * 就变成代码了，编译器报一堆 "unexpected character <U+FF0C>"。
+                 * 之前就是这样把编译搞挂的。
+                 */
+                int cropX = g_crop_x, cropY = g_crop_y;
+                int cropW = g_crop_w, cropH = g_crop_h;
+                if (cropW < 16 || cropH < 16) {
+                    /* 兜底：热更新前的极端值，退回启动时参数 */
+                    cropX = srcX; cropY = srcY; cropW = srcW; cropH = srcH;
+                }
+                int frameW = g_cap_w > 0 ? g_cap_w : capW;
+                int frameH = g_cap_h > 0 ? g_cap_h : capH;
                 Rect crop(cropX, cropY, cropX + cropW, cropY + cropH);
                 status_t err = composer->captureScreen(display, &gb, crop,
-                                                      (uint32_t) capW, (uint32_t) capH,
+                                                      (uint32_t) frameW, (uint32_t) frameH,
                                                       false, ui::ROTATION_0);
                 if (err != NO_ERROR || gb == nullptr) {
                     LOGE("captureScreen 失败: %d (%s)", err, strerror(-err));
@@ -1705,22 +1938,54 @@ int main(int argc, char **argv)
                          *
                          * 所以：抓非主屏（g_target_display >= 0）时一律不裁。
                          */
+                        /*
+                         * 源矩形也取**动态**的：抓帧缓冲恒为整块，跟着 frameW/frameH。
+                         *
+                         * 原来用的是启动时的局部 sx/sy/sw/sh（= 0,0,capW,capH），
+                         * 热更新把抓帧尺寸改小/改大后，这里还指着旧尺寸 ——
+                         * 配合下面的 blit 就是"画面只取到一块旧区域"。
+                         */
+                        int srcX2 = 0, srcY2 = 0, srcW2 = frameW, srcH2 = frameH;
                         if (!g_mask_ready && g_target_display < 0) {
                             detect_crop_columns((const uint8_t *) pixels, gb->getStride(),
-                                                sx, sy, sw, sh, &cropL, &cropR);
+                                                srcX2, srcY2, srcW2, srcH2, &cropL, &cropR);
                         }
-                        int bsx = sx + cropL, bsw = sw - cropL - cropR;
-                        if (bsw < 4) { bsx = sx; bsw = sw; }
+                        int bsx = srcX2 + cropL, bsw = srcW2 - cropL - cropR;
+                        if (bsw < 4) { bsx = srcX2; bsw = srcW2; }
                         if (!g_mask_ready && (cropL || cropR)) {
                             static long s_lastcrop = -1;
                             if (s_lastcrop != (long)(cropL * 1000 + cropR)) {
                                 s_lastcrop = cropL * 1000 + cropR;
                                 LOGI("内容黑边 %d/%d px，实际用 %d×%d（原 %d×%d）",
-                                     cropL, cropR, bsw, sh, sw, sh);
+                                     cropL, cropR, bsw, srcH2, srcW2, srcH2);
                             }
                         }
-                        blit_bilinear((const uint8_t *) pixels, gb->getStride(), capW, capH,
-                                      bsx, sy, bsw, sh, canvas, outW,
+                        /*
+                         * **blit 的抓帧尺寸也要用动态的 frameW/frameH**
+                         * （2026-11-05 修「改完截取框画面错位/拉伸」）。
+                         *
+                         * 上面 captureScreen 已经按 frameW×frameH 渲染，
+                         * 这里如果还用 main() 的局部 capW/capH，
+                         * blit_bilinear 的 cap_w/cap_h 就和真实缓冲尺寸不符 ——
+                         * 采样比按旧尺寸算，画面必错。
+                         *
+                         * 这是同一个"局部量 vs 全局量"坑的最后一个漏点：
+                         * DCSR 改了 g_cap_ 之后，captureScreen 用对了、
+                         * 但 blit 还在用错的，表现就是画面拉伸/错位。
+                         */
+                        /*
+                         * blit 前把**真实源尺寸**记到全局，供 recompute_dst 的
+                         * 等比分支使用（见 g_blit_src_w 的注释）。
+                         * 尺寸变了才重算 —— 免得每帧都算一遍。
+                         */
+                        if (bsw != g_blit_src_w || srcH2 != g_blit_src_h) {
+                            g_blit_src_w = bsw;
+                            g_blit_src_h = srcH2;
+                            recompute_dst();
+                        }
+                        blit_bilinear((const uint8_t *) pixels, gb->getStride(),
+                                      frameW, frameH,
+                                      bsx, srcY2, bsw, srcH2, canvas, outW, outH,
                                       g_dst_x, g_dst_y, g_dst_w, g_dst_h);
                         applied++;
 

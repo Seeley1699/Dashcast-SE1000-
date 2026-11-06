@@ -595,7 +595,52 @@ public final class LayerConfig {
          * 不该因为一个内部标志位没被翻过就悄无声息地跳过。
          */
         CpManager cp = sCp;
-        if (cp != null && sCasting && w > 0 && h > 0) {
+        /*
+         * **sCasting 不可信，额外以 MirrorController.isMirroring() 兜底**
+         * （2026-11-05 关键修复）。
+         *
+         * 日志实证：stop() 之后 sCasting 被置 false，而 start() 没有把它
+         * 置回 true（只写了 prefs），于是**第二次开始投屏起**这里永远进不来，
+         * 每次都打印「图层矩形**跳过**：cp=true casting=false」。
+         * 结果：切 H.264 后 CP 一直拿不到新的 destination region，
+         * 必须点一次「保存并应用」才刷新 —— 用户反馈的正是这个现象。
+         *
+         * 现在两个来源任一为真就下发：
+         *   · sCasting = LayerConfig 自己的静态位（loop 拉起 dcapd2 时会置）
+         *   · isMirroring() = MirrorController 的真实运行态（更权威）
+         * 就算静态位又漏了，也不会再静默跳过。
+         */
+        boolean casting = sCasting || MirrorController.isMirroring();
+        /*
+         * **第三重兜底：读 prefs 里的 casting_active**（2026-11-05）。
+         *
+         * 日志实证：18:30:43.896 / 18:32:22.245 / 18:34:17.043 仍然打印
+         * 「图层矩形**跳过**：cp=true casting=false」，
+         * 而那时投屏**正在进行**（VdMirror 在出帧、dcapd2 在跑）。
+         *
+         * 说明前两重都能为假：
+         *   · sCasting  —— 静态位，loop 里某些分支没置到
+         *   · isMirroring() —— 依赖 sActive，而 start() 是
+         *     「先 running=true、再起 worker、最后才 sActive=this」，
+         *     中间存在一个很短的窗口 sActive 还是 null
+         *
+         * 而 setCastingFlag(true) 写进 prefs 的那一刻起，
+         * casting_active 就是**最可靠的"这一场投屏开始了"的信号**
+         * （它由 start() 第一行附近写入，stop() 时清掉）。
+         * 所以再读一次 prefs，三重任一为真就下发。
+         *
+         * 读 prefs 很便宜（进程内缓存 + XML 已加载），且这条路径
+         * 只在「保存/切档/应用截取」时触发，不是每帧。
+         */
+        if (!casting && ctx != null) {
+            try {
+                casting = ctx.getSharedPreferences(PREF, Context.MODE_PRIVATE)
+                        .getBoolean("casting_active", false);
+                if (casting) DashLog.i(TAG, "casting 兜底：prefs casting_active=true");
+            } catch (Throwable ignored) {
+            }
+        }
+        if (cp != null && casting && w > 0 && h > 0) {
             try {
                 /*
                  * **用按编码档对齐后的矩形**，不是原始 w/h。
@@ -626,7 +671,7 @@ public final class LayerConfig {
              * 排查"预设位置应用不上"时完全没有线索。
              */
             DashLog.i(TAG, "图层矩形**跳过**：cp=" + (cp != null)
-                    + " casting=" + sCasting + " w=" + w + " h=" + h);
+                    + " casting=" + casting + " w=" + w + " h=" + h);
         }
         return ok;
     }

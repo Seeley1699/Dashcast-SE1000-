@@ -2467,32 +2467,52 @@ public class MainActivity extends Activity {
                     DashLog.w(TAG, "没能把 " + pkg + " 拉到前台，底图可能不是它的画面");
                 }
 
-                /* ② 截屏落盘 */
-                AdbShell.exec("screencap -p " + tmp, 20000);
-
-                /* ③ 问大小 */
-                String sz = AdbShell.exec("stat -c %s " + tmp, 4000);
+                /*
+                 * ══════════════════════════════════════════════════════════════
+                 * **截屏要重试**（2026-11-05 修复"截图大小异常: 0"）
+                 * ══════════════════════════════════════════════════════════════
+                 *
+                 * 日志实录：
+                 *   12:49:05  已载入底图 1280×800（抖音短视频）      ← 成功
+                 *   12:49:06  截屏失败: 截图大小异常: 0            ← 紧接着失败
+                 *
+                 * 原因：screencap -p 偶尔写出 0 字节 —— 车机 GPU 忙
+                 *      或者 SurfaceFlinger 正在重排时就是会这样。
+                 *      一次失败就放弃太脆，重试 3 次基本都能成。
+                 */
                 long size = 0;
-                if (sz != null) {
-                    try {
-                        size = Long.parseLong(sz.trim().replaceAll("[^0-9]", ""));
-                    } catch (Throwable ignored) {
+                for (int shot = 1; shot <= 3; shot++) {
+                    /* ② 截屏落盘 */
+                    AdbShell.exec("screencap -p " + tmp, 20000);
+
+                    /* ③ 问大小 */
+                    String sz = AdbShell.exec("stat -c %s " + tmp, 4000);
+                    size = 0;
+                    if (sz != null) {
+                        try {
+                            size = Long.parseLong(sz.trim().replaceAll("[^0-9]", ""));
+                        } catch (Throwable ignored) {
+                        }
                     }
-                }
-                if (size <= 0) {
-                    String ls = AdbShell.exec("ls -l " + tmp, 4000);
-                    if (ls != null) {
-                        String[] parts = ls.trim().split("\\s+");
-                        if (parts.length >= 5) {
-                            try {
-                                size = Long.parseLong(parts[4]);
-                            } catch (Throwable ignored) {
+                    if (size <= 0) {
+                        String ls = AdbShell.exec("ls -l " + tmp, 4000);
+                        if (ls != null) {
+                            String[] parts = ls.trim().split("\\s+");
+                            if (parts.length >= 5) {
+                                try {
+                                    size = Long.parseLong(parts[4]);
+                                } catch (Throwable ignored) {
+                                }
                             }
                         }
                     }
+                    if (size > 0 && size <= 12L * 1024 * 1024) break;
+                    DashLog.w(TAG, "截屏第 " + shot + " 次得到 " + size
+                            + " 字节，重试");
+                    Thread.sleep(600);
                 }
                 if (size <= 0 || size > 12L * 1024 * 1024) {
-                    throw new java.io.IOException("截图大小异常: " + size);
+                    throw new java.io.IOException("截图大小异常: " + size + "（已重试 3 次）");
                 }
 
                 /* ④ 分块拉取（每块 64KB） */

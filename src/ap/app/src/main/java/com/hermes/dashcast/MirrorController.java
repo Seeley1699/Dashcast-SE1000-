@@ -35,7 +35,7 @@ public class MirrorController {
     private static final String TAG = "DashcastMirror";
 
     private static final String BIN = "/data/local/tmp/dcapd2";
-    private static final String BIN_MD5 = "974682dfd006e4f385497882249234e0";
+    private static final String BIN_MD5 = "f0ea833ddabc1bdfe071db9c404af51f";
     private static final String PAUSE = "/data/local/tmp/dcapd2.pause";
     private static final String LOGF = "/data/local/tmp/dcapd2.log";
     /** 编码档位文件：App 写数字，dcapd2 每 500ms 轮询，运行时切档不重启进程 */
@@ -371,6 +371,31 @@ public class MirrorController {
         worker.start();
         sActive = this;
         setCastingFlag(true);
+        /*
+         * ══════════════════════════════════════════════════════════════
+         * **必须同步把 LayerConfig 的 casting 标志也置 true**（2026-11-05）
+         * ══════════════════════════════════════════════════════════════
+         *
+         * setCastingFlag() 只写 prefs（给进程重建后恢复用），
+         * 而 applyFully() 判断的 `sCasting` 是 LayerConfig 的**静态字段**，
+         * 只有 LayerConfig.setCasting() 才会变。
+         *
+         * 原来 start() 只调了 setCastingFlag(true)，漏了 setCasting(true)：
+         *   · 第一次投屏：loop() 拉起 dcapd2 后会调 setCasting(true)，没事
+         *   · 用户点「停止投屏」→ stop() 里 setCasting(false)
+         *   · 再点「开始投屏」→ start() **没有把它置回 true**
+         *     → 之后所有 applyFully() 都打印
+         *        「图层矩形**跳过**：cp=true casting=false」
+         *     → CP 永远收不到新的 destination region
+         *
+         * 日志实证（dashcast(2).log）：
+         *   17:47:52.924 图层矩形**跳过**：cp=true casting=false w=560 h=400
+         *   17:51:00.055 图层矩形**跳过**：cp=true casting=false w=560 h=400
+         * 这就是「切 H.264 不按遮罩位置投屏、要点一次保存并应用才刷新」
+         * 的真因 —— 点保存时这里其实也跳过了，只是 8 秒保活偶尔补上，
+         * 表现得像"再点一次就好了"，实际一直在漏。
+         */
+        LayerConfig.setCasting(true);
     }
 
     /**
@@ -499,8 +524,39 @@ public class MirrorController {
 
         bgMode = true;
         final String comp = component;
+        /*
+         * **清零虚拟屏无输出计时**（2026-11-05）。
+         *
+         * 上一轮判死时已清零，但"上一轮是被别的路径退出的"
+         * （比如目标回前台 exitBg、或 stop）时不会清 ——
+         * 那样新一轮的起始时刻还是旧的，一进来就可能立刻判死。
+         * 每次进后台跟随都是全新的观察窗口，必须从这里重新计时。
+         */
+        vdDeadSince = 0;
         state("回桌面 —— App 转后台，仪表继续实时跟随", true);
         DashLog.i(TAG, "进入后台跟随模式 gen=" + myGen);
+
+        /*
+         * ══════════════════════════════════════════════════════════════
+         * **第一件事：立刻停抓主屏**（2026-11-05 修复"回 HOME 漏桌面"）
+         * ══════════════════════════════════════════════════════════════
+         *
+         * 原来 DCBG 是在 vd.start() 里面才发的，而 enterBg 前面还有
+         * 一堆准备工作（读 prefs、算屏幕尺寸、设截取框）。
+         * 日志实证：
+         *   12:48:42.282  enterBg 开始
+         *   12:48:42.758  第一帧 VD 画面（476ms 后）
+         *
+         * **那 476ms 里 dcapd2 还在抓主屏 = 抓的是桌面** ——
+         * 用户看到的就是"按 HOME 仪表闪一下桌面"。
+         *
+         * 修法：进门就发，建连 + 4 字节 write 是微秒级，
+         * 之后再做那堆准备工作，dcapd2 全程不碰主屏。
+         */
+        boolean dcbgOk = vd.sendDcbgNow();
+        if (!dcbgOk) {
+            DashLog.w(TAG, "DCBG 未发出 —— 仪表可能多闪几帧桌面");
+        }
 
         if (gen.get() != myGen) return;
 
@@ -574,6 +630,32 @@ public class MirrorController {
             }
             return;
         }
+        /*
+         * **还要复核 bgMode**（2026-11-05）。
+         *
+         * vd.start() 里是 am display move-stack，单次 6~8 秒。
+         * 这期间目标 App 完全可能自己回到前台 → loop 的另一处调 exitBg()
+         * 把 bgMode 置 false、把虚拟屏拆了、断了帧源。
+         * 如果这里不检查，紧接着就会去 touch dcapd2.bg（进入"跟随模式"
+         * 但屏已经没了），dcapd2 从此既不抓主屏、也没帧可收
+         * → 表现为"后台跟随失败（虚拟屏无输出）"。
+         *
+         * gen 只能捕捉 start/stop（新会话），捕捉不到"同会话内切回前台"，
+         * 所以必须单独看 bgMode。
+         */
+        if (!bgMode) {
+            DashLog.i(TAG, "enterBg 期间已退出后台跟随（目标回前台），放弃本次搬屏结果");
+            try {
+                vd.stop(true);
+            } catch (Throwable ignored) {
+            }
+            VdMirror.setFeedFrames(false);
+            try {
+                AdbShell.exec("rm -f /data/local/tmp/dcapd2.bg", CHUNK);
+            } catch (Throwable ignored) {
+            }
+            return;
+        }
 
         if (!started) {
             setPause();                 // 先冻住，再断帧源，中间不漏桌面
@@ -602,6 +684,23 @@ public class MirrorController {
                     + "（可能是系统服务类 App，没有可投屏的界面）"
                     + "。请换一个 App 重试", true);
         } else {
+            /*
+             * ══════════════════════════════════════════════════════════
+             * **虚拟屏起来了，再补发一次截取框**（2026-11-05 修）
+             * ══════════════════════════════════════════════════════════
+             *
+             * 上面 setCropRect() 那次调用时虚拟屏还没建、vdW/vdH 还是
+             * 上一次的旧值（甚至是初值 1280×720），换算出来的裁剪框必然是错的
+             * —— 它内部会退化成"只记下来、先不发"（sPendingCrop）。
+             *
+             * vd.start() 里 armed=true 之后确实会自动补发一次，
+             * 但那是**另一条线程**、且紧接着就要开始喂帧，
+             * 时序上不保证 dcapd2 在收到第一帧之前就拿到正确的裁剪框。
+             *
+             * 这里显式再发一次，确保「裁剪框先到、帧后到」——
+             * 否则头几帧会按默认整块渲染，用户看到画面"先大后小"跳一下。
+             */
+            republishVdCrop();
             try {
                 AdbShell.exec("touch /data/local/tmp/dcapd2.bg", CHUNK);
             } catch (Throwable ignored) {
@@ -609,10 +708,28 @@ public class MirrorController {
         }
     }
 
-    /** 目标回前台 → 断帧源（dcapd2 自动恢复主屏抓帧），摘掉后台标志。 */
+    /**
+     * 目标回前台 → 断帧源（dcapd2 自动恢复主屏抓帧），摘掉后台标志。
+     *
+     * **必须和 enterBg 用同一把锁**（2026-11-05）。
+     *
+     * enterBg 是 synchronized，原来 exitBg 不是 —— 于是两者可以交错：
+     *   · 线程 A（loop）正在 enterBg 里建虚拟屏、setFeedFrames(true)
+     *   · 线程 B（readStats 判死路径）调 exitBg：bgMode=false、
+     *     vd.stop(true) 把刚建好的屏拆了、setFeedFrames(false)
+     *   · A 接着往下跑：把 App 搬进一块已经被拆掉的虚拟屏
+     * → 日志里「App 已转后台（虚拟屏 N）」紧跟「退出后台跟随模式」，
+     *   N 已经不存在了，后续当然"无帧"。
+     *
+     * 加 synchronized 后两者互斥；锁的是 this，与 enterBg 一致，
+     * 且两个方法内部都没有会再拿这把锁的调用（vd.* 是另一个对象），
+     * 不会自锁。
+     */
     private void exitBg() {
         if (!bgMode) return;
         bgMode = false;
+        /* 退出跟随 = 上一轮观察窗口作废，下次 enterBg 会重新计时 */
+        vdDeadSince = 0;
         DashLog.i(TAG, "退出后台跟随模式");
         vd.stop(true);
         VdMirror.setFeedFrames(false);
@@ -620,7 +737,24 @@ public class MirrorController {
             AdbShell.exec("rm -f /data/local/tmp/dcapd2.bg", CHUNK);
         } catch (Throwable ignored) {
         }
-        vd.hold();   // 回到主屏模式后立刻把控制通道重新挂上
+        /*
+         * ══════════════════════════════════════════════════════════════
+         * **回主屏模式必须把控制通道重新挂上**（2026-11-05 修）
+         * ══════════════════════════════════════════════════════════════
+         *
+         * setFeedFrames(false) 内部会把 sProxyWanted 一起置 false，
+         * 于是紧接着这行 `vd.hold()` 的 ensureConnected() 直接 return false ——
+         * **控制通道根本没连上**，用户以为挂好了，其实没有。
+         *
+         * 后果：回到前台之后改「截取 App 页面」或「按比例框选」，
+         * 'DCSR' 下发失败（"控制通道未建立"）→ 只能 pkill 重启 dcapd2，
+         * 也就是日志里那些"配置已热更新"时有时无的情况。
+         *
+         * 修：先显式允许建连，再 hold()。
+         */
+        VdMirror.setProxyWanted(true);
+        boolean held = vd.hold();
+        DashLog.i(TAG, "回主屏模式，控制通道" + (held ? "已重新挂上" : "挂接失败（热更新不可用）"));
     }
 
     private void setCastingFlag(boolean on) {
@@ -684,7 +818,27 @@ public class MirrorController {
          * 修法：start() 记下启动时刻，loop 在前 6 秒内**不做离开判定**，
          *      只等 App 上来。如果 6 秒后还没上来，才认为是真的失败。
          */
-        long startGraceAt = SystemClock.elapsedRealtime();
+        /*
+         * ══════════════════════════════════════════════════════════════
+         * **宽限期不能是"循环开始后 6 秒"**（2026-11-05 修复）
+         * ══════════════════════════════════════════════════════════════
+         *
+         * 原来写成 `long startGraceAt = 循环开始时刻`，配 `LAUNCH_GRACE_MS=6000`。
+         * 循环是长期运行的（一次投屏几分钟到几小时），
+         * 所以**一旦跑过 6 秒，inGrace 就永久为 false**，
+         * 之后每 800ms 的前台检查只要读到"不是目标 App"就立刻 enterBg。
+         *
+         * 实际后果：App 起不来 / 用户切到别的 App / 系统弹窗抢焦点时，
+         * 会疯狂 enterBg → 新建虚拟屏 → 无帧 → exitBg 的循环。
+         * 日志里 displayId 从 11 一路涨到 16、`启动 dashcastd` 七次，
+         * 就是这个机制在反复触发。
+         *
+         * 修法：宽限期只在**「刚把目标拉到前台」那一刻**有意义，
+         * 所以改成可变字段，每次 am start 之后都刷新成"现在"。
+         * 循环空闲时它会自然变旧（>6 秒），这才是正确语义：
+         * 「刚拉起 → 给它 6 秒上台；跑久了 → 该检查就检查」。
+         */
+        long[] graceAt = { SystemClock.elapsedRealtime() };
         final long LAUNCH_GRACE_MS = 6000;
         long lastCpAliveCheck = 0, lastRectSync = 0, lastHold = 0;
         int failCount = 0, deadChecks = 0;
@@ -721,6 +875,7 @@ public class MirrorController {
                         AdbShell.exec("am start --display 0 -n " + component, 6000);
                     } catch (Throwable ignored) {
                     }
+                    graceAt[0] = SystemClock.elapsedRealtime();   /* 刚拉起，重新计时 */
                     sleep(1000);
                     if (gen.get() != myGen) return;
                 } else if (hudMode) {
@@ -807,8 +962,22 @@ public class MirrorController {
                  * 这期间 foregroundPkg() 读到的是桌面 ——
                  * 不能据此判定"目标已转后台"，否则会立刻进虚拟屏跟随并失败。
                  */
-                boolean inGrace = (now - startGraceAt) < LAUNCH_GRACE_MS;
-                if (!hud && now - lastFgCheck >= 800) {
+                boolean inGrace = (now - graceAt[0]) < LAUNCH_GRACE_MS;
+                /*
+                 * **800 → 1500ms**（2026-11-05 降频）。
+                 *
+                 * 这里每次都要发起一次 ADB 连接跑 `dumpsys window displays`，
+                 * 而 AdbShell.exec 是「一次调用一条 TCP」：connect → CNXN 协商
+                 * → OPEN → 收数据 → close。命令本身几毫秒，付的是协议开销。
+                 *
+                 * 前后台切换的判定不需要 800ms 精度 —— App 切走之后
+                 * 晚 700ms 才发现，用户完全感知不到；但 ADB 连接数
+                 * 从 1.25 次/秒降到 0.67 次/秒，省了近一半。
+                 *
+                 * 和 readStats 一起，把稳态连接数从约 4.25 次/秒
+                 * 压到约 2 次/秒（见 readStats 里对应的注释）。
+                 */
+                if (!hud && now - lastFgCheck >= 1500) {
                     lastFgCheck = now;
                     String fg = foregroundPkg();
                     fgIsTarget = pkg != null && pkg.equals(fg);
@@ -830,10 +999,20 @@ public class MirrorController {
                     }
                 }
 
-                /* ③ 每秒一次：帧率 / 带宽 / 图块 */
-                if (now - lastStats >= 1000) {
+                /*
+                 * ③ **2 秒一次，一次 ADB 连接搞定两件事**（2026-11-05）
+                 *
+                 * 原来是 `if (daemonAlive()) readStats();` —— 两次独立连接
+                 * （`pidof dcapd2` + `tail -3 dcapd2.log`）。
+                 * 现在合并成 readStatsAndAlive()，只付一次握手，
+                 * 而且两个结果天然同一时刻，不会读错行。
+                 *
+                 * 降频到 2 秒的依据：dcapd2 自己每秒才打一行 STAT，
+                 * 1 秒采样本来就在读同一行（甚至上一行）。2 秒一定拿到新行。
+                 */
+                if (now - lastStats >= 2000) {
                     lastStats = now;
-                    if (daemonAlive()) readStats();
+                    readStatsAndAlive();
                 }
 
                 /* ④ CP 侧 dashcastd 探活（5 秒一次，或矩形连败 3 次立即触发）。
@@ -1718,6 +1897,20 @@ public class MirrorController {
     }
 
     private boolean daemonAlive() {
+        /*
+         * **优先复用组合查询的结果**（2026-11-05）。
+         *
+         * 主循环每 2 秒会跑 readStatsAndAlive()，它一次就带回了
+         * "dcapd2 还在不在"。如果刚查过（3 秒内），直接用那个结果，
+         * 不再为同一个事实开第二条 ADB 连接。
+         *
+         * 超过 3 秒没查过才真的去 pidof —— 覆盖那些不在主循环节奏里的
+         * 调用（启动时探测、restartDaemonNow 前后校验）。
+         */
+        long since = SystemClock.elapsedRealtime() - lastCombinedStatAt;
+        if (lastCombinedStatAt > 0 && since < 3000) {
+            return lastDaemonAlive;
+        }
         try {
             String out = AdbShell.exec("pidof dcapd2", CHUNK);
             return out != null && out.trim().length() > 0;
@@ -1821,18 +2014,75 @@ public class MirrorController {
             return false;
         }
         synchronized (c.cleanupLock) {
+            /*
+             * ══════════════════════════════════════════════════════════
+             * **优先热更新，能不动进程就不动**（2026-11-05）
+             * ══════════════════════════════════════════════════════════
+             *
+             * 原来一律 pkill 重启：改一次截取框就断一次 TCP（8444 + 8450），
+             * 日志里满屏 Broken pipe / ECONNREFUSED，画面还闪一下黑。
+             * 实测一场 6 分钟的投屏出现了 9 次这样的循环。
+             *
+             * 现在先试热更新：
+             *   · 主屏抓取区 → 发 'DCSR'（dcapd2 的 g_src_* 是全局变量）
+             *   · 遮罩参数   → 写文件后 dcapd2 自己 500ms 轮询重载
+             *   · VD 裁剪框  → 发 'DCVP'（本来就有）
+             * 这些都能改，就不重启进程了。
+             *
+             * 只有**编码档 / 画布尺寸**变了才必须重启 —— MediaCodec 和
+             * 缓冲池都要重建，没法热改。
+             */
+            int[] cap = c.currentSrcCap();
+            boolean hotOk = false;
+            if (c.bgMode && c.vd != null && c.vd.hasControlChannel() && cap != null) {
+                /*
+                 * 后台跟随模式：dcapd2 在 VD 分支里用的是 g_vd_crop_*，
+                 * 主屏抓取区这时反而不重要。但两套都发一遍最稳 ——
+                 * 万一这一帧刚好切回主屏，参数也是对的。
+                 */
+                hotOk = c.vd.sendSrcCrop(cap);
+                c.republishVdCrop();
+                if (hotOk) {
+                    DashLog.i(TAG, "配置已热更新（后台跟随，未重启 dcapd2）");
+                    return true;
+                }
+            } else if (!c.bgMode && c.vd != null && c.vd.hasControlChannel() && cap != null) {
+                /* 主屏模式：只需热改抓取区 */
+                hotOk = c.vd.sendSrcCrop(cap);
+                if (hotOk) {
+                    DashLog.i(TAG, "配置已热更新（主屏抓取区，未重启 dcapd2）");
+                    return true;
+                }
+            }
+
+            /* 热更新不可用（没通道 / 参数缺）→ 才真的重启 */
             c.ensureBinary();
             int[] rect = c.lastRect != null ? c.lastRect : new int[]{0, 0, getOutputW(), getOutputH()};
-            DashLog.i(TAG, "按新配置重拉 dcapd2（用 sActive 实例）");
+            DashLog.w(TAG, "热更新不可用，重启 dcapd2（用 sActive 实例）");
             boolean ok = c.launchDaemon(rect);
-
-            /*
-             * 重拉后立刻把截取框同步给 VD（如果有虚拟屏）。
-             * 放在 launchDaemon 之后：新进程已经连上、代理通道已建，
-             * 这时发 'DCVP' 才会被正确接收。
-             */
             c.republishVdCrop();
             return ok;
+        }
+    }
+
+    /**
+     * 算出当前应该用的**主屏抓取区**（屏幕坐标）—— 和 launchDaemon 里
+     * 传给 dcapd2 的 argv[3..6] 是同一套值。
+     *
+     * 供热更新使用：只有它变了才需要发 'DCSR'。
+     */
+    private int[] currentSrcCap() {
+        try {
+            int[] s = screenSize();
+            int[] safeR = lastRect != null ? lastRect
+                    : new int[]{0, 0, getOutputW(), getOutputH()};
+            if (isMapHudActive()) {
+                return new int[]{HUD_SRC_X, HUD_SRC_Y, HUD_SRC_W, HUD_SRC_H};
+            }
+            return applyMapCrop(safeR);
+        } catch (Throwable t) {
+            DashLog.w(TAG, "算抓取区失败: " + t);
+            return null;
         }
     }
 
@@ -1862,6 +2112,24 @@ public class MirrorController {
     public void setFps(Context c, int f) {
         if (f < 5) f = 5;
         if (f > 120) f = 120;
+        /*
+         * **帧率没变就别重启 dcapd2**（2026-11-05）。
+         *
+         * 原来无论 old == new 都会走下面的 launchDaemon —— 而 launchDaemon
+         * 是 pkill + 重新拉起，TCP 8444 与 8450 全断，CP 侧 dashcastd
+         * 收 EOF 自己退出、图层被销毁，仪表闪一下。
+         *
+         * 调用方是 saveMask()：「保存并应用」每次都传当前帧率，
+         * 用户只想改遮罩，却每次都被这个重启打一顿。
+         * 日志里 8 分钟 6 次 dcapd2 重启，很大一部分来自这里。
+         *
+         * 只加一个相等判断，语义不变、代价为零。
+         */
+        if (f == fps) {
+            /* 值没变：只落 prefs（幂等），不碰进程 */
+            prefs(c).edit().putInt(PREF_FPS, f).apply();
+            return;
+        }
         fps = f;
         prefs(c).edit().putInt(PREF_FPS, f).apply();
         DashLog.i(TAG, "帧率切到 " + f + " fps");
@@ -1999,9 +2267,20 @@ public class MirrorController {
     }
 
     /** 读 dcapd2 的 STAT 行：帧率 / 图块 / 带宽 */
-    /** VD 无帧计数：连续几次采样 capture=0 就认为虚拟屏没在喂帧 */
-    /** VD 无帧计数：连续几次采样 capture=0 就认为虚拟屏没在喂帧 */
-    private int vdDeadStreak = 0;
+    /**
+     * **虚拟屏"无输出"起始时刻**（2026-11-05 替代原来的 vdDeadStreak 计数）。
+     *
+     * 原来是「连续 3 次采样 capture=0 就判死」，但采样间隔是 1 秒、
+     * 而 dcapd2 等首帧最长要 5 秒 —— 阈值比等待期还短，必然误杀。
+     *
+     * 改成记时刻：从「第一次发现既无帧也无字节」开始计时，
+     * 持续 {@link #VD_DEAD_TIMEOUT_MS} 才判死。
+     * 0 表示"当前没在计时"。
+     */
+    private volatile long vdDeadSince = 0;
+
+    /** 虚拟屏判死的持续时长：覆盖 5 秒等首帧 + 10 秒真实观察期 */
+    private static final long VD_DEAD_TIMEOUT_MS = 15000;
     /**
      * **VD 失败冷却期**（2026-11-05 修复死循环）。
      *
@@ -2019,11 +2298,77 @@ public class MirrorController {
      */
     private volatile long vdFailCooldownUntil = 0;
 
+    /**
+     * 上一次 [daemonAlive + readStats] 组合查询的时间戳。
+     * 两条周期性任务共用一次 ADB 连接，见 readStatsAndAlive()。
+     */
+    private volatile long lastCombinedStatAt = 0;
+    /** 组合查询得出的「dcapd2 是否存活」，供 daemonAlive() 复用 */
+    private volatile boolean lastDaemonAlive = false;
+
+    /**
+     * ══════════════════════════════════════════════════════════════
+     * **一次 ADB 连接同时拿「进程是否活着」和「STAT 行」**（2026-11-05）
+     * ══════════════════════════════════════════════════════════════
+     *
+     * 原来主循环里是两次独立调用：
+     *     if (daemonAlive()) readStats();
+     * 每条都走一次完整的 TCP 握手 + ADB CNXN 协商，
+     * 而它们读的是同一个地方（/data/local/tmp 下的进程和日志）。
+     *
+     * 合并成一条 shell 之后：
+     *   · ADB 连接数从 2 次/周期降到 1 次/周期
+     *   · 两个结果天然同一时刻，不会出现"pidof 说有、tail 却读到旧行"
+     *
+     * 用 `pidof dcapd2 || echo NOTRUNNING` 而不是 `pidof`：
+     * pidof 找不到时返回非 0，`;` 后面的命令照常执行，
+     * 但我们要能区分"没进程"和"日志为空"，所以显式打一个标记。
+     */
+    private void readStatsAndAlive() {
+        try {
+            /*
+             * 一条命令输出两段：第一行是 pid 标记，之后是日志尾部。
+             * 用 '---STAT---' 作为分隔符，避免和日志内容混淆。
+             */
+            String cmd = "echo '---PID---'; pidof dcapd2 || echo NOTRUNNING; "
+                    + "echo '---STAT---'; tail -3 " + LOGF + " 2>/dev/null";
+            String out = AdbShell.exec(cmd, 5000);
+            lastCombinedStatAt = SystemClock.elapsedRealtime();
+            if (out == null) {
+                lastDaemonAlive = false;
+                return;
+            }
+
+            int pidIdx = out.indexOf("---PID---");
+            int statIdx = out.indexOf("---STAT---");
+            String pidPart = "";
+            String statPart = out;
+            if (pidIdx >= 0 && statIdx > pidIdx) {
+                pidPart = out.substring(pidIdx + 9, statIdx).trim();
+                statPart = out.substring(statIdx + 10);
+            }
+            lastDaemonAlive = !pidPart.isEmpty() && !pidPart.contains("NOTRUNNING");
+
+            if (!lastDaemonAlive) return;   /* 进程不在，没必要解析 STAT */
+            parseStats(statPart);
+        } catch (Throwable t) {
+            lastDaemonAlive = false;
+            DashLog.w(TAG, "组合查询失败: " + t);
+        }
+    }
+
     private void readStats() {
         try {
             String out = AdbShell.exec("tail -3 " + LOGF, 4000);
             if (out == null) return;
+            parseStats(out);
+        } catch (Throwable ignored) {
+        }
+    }
 
+    /** 解析 STAT 行（原 readStats 的主体，抽出来给两条路径共用） */
+    private void parseStats(String out) {
+        try {
             Matcher m = Pattern.compile(
                     "STAT fps=(\\d+) capture=(\\d+) tiles=(\\d+) kbps=(\\d+)").matcher(out);
             String last = null;
@@ -2035,14 +2380,23 @@ public class MirrorController {
                 cap = Integer.parseInt(m.group(2));
                 t = Integer.parseInt(m.group(3));
                 k = Integer.parseInt(m.group(4));
-                /* 抓行尾的 src=VD / src=SCREEN 标记 */
-                int i2 = out.indexOf(m.group(0));
-                if (i2 >= 0) {
-                    int eol = out.indexOf('\n', i2);
-                    String line = eol > 0 ? out.substring(i2, eol) : out.substring(i2);
-                    if (line.contains("src=VD")) src = "VD";
-                    else if (line.contains("src=SCREEN")) src = "SCREEN";
-                }
+                /*
+                 * ══════════════════════════════════════════════════════════
+                 * **src 必须取自「同一个匹配」的那一行**（2026-11-05 修复）
+                 * ══════════════════════════════════════════════════════════
+                 *
+                 * 原来是 `out.indexOf(m.group(0))` —— 它**永远返回第一处**
+                 * 出现位置，而不是本次 m.find() 所在的那处。
+                 * `tail -3` 里若同时有 src=SCREEN 和 src=VD 两行，
+                 * cap 取的是最后一行、src 却取的是第一行 → 两者错配，
+                 * 会把"主屏的 0 帧"当成"VD 的 0 帧"判死。
+                 *
+                 * 改成从 m.end() 往后找行尾：那个位置之后就是本行的剩余部分。
+                 */
+                int eol = out.indexOf('\n', m.end());
+                String tail = eol > 0 ? out.substring(m.end(), eol) : out.substring(m.end());
+                if (tail.contains("src=VD")) src = "VD";
+                else if (tail.contains("src=SCREEN")) src = "SCREEN";
             }
             if (last == null) return;
 
@@ -2050,29 +2404,43 @@ public class MirrorController {
 
             /*
              * ══════════════════════════════════════════════════════════════
-             * **虚拟屏无帧检测**（2026-11-03 黑屏根因修复）
+             * **虚拟屏无帧检测**（2026-11-05 重写：原判定会误杀正常场景）
              * ══════════════════════════════════════════════════════════════
              *
-             * （dumpsys display 实测 owner 是别的进程、state OFF）
-             * → dcapd2 收到 DCBG 切到 VD 模式，却一帧都收不到
-             * → STAT 显示 src=VD capture=0 fps=0 → **仪表纯黑**
+             * 日志实证（dashcast-3.log）：
+             *   18:33:19.130 进入后台跟随 gen=7
+             *   18:33:23.732 虚拟屏连续 3 次无帧，退回主屏    ← 只隔 4.6 秒
+             * 同一会话里这条出现了 4 次，全是同一个套路。
+             * 但那 4.6 秒内 dcapd2 并不是"死了"，而是在**等首帧**：
+             * `frame_is_blank()` 会主动丢弃最多 150 帧（约 5 秒）的纯黑画面，
+             * 等 App 从主屏搬进虚拟屏后重新画出来。这段"一个字都不发"
+             * 是**设计好的**，不是故障。
              *
-             * enterBg 当时只校验 vd.start() 的返回值，没校验"真的出帧"。
-             * 这里补上：VD 模式下连续 3 次采样 capture=0（≈3 秒），
-             * 判定虚拟屏死了 → 退出 bgMode，回到主屏抓取（至少还有画面）。
+             * 原来的判定只看 `capture==0`，窗口 3 秒 —— 两个时序直接打架：
+             * 一边规定"最多等 5 秒"，另一边"3 秒就判死"。
              *
-             * 为什么退回主屏而不是重试虚拟屏：
-             *   App 已经在后台，主屏抓的就是桌面 —— 画面不理想，
-             *   但**比纯黑好**，而且用户可以立刻看到"跟随失败"的状态提示。
+             * 新判定要同时满足三个条件，才算真死：
+             *   ① src=VD                —— 确实在虚拟屏模式
+             *   ② cap==0 && k==0        —— 既没合成帧、也没发出任何字节
+             *                              （frame_is_blank 丢弃时也是 0 字节，
+             *                                所以必须"持续够久"才能区分）
+             *   ③ 持续 15 秒            —— 覆盖 5 秒等首帧 + 10 秒真实观察期
+             *
+             * 15 秒仍无任何字节 → 虚拟屏真的没在喂帧（owner 被别的进程抢走、
+             * state OFF），此时退回主屏（画面不理想但比纯黑好）。
              */
-            if ("VD".equals(src) && cap == 0) {
-                vdDeadStreak++;
-                if (vdDeadStreak >= 3 && bgMode) {
-                    DashLog.w(TAG, "虚拟屏连续 " + vdDeadStreak + " 次无帧，退回主屏抓取");
-                    vdDeadStreak = 0;
+            boolean vdSilent = "VD".equals(src) && cap == 0 && k == 0;
+            if (vdSilent) {
+                long now2 = SystemClock.elapsedRealtime();
+                if (vdDeadSince == 0) vdDeadSince = now2;
+                long silentMs = now2 - vdDeadSince;
+                if (silentMs >= VD_DEAD_TIMEOUT_MS && bgMode) {
+                    DashLog.w(TAG, "虚拟屏持续 " + (silentMs / 1000)
+                            + " 秒无输出（capture=0 kbps=0），退回主屏抓取");
+                    vdDeadSince = 0;
                     /* 设置 30 秒冷却，避免 enterBg ↔ exitBg 死循环 */
                     vdFailCooldownUntil = SystemClock.elapsedRealtime() + 30000;
-                    state("后台跟随失败（虚拟屏无帧）—— 已退回主屏", true);
+                    state("后台跟随失败（虚拟屏长时间无输出）—— 已退回主屏", true);
                     try {
                         exitBg();
                     } catch (Throwable ex) {
@@ -2080,7 +2448,12 @@ public class MirrorController {
                     }
                 }
             } else {
-                vdDeadStreak = 0;
+                /*
+                 * 有帧或有字节 → 立刻清零计时。
+                 * 注意：判死之后 enterBg 会重新建屏，那时也要清零，
+                 * 见 enterBg() 里的 vdDeadSince = 0。
+                 */
+                vdDeadSince = 0;
             }
 
             // 有整帧要发却一个字节都没发出去 → 基本是 CP 端把连接关了。

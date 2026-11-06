@@ -1,4 +1,4 @@
-﻿# 构建产物
+# 构建产物
 src/ap/.gradle/
 src/ap/app/build/
 src/ap/build/
@@ -26,3 +26,6 @@ _probe/
 _backup/
 
 .commitmsg
+
+# 编译中间产物（build-dcapd2.ps1 重建时的旧二进制）
+*.old

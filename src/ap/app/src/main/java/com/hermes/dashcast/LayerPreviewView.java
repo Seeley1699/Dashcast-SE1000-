@@ -291,7 +291,6 @@ public class LayerPreviewView extends View {
         }
 
         /* 图层形状 */
-        /* 图层形状 */
         RectF r = new RectF(ox + cfg.x * scale, oy + cfg.y * scale,
                 ox + (cfg.x + cfg.w) * scale, oy + (cfg.y + cfg.h) * scale);
         Path path = buildPath(r);

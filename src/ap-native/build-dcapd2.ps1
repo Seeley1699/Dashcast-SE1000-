@@ -41,13 +41,25 @@ foreach ($l in @("gui","binder","ui","utils","cutils","nativewindow","log","andr
 [void]$a.Add("-Wl,--allow-shlib-undefined")
 [void]$a.Add("-Wl,-rpath,/system/lib64")
 
+# **编译前先删旧产物**（2026-11-05 修「假成功」）
+#
+# 原来只看 Test-Path：编译失败时旧的 dcapd2 还在目录里，
+# 脚本照样报 BUILD_OK，MD5 一点没变 —— 以为改了、实际没改，
+# 打包出去的 APK 里还是旧二进制，白白排查半天。
+# 现在先删掉，编译完看它在不在，假不了。
+$bin = "$HERE\dcapd2"
+if (Test-Path $bin) { Remove-Item $bin -Force -ErrorAction SilentlyContinue }
+
 $out = & $CLANG @a 2>&1 | Out-String
 
-if (Test-Path "$HERE\dcapd2") {
-    $sz = (Get-Item "$HERE\dcapd2").Length
-    $msg = "BUILD_OK $([math]::Round($sz/1KB,1)) KB"
+if (Test-Path $bin) {
+    $sz = (Get-Item $bin).Length
+    $md5 = (([Security.Cryptography.MD5]::Create().ComputeHash(
+                [IO.File]::ReadAllBytes($bin))) | ForEach-Object { $_.ToString('x2') }) -join ''
+    $msg = "BUILD_OK $([math]::Round($sz/1KB,1)) KB  md5=$md5"
 } else {
     $msg = "BUILD_FAIL`r`n$out"
 }
 Write-Output $msg
 $msg | Out-File "$HERE\_build_dcapd2.log" -Encoding utf8
+if (-not (Test-Path $bin)) { exit 1 }

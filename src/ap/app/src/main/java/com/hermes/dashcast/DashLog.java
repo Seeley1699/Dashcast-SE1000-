@@ -106,6 +106,22 @@ public final class DashLog {
         Context ctx = sCtx;
         if (ctx == null) return;   /* 还没 init，静默跳过 */
 
+        /*
+         * **V/D 级不落文件**（2026-11-05 修复"日志还是太长"）。
+         *
+         * 原来所有级别都写文件，于是把 pkt 逐包日志降成 V 级之后
+         * 依然写进了 dashcast.log —— 实测 8412 行里 7908 行还是 V 级噪音。
+         *
+         * 现在定规矩：
+         *   V/D  → 只进 logcat（开发调试用，不落盘）
+         *   I/W/E → 同时落盘（运维排查用）
+         *
+         * I 级就够了：业务关键节点（部署/投屏/切换/失败）全是 I；
+         * W/E 是异常；D 是"每个 ADB 包、每次切换"这种过程细节，
+         * 一个正常会话能刷几百行。
+         */
+        if (level == 'V' || level == 'D') return;
+
         final String line = buildLine(level, tag, msg, t);
         LocalStore.logTech(ctx, line);
     }
