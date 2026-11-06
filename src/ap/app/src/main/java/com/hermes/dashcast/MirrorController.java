@@ -309,7 +309,28 @@ public class MirrorController {
                          */
                         DashLog.i(TAG, "HUD 模式：忽略后台事件（无需虚拟屏跟随）");
                     } else {
-                        enterBg(myGen);
+                        /*
+                         * **窗口还在就别搬**（2026-11-06 修「按 HOME 后投到桌面」）
+                         *
+                         * 用户反馈：carplay 投屏成功后一回 HOME，
+                         * 仪表上就变成桌面，锁不住 carplay。
+                         *
+                         * 根因：这里原来无条件 enterBg()，它要把目标搬进虚拟屏。
+                         *   · 普通 App：move-stack 成功 → 虚拟屏里继续渲染 → 正常
+                         *   · 系统级 App：move-stack 被系统拒绝
+                         *     （日志 IllegalArgumentException: Trying to move stack）
+                         *     → 搬不进 → 主屏上只剩桌面 → dcapd2 抓到桌面
+                         *     → 仪表跟着变桌面
+                         *
+                         * 关键事实：carplay 的窗口**没被销毁**，只是不在最前面。
+                         * 合成器仍在合成它，captureScreen 抓那块矩形照样拿到像素。
+                         * 所以窗口还在时完全不动作，维持主屏抓取。
+                         */
+                        if (hasTargetWindow()) {
+                            DashLog.i(TAG, "按 HOME：目标窗口仍在，保持主屏抓取（不搬虚拟屏）");
+                        } else {
+                            enterBg(myGen);
+                        }
                     }
                 } finally {
                     pr.finish();
@@ -992,7 +1013,16 @@ public class MirrorController {
                          *   enterBg → VD 无帧 → exitBg → enterBg → …
                          * 日志里「虚拟屏 15/16/17/18...」不断新建。
                          */
-                        if (SystemClock.elapsedRealtime() >= vdFailCooldownUntil) {
+                        /*
+                         * **窗口还在就别进后台跟随**（2026-11-06）。
+                         *
+                         * 系统级 App 永远不在前台，原逻辑会一直触发 enterBg，
+                         * 而 move-stack 对它无效（日志 IllegalArgumentException），
+                         * 结果判定「投屏失败」。但它的窗口一直在，
+                         * 主屏抓取本来就能拿到，不需要搬。
+                         */
+                        if (SystemClock.elapsedRealtime() >= vdFailCooldownUntil
+                                && !hasTargetWindow()) {
                             enterBg(myGen);
                             if (gen.get() != myGen) return;
                         }
@@ -1089,7 +1119,7 @@ public class MirrorController {
                             sleep(1500);
                         }
                     }
-                } else if (fgIsTarget && !daemonAlive()) {
+                } else if (!daemonAlive() && (fgIsTarget || hasTargetWindow())) {
                     int[] r = windowRect(pkg);
                     if (r != null) {
                         lastRect = r;
@@ -1848,6 +1878,33 @@ public class MirrorController {
     public static void clearScreenPxCache() {
         MirrorController c = sActive;
         if (c != null) c.cachedScreenPx = null;
+    }
+
+    /**
+     * **目标 App 的窗口是否还在**（2026-11-06 方案 A）。
+     *
+     * 和 foregroundPkg() 的区别：那个只回答"谁在最前面"。
+     * 系统级 App（carplay 这类）永远不在最前面，
+     * 但只要合成器还在为它合成帧，captureScreen 就能抓到那块像素。
+     *
+     * 用法有两处：
+     *   ① 拉 dcapd2 的条件：窗口存在即可，不要求前台
+     *   ② 按 HOME 时：窗口还在就别搬虚拟屏（搬不动系统 App，
+     *      而且搬不动会导致仪表掉到桌面）
+     */
+    private boolean hasTargetWindow() {
+        if (pkg == null) return false;
+        try {
+            String out = AdbShell.exec(
+                    "dumpsys window windows | grep 'Window{' | grep -c '" + pkg + "'", 5000);
+            if (out == null) return false;
+            int n = 0;
+            try { n = Integer.parseInt(out.trim().replaceAll("[^0-9]", "")); } catch (Throwable ignored) {}
+            return n > 0;
+        } catch (Throwable t) {
+            DashLog.w(TAG, "查目标窗口失败: " + t);
+            return false;
+        }
     }
 
     private int[] windowRect(String pkg) {

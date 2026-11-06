@@ -542,11 +542,84 @@ private static final int CMD_SRC = 0x52534344;
         try {
             AdbShell.exec("am start --display " + displayId + " -n " + component, 6000);
             DashLog.i(TAG, "已用 am start --display " + displayId + " 拉起 " + component);
-            return true;
+            /*
+             * **必须回读确认它真的到了虚拟屏**（2026-11-06 关键修复）。
+             *
+             * 原来这里直接 return true —— 但 am start 只表示"发出去了"，
+             * 不代表成功。系统级 App（carplay）常见两种结果：
+             *   ① launchMode=singleTask/单实例：它被拉到**主屏**复用旧任务，
+             *      虚拟屏上什么都没有
+             *   ② Activity 拒绝在非主屏启动：直接失败
+             *
+             * 两种情况下 enterBg 都以为"搬屏成功"，于是：
+             *   · touch dcapd2.bg 进入跟随模式
+             *   · 但虚拟屏里没有内容 → 越抓不到
+             *   · 主屏又被 bg 标志挡住不抓 → 仪表黑屏/停住
+             *
+             * 而且等用户按 HOME，carplay 已经回到主屏了。
+             *
+             * 所以这里回读一次 am stack list，确认 task 真的落在 displayId 上。
+             * 没落上去就返回 false，让上层走"投屏失败"的明确提示，
+             * 而不是静默地假装成功。
+             */
+            if (taskOnDisplay(pkg, displayId)) {
+                DashLog.i(TAG, "确认 " + pkg + " 的 task 已在虚拟屏 " + displayId);
+                return true;
+            }
+            DashLog.w(TAG, "am start --display 后复核失败："
+                    + pkg + " 没有落到虚拟屏 " + displayId
+                    + "（多半是单实例 App 被复用到主屏，或拒绝在非主屏启动）");
+            return false;
         } catch (Throwable t) {
             DashLog.w(TAG, "am start --display 失败: " + t);
             return false;
         }
+    }
+
+    /**
+     * 复核：pkg 的任务是否真的挂在指定 display 上。
+     *
+     * 解析 `am stack list` 的 Stack/Task 结构：
+     *   Stack id=.. displayId=15
+     *     taskId=xxx: com.xxx/.MainActivity
+     * 遍历时记住当前 Stack 的 displayId，遇到该 pkg 的 taskId 就比对。
+     */
+    private boolean taskOnDisplay(String pkg, int wantDisplay) {
+        try {
+            String dump = AdbShell.exec("am stack list", 8000);
+            if (dump == null) return false;
+            int curDisplay = -1;
+            for (String raw : dump.split("\n")) {
+                String line = raw.trim();
+                if (line.startsWith("Stack id=")) {
+                    int di = line.indexOf("displayId=");
+                    curDisplay = di >= 0
+                            ? leadingIntSafe(line.substring(di + "displayId=".length())) : -1;
+                    continue;
+                }
+                if (line.startsWith("taskId=")) {
+                    int colon = line.indexOf(": ");
+                    if (colon < 0) continue;
+                    String rest = line.substring(colon + 2);
+                    int slash = rest.indexOf('/');
+                    String tpkg = slash > 0 ? rest.substring(0, slash) : "";
+                    if (pkg.equals(tpkg) && curDisplay == wantDisplay) return true;
+                }
+            }
+        } catch (Throwable t) {
+            DashLog.w(TAG, "复核 task 所在屏失败: " + t);
+        }
+        return false;
+    }
+
+    /** 从字符串开头解析整数（遇到非数字停） */
+    private static int leadingIntSafe(String s) {
+        int v = 0, i = 0;
+        while (i < s.length() && s.charAt(i) >= '0' && s.charAt(i) <= '9') {
+            v = v * 10 + (s.charAt(i) - '0');
+            i++;
+        }
+        return v;
     }
 
     /** 静默 sleep，不吞 InterruptedException 的状态 */

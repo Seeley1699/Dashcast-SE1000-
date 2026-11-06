@@ -81,6 +81,22 @@ public final class AdbShell {
     /** 串行化所有 exec：同一条连接上的 OPEN 必须一个一个来 */
     private static final Object sLock = new Object();
 
+    /**
+     * **本机 adbd 是否支持连接复用**（2026-11-06 实测修正）。
+     *
+     * 日志实证（dashcast-4.log）：8 分钟内出现 374 次
+     * 「复用连接不可用，已降级为新连接」，约 47 次/分钟。
+     *
+     * 根因：降级重连成功后 sSocket 又变成非空，下一次 exec 又走复用路径、
+     * 又失败、又降级 —— 每次命令都要「先失败一次再重连」，
+     * 比原来"每次新建"还慢。
+     *
+     * 所以改成：**失败一次就认定这台机器不支持复用**，
+     * 之后永久走"每次新建"。只在进程重启后重新试探。
+     * 代价是失去复用收益，但至少不再付失败的开销。
+     */
+    private static volatile boolean sReuseBroken = false;
+
     private AdbShell() {}
 
     /** 本机 adbd 是否可用（root + 免认证） */
@@ -112,6 +128,7 @@ public final class AdbShell {
                 closeQuietly();
             }
 
+            if (sReuseBroken) closeQuietly();
             boolean needConnect = sSocket == null;
             try {
                 if (needConnect) {
@@ -119,6 +136,8 @@ public final class AdbShell {
                 }
                 String result = runCommand(command, timeoutMs);
                 sLastUsedAt = SystemClock.elapsedRealtime();
+                sLastUsedAt = SystemClock.elapsedRealtime();
+                if (sReuseBroken) closeQuietly();
                 return result;
             } catch (Throwable t) {
                 /*
@@ -146,7 +165,11 @@ public final class AdbShell {
                         connectAndHandshake();
                         String result2 = runCommand(command, timeoutMs);
                         sLastUsedAt = SystemClock.elapsedRealtime();
-                        DashLog.w(TAG, "复用连接不可用，已降级为新连接（后续仍会尝试复用）");
+                        if (!sReuseBroken) {
+                            sReuseBroken = true;
+                            DashLog.w(TAG, "本机 adbd 不支持连接复用，已永久切换为每次新建（只报一次）");
+                        }
+                        closeQuietly();
                         return result2;
                     } catch (Throwable t2) {
                         closeQuietly();

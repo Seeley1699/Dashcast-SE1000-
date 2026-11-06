@@ -58,27 +58,27 @@
 
     <!-- ══ 背景：浅灰页面 + 白色卡片 ══ -->
     <!-- 页面底：Color.gray.opacity(0.06) 叠在白底上的等效值 -->
-    <color name="surface_root">#FFDDE1E8</color>
+    <color name="surface_root">#FFF3F3F2</color>
     <!-- 卡片：systemBackground -->
-    <color name="surface_card">#FFEFF2F7</color>
+    <color name="surface_card">#FFFFFFFF</color>
     <!-- 次级面（搜索框/输入区）：比卡片略灰，用于区分可交互区 -->
-    <color name="surface_raised">#FFE5E9F0</color>
+    <color name="surface_raised">#FFEDEDEB</color>
     <!-- 按下态：iOS 的 systemFill 概念 -->
-    <color name="surface_raised_press">#FFD5DAE3</color>
+    <color name="surface_raised_press">#FFE0E0DD</color>
     <!-- 描边：iOS separator -->
-    <color name="surface_border">#FFCBD2DE</color>
+    <color name="surface_border">#FFE4E4E1</color>
     <!-- 禁用底 -->
-    <color name="surface_muted">#FFE7EBF2</color>
+    <color name="surface_muted">#FFECECEA</color>
     <!-- 预览区（画布）：纯白，让网格线清晰 -->
-    <color name="surface_deep">#FFF4F7FB</color>
+    <color name="surface_deep">#FFFAFAF9</color>
 
     <!-- ══ 文字：iOS label 三级 ══ -->
-    <color name="content_primary">#FF2B2F36</color>     <!-- 深灰（原纯黑，对比度 21:1→11:1 更柔和） -->
-    <color name="content_secondary">#FF545A66</color>   <!-- 中深灰 -->
-    <color name="content_tertiary">#FF858B99</color>    <!-- 弱文字 -->
-    <color name="content_quaternary">#FF8A8A90</color>
+    <color name="content_primary">#FF1C1C1E</color>     <!-- 深灰（原纯黑，对比度 21:1→11:1 更柔和） -->
+    <color name="content_secondary">#FF6B6B70</color>   <!-- 中深灰 -->
+    <color name="content_tertiary">#FF9A9A9F</color>    <!-- 弱文字 -->
+    <color name="content_quaternary">#FF9A9A9F</color>
     <!-- 强调文字：用户要求所有文字纯黑，故改 #000000（原 #007AFF） -->
-    <color name="content_accent">#FF000000</color>
+    <color name="content_accent">#FF1C1C1E</color>
 
 
     <!-- ══ 主色：iOS systemBlue ══ -->
@@ -86,12 +86,12 @@
     <color name="accent_press">#FF0062CC</color>
     <color name="accent_on">#FFFFFFFF</color>
     <!--
-      accent_soft 原本是 #339BFF（淡蓝），被 14 处**按钮文字**引用。
-      用户要求所有文字纯黑 → 改 #000000。
-      注意：这个名字虽叫 accent，但实际只当文字色用，
-      改黑不影响任何背景色。
+      accent_soft 被 14 处按钮文字引用，取主色深一档保证白卡上对比度达标。
+
+
+
     -->
-    <color name="accent_soft">#FF000000</color>
+    <color name="accent_soft">#FF0A6FD8</color>
 
     <color name="accent_tint">#0F007AFF</color>
 
