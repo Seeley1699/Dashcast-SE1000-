@@ -27,7 +27,6 @@ import android.content.pm.ApplicationInfo;
 import android.content.pm.PackageManager;
 import android.content.pm.ResolveInfo;
 import android.graphics.Typeface;
-import android.media.projection.MediaProjectionManager;
 import android.os.Build;
 import android.view.Window;
 import android.view.WindowInsets;
@@ -95,10 +94,7 @@ public class MainActivity extends Activity {
     private static final String K_LABEL = "target_label";
 
     /** 屏幕捕获授权结果（本 ROM 建 PUBLIC 虚拟屏必须带这个 token） */
-    private Intent projectionData = null;
     /** 本轮已为"兜底建屏"弹过一次授权框了，别再弹第二次 */
-    private boolean projectionTried = false;
-    private static final int REQ_PROJECTION = 0x1001;
 
     /** busy 看门狗超时（推 dashcastd 走 SSH 分块上传，给足 30 秒） */
     private static final long BUSY_TIMEOUT_MS = 30000;
@@ -332,9 +328,9 @@ public class MainActivity extends Activity {
         left.addView(sectionLabel("服务部署"));
         LinearLayout deployRow = new LinearLayout(this);
         deployRow.setOrientation(LinearLayout.HORIZONTAL);
-        deployRow.addView(iconButton("部署", "↓", R.drawable.btn_primary,
+        deployRow.addView(iconButton("部署", R.drawable.ic_download, R.drawable.btn_primary,
                 android.R.color.white, v -> deployService()), rowLp(1f));
-        deployRow.addView(iconButton("停止", "■", R.drawable.btn_danger,
+        deployRow.addView(iconButton("停服务", R.drawable.ic_stop, R.drawable.btn_danger,
                 R.color.state_error, v -> stopCpService()), rowLp(1f));
         left.addView(deployRow);
 
@@ -371,15 +367,15 @@ public class MainActivity extends Activity {
         targetHint.setLayoutParams(thLp);
         castCard.addView(targetHint);
 
-        castCard.addView(iconButton("选择投屏 App", "◉", R.drawable.btn_secondary,
+        castCard.addView(iconButton("选择投屏 App", R.drawable.ic_target, R.drawable.btn_secondary,
                 R.color.accent_soft, v -> showAppPicker()));
 
         LinearLayout castMainRow = new LinearLayout(this);
         castMainRow.setOrientation(LinearLayout.HORIZONTAL);
-        btnStart = iconButton("开始投屏", "▶", R.drawable.btn_primary,
+        btnStart = iconButton("开始投屏", R.drawable.ic_play, R.drawable.btn_primary,
                 android.R.color.white, v -> startCast());
         castMainRow.addView(btnStart, rowLp(1.5f));
-        btnStop = iconButton("停止", "■", R.drawable.btn_danger,
+        btnStop = iconButton("停投屏", R.drawable.ic_stop, R.drawable.btn_danger,
                 R.color.state_error, v -> stopCastOnly());
         castMainRow.addView(btnStop, rowLp(1f));
         castCard.addView(castMainRow);
@@ -388,10 +384,10 @@ public class MainActivity extends Activity {
          * 重构时漏掉过一次，导致完全无法切档 —— 现在固定在主操作下方。 */
         LinearLayout codecRow = new LinearLayout(this);
         codecRow.setOrientation(LinearLayout.HORIZONTAL);
-        btnCodecBgra = iconButton("BGRA+LZ4", "◐", R.drawable.btn_secondary,
+        btnCodecBgra = iconButton("BGRA+LZ4", R.drawable.ic_half, R.drawable.btn_secondary,
                 R.color.accent_soft, v -> setCodecMode(MirrorController.CODEC_BGRA));
         codecRow.addView(btnCodecBgra, rowLp(1f));
-        btnCodecH264 = iconButton("H.264", "▣", R.drawable.btn_secondary,
+        btnCodecH264 = iconButton("H.264", R.drawable.ic_square_in, R.drawable.btn_secondary,
                 R.color.accent_soft, v -> setCodecMode(MirrorController.CODEC_H264));
         codecRow.addView(btnCodecH264, rowLp(1f));
         castCard.addView(codecRow);
@@ -948,139 +944,10 @@ public class MainActivity extends Activity {
         col.addView(head);
 
         /* 预览区（可拖拽；高度 360 —— 新增「截取 App 页面」区块后要给它腾地方） */
-        FrameLayout pvBox = new FrameLayout(this);
-        /*
-         * 预览容器改成 squircle（2026-11-04）。
-         *
-         * 原来直接 setBackgroundColor 纯色 → 直角矩形，
-         * 和周围 16dp squircle 卡片放在一起显得"方"。
-         *
-         * 现在用 SquircleDrawable：填充 #000000（MiUIX surface），
-         * 16dp 超椭圆圆角，和卡片一致的曲率。
-         * 描边 1dp outline，让预览区和页面底分开。
-         */
-        pvBox.setBackground(Squircle.of(this).border(
-                R.color.surface_deep, R.color.surface_border, 1f, Squircle.R_TAB));
-        LinearLayout.LayoutParams pvLp = new LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT, dp(320));
-        pvLp.setMargins(0, dp(8), 0, 0);
-        pvBox.setLayoutParams(pvLp);
-
-        maskPreview = new LayerPreviewView(this, maskCfg);
-        maskPreview.setOnGeometryChanged(c -> refreshMaskInfo());
-        /* 地图模式开的时候，预览上叠一块"实际抓取区"虚线框 */
-        maskPreview.setMapMode(mirror.isMapMode(), 2560, 1600);
-        /*
-         * 补应用「吸附网格」偏好。
-         * buildAppCropSection 在 maskPreview 创建之前就跑了（它在右栏顶部），
-         * 那次调用被 null 判断跳过。这里 maskPreview 已就绪，补一次。
-         */
-        maskPreview.setSnapEnabled(getSharedPreferences(PREF, MODE_PRIVATE)
-                .getBoolean("layer_snap_grid", true));
-
-        pvBox.addView(maskPreview, new FrameLayout.LayoutParams(
-                FrameLayout.LayoutParams.MATCH_PARENT,
-                FrameLayout.LayoutParams.MATCH_PARENT));
-        col.addView(pvBox);
-
-        maskInfo = new TextView(this);
-        maskInfo.setTextSize(15);
-        maskInfo.setTextColor(getColor(R.color.content_tertiary));
-        maskInfo.setPadding(dp(2), dp(4), 0, dp(8));
-        col.addView(maskInfo);
+        buildPreviewArea(col);
 
         /* ── 三个预设槽：点=应用，长按=保存当前，再长按=清空 ── */
-        LinearLayout presetRow = new LinearLayout(this);
-        presetRow.setOrientation(LinearLayout.HORIZONTAL);
-        LinearLayout.LayoutParams prLp = new LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT,
-                LinearLayout.LayoutParams.WRAP_CONTENT);
-        prLp.setMargins(0, 0, 0, dp(8));
-        presetRow.setLayoutParams(prLp);
-
-        maskPresetBtns = new LinearLayout[LayerConfig.PRESET_COUNT];
-        for (int slot = 0; slot < LayerConfig.PRESET_COUNT; slot++) {
-            final int s = slot;
-            LinearLayout btn = chipButton("", null);
-            btn.setLayoutParams(new LinearLayout.LayoutParams(0, dp(52), 1f));
-            ((LinearLayout.LayoutParams) btn.getLayoutParams())
-                    .setMargins(dp(4), 0, dp(4), 0);
-            maskPresetBtns[slot] = btn;
-
-            /* 短按：应用该预设（空槽提示保存方式） */
-            btn.setOnClickListener(v -> {
-                if (!LayerConfig.hasPreset(this, s)) {
-                    Toast.makeText(this, "预设 " + (s + 1)
-                            + " 还是空的 —— 长按保存当前位置", Toast.LENGTH_SHORT).show();
-                    return;
-                }
-                if (maskCfg.loadPreset(this, s)) {
-                    syncMaskControls();
-                    refreshMask();
-                    appendLog("已应用预设 " + (s + 1) + " · "
-                            + LayerPreviewView.geometryText(maskCfg));
-                    setStatus("状态：已应用预设 " + (s + 1));
-
-                    /*
-                     * **必须走完整下发路径**（2026-11-02 bug 修复）。
-                     *
-                     * 原来这里只做到上面三行就结束了 —— 内存和预览变了，
-                     * 但 dcapd2.layer、SharedPreferences、CP 的 destination
-                     * 三处持久状态全是旧值。表现就是：
-                     *   「预设的遮罩尺寸应用不上，得再点一次保存并应用」
-                     * H.264 档最先暴露（它要求编码尺寸=遮罩尺寸=destination
-                     * 三者 1:1，不一致就是明显的位置错+拉伸）。
-                     *
-                     * applyFully() 把这套完整路径收进了 LayerConfig，
-                     * 与「保存并应用」走同一份代码，以后不会再漏。
-                     * 它会写文件（adb），必须在后台线程。
-                     */
-                    final LayerConfig snap = maskCfg;
-                    final boolean casting = MirrorController.isMirroring();
-                    final android.content.Context appCtx = getApplicationContext();
-                    new Thread(() -> {
-                        try {
-                            snap.applyFully(appCtx);
-                            DashLog.i("DashcastMask", "预设 " + (s + 1) + " 已完整下发"
-                                    + (casting ? "（含图层矩形）" : "（未投屏，仅落盘）"));
-                        } catch (Throwable ex) {
-                            DashLog.w("DashcastMask", "预设下发失败: " + ex);
-                        }
-                    }, "preset-apply").start();
-                }
-            });
-
-            /* 长按：已存在 → 询问保存还是清空；不存在 → 直接保存 */
-            btn.setOnLongClickListener(v -> {
-                if (LayerConfig.hasPreset(this, s)) {
-                    new AlertDialog.Builder(this)
-                            .setTitle("预设 " + (s + 1))
-                            .setItems(new String[]{"保存当前到该槽", "清空该槽"},
-                                    (d, which) -> {
-                                        if (which == 0) doSavePreset(s);
-                                        else {
-                                            LayerConfig.clearPreset(this, s);
-                                            refreshPresetBtns();
-                                            appendLog("已清空预设 " + (s + 1));
-                                        }
-                                    })
-                            .show();
-                } else {
-                    doSavePreset(s);
-                }
-                return true;
-            });
-
-            presetRow.addView(btn);
-        }
-        col.addView(presetRow);
-
-        TextView presetHint = new TextView(this);
-        presetHint.setText("点预设=应用 · 长按=保存/清空");
-        presetHint.setTextSize(13);
-        presetHint.setTextColor(getColor(R.color.content_tertiary));
-        presetHint.setPadding(dp(4), 0, 0, dp(8));
-        col.addView(presetHint);
+        buildPresetRow(col);
 
         /* 形状 / 填充 / 缩放 / 帧率 四格 */
         LinearLayout r1 = new LinearLayout(this);
@@ -1231,8 +1098,53 @@ public class MainActivity extends Activity {
          * 现在只留一个「遮罩参数」，把 4 个滑块合在一组。
          */
         col.addView(maskSection("遮罩参数"));
-        LinearLayout g0 = grid2();
-        maskSbGrid = addMaskSlider(g0, "网格", 4, 128, maskCfg.grid, "px",
+
+        /*
+         * **低频参数收进「高级」折叠区**（2026-11-07，unslop）。
+         * 原来 15 个滑块平铺，调「羽化」要先滚过网格/边框/四角/梯形。
+         * 现在分两层：默认可见 = 羽化 + 四角圆角；高级内 = 网格/边框/梯形。
+         */
+        LinearLayout advancedBox = new LinearLayout(this);
+        advancedBox.setOrientation(LinearLayout.VERTICAL);
+
+        LinearLayout advancedHead = new LinearLayout(this);
+        advancedHead.setOrientation(LinearLayout.HORIZONTAL);
+        advancedHead.setGravity(Gravity.CENTER_VERTICAL);
+        advancedHead.setBackground(squircleFor(R.drawable.btn_secondary));
+        advancedHead.setClickable(true);
+        advancedHead.setPadding(dp(12), 0, dp(12), 0);
+        LinearLayout.LayoutParams ahLp = new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, dp(44));
+        ahLp.setMargins(dp(4), dp(8), dp(4), dp(4));
+        advancedHead.setLayoutParams(ahLp);
+
+        TextView advIcon = new TextView(this);
+        advIcon.setTextSize(13);
+        advIcon.setTextColor(getColor(R.color.content_secondary));
+        advIcon.setWidth(dp(18));
+        advancedHead.addView(advIcon);
+
+        TextView advLabel = new TextView(this);
+        advLabel.setText("高级参数（网格 / 边框 / 梯形）");
+        advLabel.setTextSize(15);
+        advLabel.setTextColor(getColor(R.color.content_secondary));
+        advancedHead.addView(advLabel, new LinearLayout.LayoutParams(
+                0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
+
+        final boolean advOpen = getSharedPreferences(PREF, MODE_PRIVATE)
+                .getBoolean("advanced_open", false);
+        advancedBox.setVisibility(advOpen ? android.view.View.VISIBLE : android.view.View.GONE);
+        advIcon.setText(advOpen ? "▾" : "▸");
+
+        advancedHead.setOnClickListener(v -> {
+            boolean now = advancedBox.getVisibility() != android.view.View.VISIBLE;
+            advancedBox.setVisibility(now ? android.view.View.VISIBLE : android.view.View.GONE);
+            advIcon.setText(now ? "▾" : "▸");
+            getSharedPreferences(PREF, MODE_PRIVATE).edit()
+                    .putBoolean("advanced_open", now).apply();
+        });
+
+        LinearLayout g0 = grid2();        maskSbGrid = addMaskSlider(g0, "网格", 4, 128, maskCfg.grid, "px",
                 v -> { maskCfg.grid = v; refreshMask(); });
         maskTvGrid = maskLastSliderVal;
         /*
@@ -1269,13 +1181,15 @@ public class MainActivity extends Activity {
         maskSbBorder = addMaskSlider(g0, "边框", 0, 40, maskCfg.border, "",
                 v -> { maskCfg.border = v; refreshMask(); });
         maskTvBorder = maskLastSliderVal;
-        col.addView(g0);
+        advancedBox.addView(g0);
 
         LinearLayout g1 = grid2();
         maskSbFeather = addMaskSlider(g1, "羽化", 0, 96, maskCfg.feather, "",
                 v -> { maskCfg.feather = v; refreshMask(); });
         maskTvFeather = maskLastSliderVal;
         col.addView(g1);
+        col.addView(advancedHead);
+        col.addView(advancedBox);
 
 
         /* ══════════════════════════════════════════════════════════════
@@ -1293,6 +1207,173 @@ public class MainActivity extends Activity {
          *
          * 状态存 prefs（"corner_locked"），重启后保持。
          */
+        buildCornerControls(col);
+
+        advancedBox.addView(maskSection("梯形"));
+        LinearLayout g4 = grid2();
+        maskSbTrapTop = addMaskSlider(g4, "梯形上沿", 0, 300, maskCfg.trapTop, "",
+                v -> { maskCfg.trapTop = v; refreshMask(); });
+        maskTvTrapTop = maskLastSliderVal;
+        maskSbTrapBot = addMaskSlider(g4, "梯形下沿", 0, 300, maskCfg.trapBot, "",
+                v -> { maskCfg.trapBot = v; refreshMask(); });
+        maskTvTrapBot = maskLastSliderVal;
+        advancedBox.addView(g4);
+
+        buildMaskActionRow(col);
+
+        maskPreview.invalidate();
+        refreshMaskInfo();
+        refreshPresetBtns();
+
+        /*
+         * 面板搭好了，按当前编码档刷新一次可用性 ——
+         * 否则用户在 H.264 档下进来，控件是亮的但拖了没反应。
+         */
+        applyAlphaDependentAvailability(
+                MirrorController.getCodec() == MirrorController.CODEC_H264);
+    }
+
+    /** 预设槽 1/2/3 + 「点预设=应用 · 长按=保存/清空」提示 */
+    private void buildPresetRow(LinearLayout col) {
+        LinearLayout presetRow = new LinearLayout(this);
+        presetRow.setOrientation(LinearLayout.HORIZONTAL);
+        LinearLayout.LayoutParams prLp = new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT);
+        prLp.setMargins(0, 0, 0, dp(8));
+        presetRow.setLayoutParams(prLp);
+
+        maskPresetBtns = new LinearLayout[LayerConfig.PRESET_COUNT];
+        for (int slot = 0; slot < LayerConfig.PRESET_COUNT; slot++) {
+            final int s = slot;
+            LinearLayout btn = chipButton("", null);
+            btn.setLayoutParams(new LinearLayout.LayoutParams(0, dp(52), 1f));
+            ((LinearLayout.LayoutParams) btn.getLayoutParams())
+                    .setMargins(dp(4), 0, dp(4), 0);
+            maskPresetBtns[slot] = btn;
+
+            /* 短按：应用该预设（空槽提示保存方式） */
+            btn.setOnClickListener(v -> {
+                if (!LayerConfig.hasPreset(this, s)) {
+                    Toast.makeText(this, "预设 " + (s + 1)
+                            + " 还是空的 —— 长按保存当前位置", Toast.LENGTH_SHORT).show();
+                    return;
+                }
+                if (maskCfg.loadPreset(this, s)) {
+                    syncMaskControls();
+                    refreshMask();
+                    appendLog("已应用预设 " + (s + 1) + " · "
+                            + LayerPreviewView.geometryText(maskCfg));
+                    setStatus("状态：已应用预设 " + (s + 1));
+
+                    /*
+                     * **必须走完整下发路径**（2026-11-02 bug 修复）。
+                     *
+                     * 原来这里只做到上面三行就结束了 —— 内存和预览变了，
+                     * 但 dcapd2.layer、SharedPreferences、CP 的 destination
+                     * 三处持久状态全是旧值。表现就是：
+                     *   「预设的遮罩尺寸应用不上，得再点一次保存并应用」
+                     * H.264 档最先暴露（它要求编码尺寸=遮罩尺寸=destination
+                     * 三者 1:1，不一致就是明显的位置错+拉伸）。
+                     *
+                     * applyFully() 把这套完整路径收进了 LayerConfig，
+                     * 与「保存并应用」走同一份代码，以后不会再漏。
+                     * 它会写文件（adb），必须在后台线程。
+                     */
+                    final LayerConfig snap = maskCfg;
+                    final boolean casting = MirrorController.isMirroring();
+                    final android.content.Context appCtx = getApplicationContext();
+                    new Thread(() -> {
+                        try {
+                            snap.applyFully(appCtx);
+                            DashLog.i("DashcastMask", "预设 " + (s + 1) + " 已完整下发"
+                                    + (casting ? "（含图层矩形）" : "（未投屏，仅落盘）"));
+                        } catch (Throwable ex) {
+                            DashLog.w("DashcastMask", "预设下发失败: " + ex);
+                        }
+                    }, "preset-apply").start();
+                }
+            });
+
+            /* 长按：已存在 → 询问保存还是清空；不存在 → 直接保存 */
+            btn.setOnLongClickListener(v -> {
+                if (LayerConfig.hasPreset(this, s)) {
+                    new AlertDialog.Builder(this)
+                            .setTitle("预设 " + (s + 1))
+                            .setItems(new String[]{"保存当前到该槽", "清空该槽"},
+                                    (d, which) -> {
+                                        if (which == 0) doSavePreset(s);
+                                        else {
+                                            LayerConfig.clearPreset(this, s);
+                                            refreshPresetBtns();
+                                            appendLog("已清空预设 " + (s + 1));
+                                        }
+                                    })
+                            .show();
+                } else {
+                    doSavePreset(s);
+                }
+                return true;
+            });
+
+            presetRow.addView(btn);
+        }
+        col.addView(presetRow);
+
+        TextView presetHint = new TextView(this);
+        presetHint.setText("点预设=应用 · 长按=保存/清空");
+        presetHint.setTextSize(13);
+        presetHint.setTextColor(getColor(R.color.content_tertiary));
+        presetHint.setPadding(dp(4), 0, 0, dp(8));
+        col.addView(presetHint);
+    }
+
+    /** 预览画布（黑底 squircle）+ 下方几何信息行 */
+    private void buildPreviewArea(LinearLayout col) {
+        FrameLayout pvBox = new FrameLayout(this);
+        /*
+         * 预览容器改成 squircle（2026-11-04）。
+         *
+         * 原来直接 setBackgroundColor 纯色 → 直角矩形，
+         * 和周围 16dp squircle 卡片放在一起显得"方"。
+         *
+         * 现在用 SquircleDrawable：填充 #000000（MiUIX surface），
+         * 16dp 超椭圆圆角，和卡片一致的曲率。
+         * 描边 1dp outline，让预览区和页面底分开。
+         */
+        pvBox.setBackground(Squircle.of(this).border(
+                R.color.surface_deep, R.color.surface_border, 1f, Squircle.R_TAB));
+        LinearLayout.LayoutParams pvLp = new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, dp(320));
+        pvLp.setMargins(0, dp(8), 0, 0);
+        pvBox.setLayoutParams(pvLp);
+
+        maskPreview = new LayerPreviewView(this, maskCfg);
+        maskPreview.setOnGeometryChanged(c -> refreshMaskInfo());
+        /* 地图模式开的时候，预览上叠一块"实际抓取区"虚线框 */
+        maskPreview.setMapMode(mirror.isMapMode(), 2560, 1600);
+        /*
+         * 补应用「吸附网格」偏好。
+         * buildAppCropSection 在 maskPreview 创建之前就跑了（它在右栏顶部），
+         * 那次调用被 null 判断跳过。这里 maskPreview 已就绪，补一次。
+         */
+        maskPreview.setSnapEnabled(getSharedPreferences(PREF, MODE_PRIVATE)
+                .getBoolean("layer_snap_grid", true));
+
+        pvBox.addView(maskPreview, new FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT,
+                FrameLayout.LayoutParams.MATCH_PARENT));
+        col.addView(pvBox);
+
+        maskInfo = new TextView(this);
+        maskInfo.setTextSize(15);
+        maskInfo.setTextColor(getColor(R.color.content_tertiary));
+        maskInfo.setPadding(dp(2), dp(4), 0, dp(8));
+        col.addView(maskInfo);
+    }
+
+    /** 四角圆角：标题 + 同步勾选 + 4 个滑块 */
+    private void buildCornerControls(LinearLayout col) {
         LinearLayout cornerHead = new LinearLayout(this);
         cornerHead.setOrientation(LinearLayout.HORIZONTAL);
         cornerHead.setGravity(Gravity.CENTER_VERTICAL);
@@ -1343,17 +1424,10 @@ public class MainActivity extends Activity {
         col.addView(g3);
 
         applyCornerLockStyle();
+    }
 
-        col.addView(maskSection("梯形"));
-        LinearLayout g4 = grid2();
-        maskSbTrapTop = addMaskSlider(g4, "梯形上沿", 0, 300, maskCfg.trapTop, "",
-                v -> { maskCfg.trapTop = v; refreshMask(); });
-        maskTvTrapTop = maskLastSliderVal;
-        maskSbTrapBot = addMaskSlider(g4, "梯形下沿", 0, 300, maskCfg.trapBot, "",
-                v -> { maskCfg.trapBot = v; refreshMask(); });
-        maskTvTrapBot = maskLastSliderVal;
-        col.addView(g4);
-
+    /** 遮罩面板底部：取消（还原）/ 保存并应用 */
+    private void buildMaskActionRow(LinearLayout col) {
         /* 保存 / 取消 */
         LinearLayout r2 = new LinearLayout(this);
         r2.setOrientation(LinearLayout.HORIZONTAL);
@@ -1369,20 +1443,9 @@ public class MainActivity extends Activity {
             refreshMask();
         }), rowLp(1f));
 
-        r2.addView(iconButton("保存并应用", "✓", R.drawable.btn_primary,
+        r2.addView(iconButton("保存并应用", R.drawable.ic_check, R.drawable.btn_primary,
                 android.R.color.white, v -> saveMask()), rowLp(1f));
         col.addView(r2);
-
-        maskPreview.invalidate();
-        refreshMaskInfo();
-        refreshPresetBtns();
-
-        /*
-         * 面板搭好了，按当前编码档刷新一次可用性 ——
-         * 否则用户在 H.264 档下进来，控件是亮的但拖了没反应。
-         */
-        applyAlphaDependentAvailability(
-                MirrorController.getCodec() == MirrorController.CODEC_H264);
     }
 
     /**
@@ -1920,10 +1983,10 @@ public class MainActivity extends Activity {
         /* 操作：读取窗口 / 应用并投屏 */
         LinearLayout actRow = new LinearLayout(this);
         actRow.setOrientation(LinearLayout.HORIZONTAL);
-        LinearLayout btnRead = iconButton("读取窗口", "⬇",
+        LinearLayout btnRead = iconButton("读取窗口", R.drawable.ic_download,
                 R.drawable.btn_secondary, R.color.content_primary,
                 v -> readTargetWindow());
-        LinearLayout btnApply = iconButton("应用并投屏", "✓",
+        LinearLayout btnApply = iconButton("应用并投屏", R.drawable.ic_check,
                 R.drawable.btn_selected, R.color.accent_on,
                 v -> applyAppCropAndCast());
         actRow.addView(btnRead, rowLp(1f));
@@ -2005,10 +2068,10 @@ public class MainActivity extends Activity {
          */
         LinearLayout shotRow = new LinearLayout(this);
         shotRow.setOrientation(LinearLayout.HORIZONTAL);
-        LinearLayout btnShot = iconButton("刷新截图（当底图）", "◨",
+        LinearLayout btnShot = iconButton("刷新截图（当底图）", R.drawable.ic_crop,
                 R.drawable.btn_secondary, R.color.content_primary,
                 v -> refreshBackgroundShot());
-        LinearLayout btnShotClear = iconButton("清除底图", "✕",
+        LinearLayout btnShotClear = iconButton("清除底图", R.drawable.ic_x,
                 R.drawable.btn_secondary, R.color.content_tertiary,
                 v -> {
                     if (appCropPreview != null) appCropPreview.setBackgroundShot(null);
@@ -2971,8 +3034,20 @@ public class MainActivity extends Activity {
         return getDrawable(bgRes);
     }
 
-    private LinearLayout iconButton(String text, String glyph, int bgRes, int colorRes,
+    /*
+     * **图标按钮：优先 vector drawable**（2026-11-07）。
+     *
+     * 原来传 "↓" "■" "▶" 这类字符，靠字体渲染：字形宽度/基线不一致、
+     * 缺字时字体回退可能变豆腐块、颜色只能整体 0.85 压暗。
+     * vector 是纯路径，任何 DPI 都清晰；颜色用 setImageTintList 精确控制。
+     */
+    private LinearLayout iconButton(String text, int iconRes, int bgRes, int colorRes,
                                     View.OnClickListener l) {
+        return makeIconButton(text, iconRes, null, bgRes, colorRes, l);
+    }
+
+    private LinearLayout makeIconButton(String text, int iconRes, String glyph,
+                                        int bgRes, int colorRes, View.OnClickListener l) {
         LinearLayout btn = new LinearLayout(this);
         btn.setOrientation(LinearLayout.HORIZONTAL);
         btn.setGravity(Gravity.CENTER);
@@ -2990,18 +3065,30 @@ public class MainActivity extends Activity {
         btn.setFocusable(true);
         btn.setPadding(dp(12), 0, dp(12), 0);
 
-        TextView ic = new TextView(this);
-        ic.setText(glyph);
-        ic.setTextSize(16);
-        ic.setTextColor(getColor(colorRes));
-        ic.setAlpha(0.85f);
-        LinearLayout.LayoutParams icLp = new LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.WRAP_CONTENT,
-                LinearLayout.LayoutParams.WRAP_CONTENT);
-        icLp.setMargins(0, 0, dp(8), 0);
-        ic.setLayoutParams(icLp);
-        btn.addView(ic);
-
+        /* 图标：有 iconRes 用 ImageView+vector（精确着色），否则退回字符字形 */
+        if (iconRes != 0) {
+            ImageView ic = new ImageView(this);
+            ic.setImageResource(iconRes);
+            ic.setScaleType(ImageView.ScaleType.CENTER_INSIDE);
+            int sz = dp(18);
+            LinearLayout.LayoutParams icLp = new LinearLayout.LayoutParams(sz, sz);
+            icLp.setMargins(0, 0, dp(8), 0);
+            ic.setLayoutParams(icLp);
+            ic.setImageTintList(android.content.res.ColorStateList.valueOf(getColor(colorRes)));
+            btn.addView(ic);
+        } else {
+            TextView ic = new TextView(this);
+            ic.setText(glyph);
+            ic.setTextSize(16);
+            ic.setTextColor(getColor(colorRes));
+            ic.setAlpha(0.85f);
+            LinearLayout.LayoutParams icLp = new LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.WRAP_CONTENT,
+                    LinearLayout.LayoutParams.WRAP_CONTENT);
+            icLp.setMargins(0, 0, dp(8), 0);
+            ic.setLayoutParams(icLp);
+            btn.addView(ic);
+        }
         TextView tx = new TextView(this);
         tx.setText(text);
         /*
@@ -3026,6 +3113,12 @@ public class MainActivity extends Activity {
         LinearLayout.LayoutParams selfLp = (LinearLayout.LayoutParams) btn.getLayoutParams();
         selfLp.setMargins(dp(4), dp(4), dp(4), dp(4));
         return btn;
+    }
+
+    /** 旧重载：仍接受字符字形（过渡用） */
+    private LinearLayout iconButton(String text, String glyph, int bgRes, int colorRes,
+                                    View.OnClickListener l) {
+        return makeIconButton(text, 0, glyph, bgRes, colorRes, l);
     }
 
     /** 状态卡里的单格指标：上面大数字，下面小标签，各占 1/3 */
@@ -3898,38 +3991,6 @@ public class MainActivity extends Activity {
     }
 
 
-    /** 弹系统的「开始录制或投放」授权框 —— 只有私有屏建不出来时的兜底路径才会到这儿 */
-    private void requestProjection() {
-        MediaProjectionManager mpm = (MediaProjectionManager)
-                getSystemService(Context.MEDIA_PROJECTION_SERVICE);
-        projectionTried = true;
-        setStatus("状态：这台 ROM 只肯给带镜像位的屏，需要一次屏幕授权…");
-        setDotColor(R.color.state_warn);
-        try {
-            startActivityForResult(mpm.createScreenCaptureIntent(), REQ_PROJECTION);
-        } catch (Exception e) {
-            DashLog.e(TAG, "拉起授权框失败", e);
-            setStatus("状态：拉起屏幕授权失败 " + e.getMessage());
-            setDotColor(R.color.text_sub);
-        }
-    }
-
-    @Override
-    protected void onActivityResult(int requestCode, int resultCode, Intent data) {
-        if (requestCode == REQ_PROJECTION) {
-            if (resultCode == RESULT_OK && data != null) {
-                projectionData = data;
-                setStatus("状态：已授权，开始投屏…");
-                startCast();
-            } else {
-                setStatus("状态：屏幕授权被拒绝（没有 token 建不了 PUBLIC 虚拟屏）");
-                setDotColor(R.color.text_sub);
-            }
-            return;
-        }
-        super.onActivityResult(requestCode, resultCode, data);
-    }
-
     /** 虚拟屏就绪回调：把目标 App 搬进虚拟屏（而非物理仪表屏） */
     private void onDisplayReady(int displayId) {
         if (displayId < 0) {
@@ -3951,8 +4012,6 @@ public class MainActivity extends Activity {
             return;
         }
 
-        // 送 App 上屏这一步可能要走本机 adbd（socket 阻塞），不能放在主线程
-        projectionTried = false;
 
         /*
          * **HUD 模式不需要"送 App 上屏"**（2026-11-02）。
