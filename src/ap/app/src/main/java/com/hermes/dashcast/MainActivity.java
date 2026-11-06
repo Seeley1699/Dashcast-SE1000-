@@ -916,15 +916,33 @@ public class MainActivity extends Activity {
         buildAppCropSection(col);
 
         /* 标题 */
+        final boolean maskPanelOpen = getSharedPreferences(PREF, MODE_PRIVATE)
+                .getBoolean("mask_panel_open", true);
+
         LinearLayout head = new LinearLayout(this);
         head.setOrientation(LinearLayout.HORIZONTAL);
         head.setGravity(Gravity.CENTER_VERTICAL);
 
+        /*
+         * **「图层遮罩」标题变成折叠条**（2026-11-07）。
+         *
+         * 之前它下面永远全部展开：预览 + 预设 + 形状 + 帧率 + 警告 +
+         * 11 个滑块 + 保存按钮，整条要滚动两三屏。
+         *
+         * 现在拆两层：
+         *   始终可见：预览画布 + 几何信息（核心视觉反馈，不该藏）
+         *   折叠内容：预设 / 形状 / 帧率 / 参数滑块 / 保存按钮
+         *
+         * 折叠后右栏只剩一块预览 —— 用户切到这个页面时先看到画面，
+         * 要改参数再展开，符合「先看结果、再调参数」的操作顺序。
+         */
         TextView t = new TextView(this);
-        t.setText("图层遮罩");
+        t.setText(maskPanelOpen ? "▾ 图层遮罩" : "▸ 图层遮罩");
         t.setTextSize(20);
         t.setTextColor(getColor(R.color.content_primary));
         t.setTypeface(Typeface.DEFAULT_BOLD);
+        head.setClickable(true);
+        head.setPadding(dp(0), dp(4), dp(0), dp(4));
         head.addView(t, new LinearLayout.LayoutParams(
                 0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
 
@@ -947,7 +965,24 @@ public class MainActivity extends Activity {
         buildPreviewArea(col);
 
         /* ── 三个预设槽：点=应用，长按=保存当前，再长按=清空 ── */
-        buildPresetRow(col);
+        /*
+         * ↑ 以上（预览画布 + 几何信息）始终可见。
+         * ↓ 以下全部装进 maskBody —— 折叠时一起隐藏。
+         */
+        LinearLayout maskBody = new LinearLayout(this);
+        maskBody.setOrientation(LinearLayout.VERTICAL);
+        maskBody.setVisibility(maskPanelOpen ? android.view.View.VISIBLE : android.view.View.GONE);
+        col.addView(maskBody);
+
+        head.setOnClickListener(v -> {
+            boolean now = maskBody.getVisibility() != android.view.View.VISIBLE;
+            maskBody.setVisibility(now ? android.view.View.VISIBLE : android.view.View.GONE);
+            t.setText(now ? "▾ 图层遮罩" : "▸ 图层遮罩");
+            getSharedPreferences(PREF, MODE_PRIVATE).edit()
+                    .putBoolean("mask_panel_open", now).apply();
+        });
+
+        buildPresetRow(maskBody);
 
         /* 形状 / 填充 / 缩放 / 帧率 四格 */
         LinearLayout r1 = new LinearLayout(this);
@@ -1030,7 +1065,7 @@ public class MainActivity extends Activity {
          * 功能不完整，直接去掉。精确拖框靠下面的「拖拽吸附」开关
          * （关掉后就是像素级）已经够用。
          */
-        col.addView(r1);
+        maskBody.addView(r1);
 
         /*
          * 帧率单独一行（2026-11-03）。
@@ -1065,7 +1100,7 @@ public class MainActivity extends Activity {
             MirrorController mc = MirrorController.getActive();
             if (mc != null) { mc.setFps(this, maskFps); }
         }), rowLp(1f));
-        col.addView(fpsRow);
+        maskBody.addView(fpsRow);
 
         /*
          * ══════════════════════════════════════════════════════════════
@@ -1087,7 +1122,7 @@ public class MainActivity extends Activity {
         maskAlphaWarn.setTextColor(getColor(R.color.state_warn));
         maskAlphaWarn.setPadding(dp(4), dp(8), dp(4), dp(2));
         maskAlphaWarn.setLineSpacing(0, 1.15f);
-        col.addView(maskAlphaWarn);
+        maskBody.addView(maskAlphaWarn);
 
         /*
          * 参数滑块区（两列网格）。
@@ -1097,7 +1132,7 @@ public class MainActivity extends Activity {
          * 是历史迭代留下的残骸，占 78dp 纯浪费。
          * 现在只留一个「遮罩参数」，把 4 个滑块合在一组。
          */
-        col.addView(maskSection("遮罩参数"));
+        maskBody.addView(maskSection("遮罩参数"));
 
         /*
          * **低频参数收进「高级」折叠区**（2026-11-07，unslop）。
@@ -1187,9 +1222,9 @@ public class MainActivity extends Activity {
         maskSbFeather = addMaskSlider(g1, "羽化", 0, 96, maskCfg.feather, "",
                 v -> { maskCfg.feather = v; refreshMask(); });
         maskTvFeather = maskLastSliderVal;
-        col.addView(g1);
-        col.addView(advancedHead);
-        col.addView(advancedBox);
+        maskBody.addView(g1);
+        maskBody.addView(advancedHead);
+        maskBody.addView(advancedBox);
 
 
         /* ══════════════════════════════════════════════════════════════
@@ -1207,7 +1242,7 @@ public class MainActivity extends Activity {
          *
          * 状态存 prefs（"corner_locked"），重启后保持。
          */
-        buildCornerControls(col);
+        buildCornerControls(maskBody);
 
         advancedBox.addView(maskSection("梯形"));
         LinearLayout g4 = grid2();
@@ -1219,7 +1254,7 @@ public class MainActivity extends Activity {
         maskTvTrapBot = maskLastSliderVal;
         advancedBox.addView(g4);
 
-        buildMaskActionRow(col);
+        buildMaskActionRow(maskBody);
 
         maskPreview.invalidate();
         refreshMaskInfo();
@@ -1570,8 +1605,20 @@ public class MainActivity extends Activity {
          *     拖截取框都会被卡片抢走）—— 见 body.setOnClickListener(null)
          *     配合 setClickable(true)，只截不断冒泡。
          */
-        LinearLayout card = card();
-        card.setPadding(dp(10), dp(8), dp(10), dp(10));
+        /*
+         * **不再用浅灰卡片，改成和「图层遮罩」同一套视觉语言**（2026-11-07）。
+         *
+         * 原来这里是 card()（带 surface_card 底 + 阴影），而下面的
+         * 「图层遮罩」标题是纯文字、无背景。结果截取区看起来像一条
+         * 格格不入的浮条贴在页面顶部 —— 它其实是与图层遮罩并列的
+         * 两大功能之一，视觉上却像次级工具。
+         *
+         * 现在去掉背景，只留一条可点的标题行，靠 ▸/▾ 表达折叠状态，
+         * 和「高级参数」折叠条、以及「图层遮罩」标题保持一致的观感。
+         */
+        LinearLayout card = new LinearLayout(this);
+        card.setOrientation(LinearLayout.VERTICAL);
+        card.setPadding(0, 0, 0, 0);
         card.setClickable(true);
         card.setFocusable(true);
 
@@ -1583,7 +1630,7 @@ public class MainActivity extends Activity {
         head.setPadding(dp(10), 0, dp(8), 0);
 
         TextView title = new TextView(this);
-        title.setText("▸ 截取 App 页面");
+        title.setText("▸ 截取 App 页面");   /* 默认折叠，toggle 里会切换 */
         /*
          * **字号从 14 提到 18**（2026-11-04）。
          *
@@ -1592,7 +1639,7 @@ public class MainActivity extends Activity {
          * 18sp + 加粗，和「图层遮罩」标题同级，一眼能找到。
          */
         title.setTextSize(20);
-        title.setTextColor(getColor(R.color.content_accent));
+        title.setTextColor(getColor(R.color.content_primary));   /* 与「图层遮罩」一致 */
         title.setTypeface(Typeface.DEFAULT_BOLD);
         title.setIncludeFontPadding(false);
         head.addView(title, new LinearLayout.LayoutParams(0,
@@ -1609,17 +1656,7 @@ public class MainActivity extends Activity {
          * 现在这个区块自带一个高对比按钮，文案是「展开 / 收起」，
          * 和「展开编辑」视觉上区分开，不会点错。
          */
-        Button btnToggle = new Button(this);
-        btnToggle.setText("展开");
-        btnToggle.setTextSize(16);
-        btnToggle.setTextColor(getColor(R.color.accent_on));
-        btnToggle.setBackgroundResource(R.drawable.btn_selected);
-        btnToggle.setAllCaps(false);
-        btnToggle.setIncludeFontPadding(false);
-        btnToggle.setPadding(dp(12), 0, dp(12), 0);
-        btnToggle.setLayoutParams(new LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.WRAP_CONTENT, dp(44)));
-        head.addView(btnToggle);
+
 
         /*
          * head 必须给**明确的固定高度**（2026-11-04 再调）。
@@ -2115,11 +2152,7 @@ public class MainActivity extends Activity {
                 bodyScroll.setVisibility(View.GONE);
             }
             title.setText((opening ? "▾ " : "▸ ") + "截取 App 页面");
-            btnToggle.setText(opening ? "收起" : "展开");
-            btnToggle.setBackgroundResource(opening
-                    ? R.drawable.btn_secondary : R.drawable.btn_selected);
-            btnToggle.setTextColor(getColor(opening
-                    ? R.color.accent_soft : R.color.accent_on));
+
             if (opening) {
                 syncAppCropFromConfig();
                 /*
@@ -2134,7 +2167,6 @@ public class MainActivity extends Activity {
         };
         card.setOnClickListener(toggle);
         head.setOnClickListener(toggle);
-        btnToggle.setOnClickListener(toggle);
 
         parent.addView(card);
 
