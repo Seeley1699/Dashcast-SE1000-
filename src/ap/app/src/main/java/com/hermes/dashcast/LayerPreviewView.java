@@ -764,6 +764,22 @@ public class LayerPreviewView extends View {
         computeScale();
         switch (e.getActionMasked()) {
             case MotionEvent.ACTION_DOWN: {
+                /*
+                 * **框外按下直接返回 false**（2026-11-07 二次修复）。
+                 *
+                 * 上一轮只改了 requestDisallowInterceptTouchEvent（抢不抢事件），
+                 * 但这里仍然无条件 return true —— 于是 onTouchEvent 成为手势消费者，
+                 * 手指一动框就跟着改。用户看到的就是"空白处也能拖动框"。
+                 *
+                 * 正确语义：
+                 *   框内 / 手柄  → return true（我处理，父容器别抢）
+                 *   框外空白     → return false（不消费，交给父 ScrollView 滚动）
+                 */
+                if (!hitsDraggableArea(e.getX(), e.getY())) {
+                    mode = 0;
+                    return false;
+                }
+
                 downX = e.getX(); downY = e.getY();
                 startX = cfg.x; startY = cfg.y;
                 startW = cfg.w; startH = cfg.h;
@@ -842,28 +858,32 @@ public class LayerPreviewView extends View {
 
         switch (e.getActionMasked()) {
             case MotionEvent.ACTION_DOWN: {
+                /*
+                 * **框外按下返回 false，交给父容器滚动**（2026-11-07 二次修复）。
+                 *
+                 * 原来框外会设 aMode = 10（拖出 8dp 后重画一块新框）。
+                 * 这条交互和"空白处滑动要滚页面"直接冲突：
+                 * 用户想滚动，手指一动却在创建新截取框。
+                 *
+                 * 现在：
+                 *   手柄 / 框内 → return true（拖框）
+                 *   框外空白    → return false（滚动）
+                 *
+                 * 要重新框选就点「读取窗口」或点「手动」再拖，不再靠在空白处瞎拖。
+                 */
+                if (!hitsDraggableArea(e.getX(), e.getY())) {
+                    aMode = 0;
+                    return false;
+                }
+
                 downX = e.getX();
                 downY = e.getY();
                 aStartX = cfg.srcX; aStartY = cfg.srcY;
                 aStartW = cfg.srcW; aStartH = cfg.srcH;
 
                 aMode = hitTestHandles(e.getX(), e.getY(), cr);
-                if (aMode == 0 && cr.contains(e.getX(), e.getY())) {
-                    aMode = 1;   /* 框内 → 移动 */
-                } else if (aMode == 0) {
-                    /*
-                     * 框外按下 —— **先不重画**（2026-11-03 手感修复）。
-                     *
-                     * 原来是"一按框外就把框重置成 16×16 并从这里重画"，
-                     * 于是用户想微调时手指稍微偏出框一点点，整块框就被清掉，
-                     * 表现就是"拖动不好拖、拖不出想要的效果"。
-                     *
-                     * 现在记下起点，等**真的拖出 8dp** 才开始重画；
-                     * 没拖起来的轻点一律不动原框。
-                     */
-                    aMode = 10;
-                    aNewStartX = clampScreen((int) ((e.getX() - aox) / ascale), 0, screenW);
-                    aNewStartY = clampScreen((int) ((e.getY() - aoy) / ascale), 0, screenH);
+                if (aMode == 0) {
+                    aMode = 1;   /* 框内 → 移动（hitsDraggableArea 已排除框外） */
                 }
                 invalidate();
                 return true;
