@@ -20,6 +20,21 @@
     <!-- 投放当前前台 App：moveTaskToDisplay 需要（signature|privileged，工程固件可装） -->
     <uses-permission android:name="android.permission.MANAGE_ACTIVITY_TASKS" />
 
+    <!--
+        桌面浮窗（overlay）。
+
+        **这是做"浮在桌面上的小窗"的必要条件**（2026-11-07 实测）：
+        Activity + resizeableActivity 只能让窗口不铺满**自己的任务栈**，
+        一旦按 HOME 或者桌面盖上来，Activity 窗口就被挡住/退到后面。
+        真正浮在所有应用之上的只有 WindowManager 的 overlay 窗口，
+        而它必须持有 SYSTEM_ALERT_WINDOW。
+
+        appops 实测：未声明时 `appops set ... allow` 写入无效
+        （dumpsys appops 里永远是 "SYSTEM_ALERT_WINDOW (default)" 带 Reject 记录）。
+        声明之后才能通过「设置 → 应用 → 显示在其他应用上层」或 adb appops 授权。
+    -->
+    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+
     <queries>
         <intent>
             <action android:name="android.intent.action.MAIN" />
@@ -77,6 +92,44 @@
             android:name=".TestPatternActivity"
             android:exported="true"
             android:launchMode="singleInstance" />
+
+        <!--
+            浮窗（overlay）测试页。
+
+            MiniWindowActivity 是「Activity 不铺满」，按 HOME 会退到后台；
+            MiniOverlay 是「WindowManager overlay」，浮在所有 App 之上。
+            这个测试页两者都能验，用来对比。
+
+            用法：
+              adb shell am start -n com.hermes.dashcast/.OverlayTestActivity
+        -->
+        <activity
+            android:name=".OverlayTestActivity"
+            android:exported="true"
+            android:launchMode="singleTask"
+            android:label="浮窗测试" />
+
+        <!--
+            小窗（浮窗）。
+
+            配置对齐银河视界的 SrMiniActivity（车机浮窗的既有范式）：
+              · taskAffinity 独立      → 不和主界面挤同一个任务栈
+              · launchMode=singleTask  → 反复拉起只 bringToFront，不堆实例
+              · resizeableActivity=true → 允许系统给它非全屏尺寸
+              · configChanges 0x1f80   = orientation|screenSize|screenLayout|density
+                （尺寸变化时不重建 Activity，浮窗才不会闪一下）
+
+            exported=true 只为能用 adb 直接 start 调试验证；
+            正式入口走 MainActivity 里的 MiniWindowActivity.launch()。
+        -->
+        <activity
+            android:name=".MiniWindowActivity"
+            android:exported="true"
+            android:taskAffinity="com.hermes.dashcast.mini"
+            android:launchMode="singleTask"
+            android:configChanges="orientation|screenSize|screenLayout|keyboardHidden|density"
+            android:resizeableActivity="true"
+            android:label="小窗测试" />
 
         <!-- 联调用：adb shell am broadcast -a com.hermes.dashcast.DIAG
              把 CP（仪表）和 AP（中控）两边的状态一次性打到 logcat。
