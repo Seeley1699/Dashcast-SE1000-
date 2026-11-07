@@ -667,6 +667,52 @@ public class LayerPreviewView extends View {
         return p;
     }
 
+    /*
+     * **命中测试：手指是否落在可拖拽的东西上**（2026-11-07）。
+     *
+     * 用途只有一个 —— 决定 DOWN 时要不要 requestDisallowInterceptTouchEvent。
+     * 不改拖拽逻辑本身（那边仍然按原来的 mode 判定走）。
+     *
+     * 两种模式各自的"可拖拽区"：
+     *   · 遮罩模式（!appCropMode）：
+     *       遮罩矩形内部 + 右下角 24dp 缩放手柄
+     *   · 截取模式（appCropMode）：
+     *       截取矩形内部 + 8 个手柄（hitTestHandles 已有实现）
+     *
+     * 都留 4dp 容差 —— 手指比视觉框宽，贴边按下去也该算命中。
+     */
+    private boolean hitsDraggableArea(float x, float y) {
+        float tol = dp(4);
+        if (appCropMode) {
+            computeAppScale();
+            RectF cr = new RectF(
+                    aox + cfg.srcX * ascale,
+                    aoy + cfg.srcY * ascale,
+                    aox + (cfg.srcX + cfg.srcW) * ascale,
+                    aoy + (cfg.srcY + cfg.srcH) * ascale);
+            /* 手柄优先（hitTestHandles 返回非 0 即命中） */
+            if (hitTestHandles(x, y, cr) != 0) return true;
+            /* 框内留容差 */
+            return x >= cr.left - tol && x <= cr.right + tol
+                    && y >= cr.top - tol && y <= cr.bottom + tol;
+        }
+
+        /* 遮罩模式 */
+        computeScale();
+        float left   = ox + cfg.x * scale;
+        float top    = oy + cfg.y * scale;
+        float right  = ox + (cfg.x + cfg.w) * scale;
+        float bottom = oy + (cfg.y + cfg.h) * scale;
+
+        /* 右下角手柄：24dp 半径内 */
+        float hx = ox + (cfg.x + cfg.w) * scale;
+        float hy = oy + (cfg.y + cfg.h) * scale;
+        if (Math.hypot(x - hx, y - hy) < dp(24)) return true;
+
+        /* 框内留容差 */
+        return x >= left - tol && x <= right + tol
+                && y >= top - tol && y <= bottom + tol;
+    }
     @Override
     public boolean onTouchEvent(MotionEvent e) {
         /*
@@ -689,8 +735,22 @@ public class LayerPreviewView extends View {
         int action = e.getActionMasked();
         if (action == MotionEvent.ACTION_DOWN
                 || action == MotionEvent.ACTION_POINTER_DOWN) {
+            /*
+             * **只有按在框内/手柄上才抢事件**（2026-11-07 修复"空白处滑不动"）。
+             *
+             * 原来这里无条件 requestDisallowInterceptTouchEvent(true) ——
+             * 只要在预览区按下（哪怕是空白背景），父 ScrollView 就被禁止拦截，
+             * 于是空白处上下滑动**滚不动页面**，用户以为卡死了。
+             *
+             * 现在先判命中：
+             *   · 落在遮罩框内 / 右下角手柄 / 截取框 / 它的 8 个手柄 → 抢事件（要拖框）
+             *   · 落在框外空白 → 放行，让父 ScrollView 正常滚动
+             *
+             * 判定只看"手指vs框"的几何关系，不改任何拖拽逻辑。
+             */
+            boolean hit = hitsDraggableArea(e.getX(), e.getY());
             if (getParent() != null) {
-                getParent().requestDisallowInterceptTouchEvent(true);
+                getParent().requestDisallowInterceptTouchEvent(hit);
             }
         } else if (action == MotionEvent.ACTION_UP
                 || action == MotionEvent.ACTION_CANCEL) {

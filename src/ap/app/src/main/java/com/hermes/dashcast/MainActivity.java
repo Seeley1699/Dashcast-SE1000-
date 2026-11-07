@@ -201,7 +201,7 @@ public class MainActivity extends Activity {
 
         TextView title = new TextView(this);
         title.setText("Dashcast");
-        title.setTextSize(36);
+        title.setTextSize(28);   /* 36 → 28：这是控制面板，不是启动页 */
         /*
          * 标题文字用 content_primary（浅色 UI 是深色字）
          * 原来是写死的 android.R.color.white —— 深色底上没问题，
@@ -261,9 +261,8 @@ public class MainActivity extends Activity {
 
         statusDot = new TextView(this);
         statusDot.setBackgroundResource(R.drawable.status_dot);
-        LinearLayout.LayoutParams dotLp = new LinearLayout.LayoutParams(dp(14), dp(14));
-        dotLp.setMargins(0, 0, dp(10), 0);
-        statusDot.setLayoutParams(dotLp);
+        LinearLayout.LayoutParams dotLp = new LinearLayout.LayoutParams(dp(12), dp(12));
+        dotLp.setMargins(0, 0, dp(12), 0);
         statusRow.addView(statusDot);
 
         status = new TextView(this);
@@ -281,7 +280,7 @@ public class MainActivity extends Activity {
          *   2 行足够显示「状态：投屏失败 —— com.xxx 起不到前台」这一半，
          *   完整原因在下方「运行日志」里能看到（日志不截断）。
          */
-        status.setTextSize(28);
+        status.setTextSize(22);   /* 28 → 22：两行 28sp 太占地方 */
         status.setMaxLines(2);
         status.setEllipsize(android.text.TextUtils.TruncateAt.END);
         status.setLineSpacing(0f, 1.05f);
@@ -316,7 +315,7 @@ public class MainActivity extends Activity {
          */
         LinearLayout.LayoutParams sgLp = new LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT, dp(84));
-        sgLp.setMargins(0, dp(10), 0, 0);
+        sgLp.setMargins(0, dp(8), 0, 0);
         statGrid.setLayoutParams(sgLp);
         metrics   = statCellFixed(statGrid, "fps",  "—");
         upstream  = statCellFixed(statGrid, "上行 KB/s", "—");
@@ -328,8 +327,21 @@ public class MainActivity extends Activity {
         left.addView(sectionLabel("服务部署"));
         LinearLayout deployRow = new LinearLayout(this);
         deployRow.setOrientation(LinearLayout.HORIZONTAL);
-        deployRow.addView(iconButton("部署", R.drawable.ic_download, R.drawable.btn_primary,
-                android.R.color.white, v -> deployService()), rowLp(1f));
+        /*
+         * **「部署」降级为次要样式**（2026-11-07，unslop：one bright element）。
+         *
+         * 原来它和「开始投屏」都是蓝实底 —— 左栏同时出现两个亮元素，
+         * 主次不分。而「部署」是**一次性前置动作**（把接收端推到仪表主机），
+         * 日常使用根本不会点它；真正的主操作是「开始投屏」。
+         *
+         * 改成 secondaryButton（抬升底 + 描边），图标色用 accent_soft
+         * （蓝，但比主按钮的白色低调），既保留辨识度又不抢焦点。
+         *
+         * 注意：「停服务」本来就是 btn_danger（红描边），这一行两个按钮
+         * 现在都是次要样式，只有左边的「开始投屏」是蓝实底。
+         */
+        deployRow.addView(iconButton("部署", R.drawable.ic_download, R.drawable.btn_secondary,
+                R.color.accent_soft, v -> deployService()), rowLp(1f));
         deployRow.addView(iconButton("停服务", R.drawable.ic_stop, R.drawable.btn_danger,
                 R.color.state_error, v -> stopCpService()), rowLp(1f));
         left.addView(deployRow);
@@ -348,7 +360,7 @@ public class MainActivity extends Activity {
          * 改用 Squircle.of(this).card()：squircle 圆角 + 1dp 描边 + 阴影。
          */
         castCard.setBackground(Squircle.of(this).card(R.color.surface_card));
-        castCard.setPadding(dp(12), dp(10), dp(12), dp(10));
+        castCard.setPadding(dp(12), dp(12), dp(12), dp(12));
         LinearLayout.LayoutParams ccLp = new LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT,
                 LinearLayout.LayoutParams.WRAP_CONTENT);
@@ -358,7 +370,7 @@ public class MainActivity extends Activity {
         targetHint.setTextSize(16);
         targetHint.setTextColor(getColor(R.color.content_secondary));
         targetHint.setGravity(Gravity.CENTER);
-        targetHint.setPadding(dp(10), dp(8), dp(10), dp(8));
+        targetHint.setPadding(dp(12), dp(8), dp(12), dp(8));
         targetHint.setBackgroundResource(R.drawable.chip_bg);
         LinearLayout.LayoutParams thLp = new LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT,
@@ -936,15 +948,39 @@ public class MainActivity extends Activity {
          * 折叠后右栏只剩一块预览 —— 用户切到这个页面时先看到画面，
          * 要改参数再展开，符合「先看结果、再调参数」的操作顺序。
          */
+        /*
+         * **折叠符号挪到右侧，单独标「参数」**（2026-11-07 二次修正）。
+         *
+         * 原来标题写成「▾ 图层遮罩」，但 ▸/▾ 语义是"整块内容的开合"——
+         * 而这里的预览画布**始终显示**，只有参数区折叠。
+         * 用户看到 ▸ 却马上看到预览，会以为"折叠没生效"。
+         *
+         * 现在拆成两段：
+         *   左：图层遮罩（固定标题，不带符号）
+         *   右：参数 ▸ / 参数 ▾（明确指向"参数已收起/已展开"）
+         */
         TextView t = new TextView(this);
-        t.setText(maskPanelOpen ? "▾ 图层遮罩" : "▸ 图层遮罩");
+        t.setText("图层遮罩");
         t.setTextSize(20);
         t.setTextColor(getColor(R.color.content_primary));
         t.setTypeface(Typeface.DEFAULT_BOLD);
         head.setClickable(true);
-        head.setPadding(dp(0), dp(4), dp(0), dp(4));
+        head.setPadding(dp(0), dp(4), dp(8), dp(4));
         head.addView(t, new LinearLayout.LayoutParams(
                 0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
+
+        /*
+         * 「参数 ▸/▾」做成小胶囊 —— 纯文字容易被当成说明文字，
+         * 加个浅底让它一眼看出"这里可以点"。
+         */
+        TextView paramsToggle = new TextView(this);
+        paramsToggle.setText(maskPanelOpen ? "参数 ▾" : "参数 ▸");
+        paramsToggle.setTextSize(15);   /* 14 → 15：与其它次要文字同档 */
+        paramsToggle.setTextColor(getColor(R.color.content_secondary));
+        paramsToggle.setBackground(squircleFor(R.drawable.btn_secondary));
+        paramsToggle.setGravity(Gravity.CENTER);
+        paramsToggle.setPadding(dp(12), dp(4), dp(12), dp(4));
+        head.addView(paramsToggle);
 
         /*
          * 「展开编辑」按钮已删除（2026-11-04）。
@@ -977,7 +1013,7 @@ public class MainActivity extends Activity {
         head.setOnClickListener(v -> {
             boolean now = maskBody.getVisibility() != android.view.View.VISIBLE;
             maskBody.setVisibility(now ? android.view.View.VISIBLE : android.view.View.GONE);
-            t.setText(now ? "▾ 图层遮罩" : "▸ 图层遮罩");
+            paramsToggle.setText(now ? "参数 ▾" : "参数 ▸");
             getSharedPreferences(PREF, MODE_PRIVATE).edit()
                     .putBoolean("mask_panel_open", now).apply();
         });
@@ -1417,7 +1453,7 @@ public class MainActivity extends Activity {
         cornerTitle.setText("四角圆角");
         cornerTitle.setTextSize(15);
         cornerTitle.setTextColor(getColor(R.color.accent));
-        cornerTitle.setPadding(dp(4), dp(10), 0, dp(4));
+        cornerTitle.setPadding(dp(4), dp(12), 0, dp(4));
         cornerHead.addView(cornerTitle, new LinearLayout.LayoutParams(
                 0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
 
@@ -1468,7 +1504,7 @@ public class MainActivity extends Activity {
         r2.setOrientation(LinearLayout.HORIZONTAL);
         LinearLayout.LayoutParams r2Lp = new LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
-        r2Lp.setMargins(0, dp(10), 0, 0);
+        r2Lp.setMargins(0, dp(12), 0, 0);
         r2.setLayoutParams(r2Lp);
 
         r2.addView(chipButton("取消（还原）", v -> {
@@ -1527,7 +1563,7 @@ public class MainActivity extends Activity {
         tv.setText(text);
         tv.setTextSize(15);
         tv.setTextColor(getColor(R.color.accent));
-        tv.setPadding(dp(4), dp(10), 0, dp(4));
+        tv.setPadding(dp(4), dp(12), 0, dp(4));
         l.addView(tv);
         return l;
     }
@@ -1626,8 +1662,15 @@ public class MainActivity extends Activity {
         LinearLayout head = new LinearLayout(this);
         head.setOrientation(LinearLayout.HORIZONTAL);
         head.setGravity(Gravity.CENTER_VERTICAL);
-        head.setBackgroundResource(R.drawable.chip_bg);
-        head.setPadding(dp(10), 0, dp(8), 0);
+        /*
+         * **和「图层遮罩」标题完全一致**（2026-11-07）。
+         *
+         * 原来这里套了 chip_bg（surface_raised 底 + 1dp 描边 + 12dp 圆角），
+         * 而下面是裸文字 —— 两条本该平级的分组标题，一条像按钮、一条像标题。
+         *
+         * 现在都去掉背景，只留 ▸/▾ + 加粗文字，靠前缀和点击区表达可折叠。
+         */
+        head.setPadding(dp(0), dp(4), dp(8), dp(4));
 
         TextView title = new TextView(this);
         title.setText("▸ 截取 App 页面");   /* 默认折叠，toggle 里会切换 */
@@ -1659,15 +1702,20 @@ public class MainActivity extends Activity {
 
 
         /*
-         * head 必须给**明确的固定高度**（2026-11-04 再调）。
+         * **高度改回 WRAP_CONTENT**（2026-11-07）。
          *
-         * 原来用 WRAP_CONTENT → title 是 width=0 + weight=1 量成 0，
-         * head 高度也塌成 0，整块看起来"消失"。
-         * 现在给 dp(56)：比按钮的 44 留出上下各 6dp 余量，
-         * 手指好按，也不再"太小"。
+         * 历史：2026-11-04 时这里给 dp(56)，因为那时 head 里有个 44dp 的
+         * 「展开/收起」Button，需要给按钮留上下余量；而且当时 title 是
+         * width=0 + weight=1，若 head 用 WRAP_CONTENT 会量成 0 高度塌掉。
+         *
+         * 现在按钮已删、padding 改成 4dp 上下（和「图层遮罩」一致），
+         * title 自身的行高就撑得起 head，不需要固定高度：
+         * 固定 56dp 反而让它比下面那条「图层遮罩」（约 28dp）高出一倍，
+         * 两条平级标题的高矮差很明显。
          */
         card.addView(head, new LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT, dp(56)));
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT));
 
         /*
          * ══════════════════════════════════════════════════════════════
@@ -2168,8 +2216,19 @@ public class MainActivity extends Activity {
         card.setOnClickListener(toggle);
         head.setOnClickListener(toggle);
 
-        parent.addView(card);
-
+        /*
+         * **区块之间留出间距**（2026-11-07）。
+         *
+         * 原来 card 没有任何 margin，而下面的「图层遮罩」head 只有 4dp padding ——
+         * 两条平级标题只差 32px，看起来就是两行文字挨在一起，不像两个独立模块。
+         *
+         * 加 16dp 底部间距（= 4 个网格），和右栏各区块之间的呼吸感一致。
+         */
+        LinearLayout.LayoutParams cardLp = new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT);
+        cardLp.setMargins(0, 0, 0, dp(16));
+        parent.addView(card, cardLp);
         /*
          * 初始化：只载入配置，**不自动读目标窗口**。
          *
@@ -3141,7 +3200,7 @@ public class MainActivity extends Activity {
         actionButtons.add(btn);
         /* 默认占满一行；放进 row 时由 rowLp 覆盖 */
         btn.setLayoutParams(new LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT, dp(62)));
+                LinearLayout.LayoutParams.MATCH_PARENT, dp(64)));
         LinearLayout.LayoutParams selfLp = (LinearLayout.LayoutParams) btn.getLayoutParams();
         selfLp.setMargins(dp(4), dp(4), dp(4), dp(4));
         return btn;
@@ -3175,7 +3234,7 @@ public class MainActivity extends Activity {
 
         TextView v = new TextView(this);
         v.setText(initVal);
-        v.setTextSize(36);
+        v.setTextSize(28);   /* 36 → 28：状态卡格子只 200dp 宽，36 会撑满 */
         v.setTextColor(getColor(R.color.accent_soft));
         v.setTypeface(Typeface.DEFAULT_BOLD);
         v.setGravity(Gravity.CENTER);
@@ -3202,7 +3261,7 @@ public class MainActivity extends Activity {
     private Button makeButton(String text, int bgRes, int colorRes,
                               View.OnClickListener listener, float weight) {
         Button b = makeButton(text, bgRes, colorRes, listener);
-        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(0, dp(62), weight);
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(0, dp(64), weight);
         lp.setMargins(dp(4), dp(8), dp(4), dp(8));
         b.setLayoutParams(lp);
         return b;
@@ -3220,7 +3279,7 @@ public class MainActivity extends Activity {
         b.setOnClickListener(listener);
         LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT,
-                dp(54));
+                dp(56));
         lp.setMargins(0, dp(8), 0, dp(8));
         b.setLayoutParams(lp);
         actionButtons.add(b);
@@ -3677,7 +3736,7 @@ public class MainActivity extends Activity {
         cell.setOrientation(LinearLayout.VERTICAL);
         cell.setGravity(Gravity.CENTER);
         cell.setBackgroundResource(R.drawable.app_cell);
-        cell.setPadding(dp(8), dp(10), dp(8), dp(8));
+        cell.setPadding(dp(8), dp(12), dp(8), dp(8));
         cell.setClickable(true);
         cell.setFocusable(true);
 
@@ -4410,15 +4469,36 @@ public class MainActivity extends Activity {
             View decor = w.getDecorView();
             if (decor == null) return;
 
+            /*
+             * **不隐藏 dock 栏/导航栏**（2026-11-07 用户要求）。
+             *
+             * 原来的行为是"沉浸式"：把导航栏藏起来，让画面铺满整屏。
+             * 但车机的 dock 栏（底部「回到桌面 / 音量 / 空调」那排）
+             * 是用户日常操作入口 —— 藏掉之后想回桌面还得从边缘上滑，
+             * 在颠簸的车里很难点准。
+             *
+             * 现在：
+             *   · 保留 setDecorFitsSystemWindows(false) —— 内容仍然延伸到
+             *     状态栏下方（否则顶部会多出一条白边）
+             *   · 不再调 hideNavBars() —— 导航栏保持可见
+             *
+             * 注意：page 的 OnApplyWindowInsetsListener 仍然会读
+             * navigationBars 的 bottom inset 加 padding，所以内容不会被
+             * dock 栏压住 —— 它会自动让出那块高度。
+             */
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
                 w.setDecorFitsSystemWindows(false);
-                /* 立刻试一次；如果 DecorView 还没 attach 就排到消息队列尾部再试。 */
+                /*
+                 * 系统栏样式：只让它"半透明覆盖"，不做隐藏。
+                 * BEHAVIOR_DEFAULT = 从边缘滑动时临时显示（系统默认行为），
+                 * 这里显式设成它，避免继承到某个自定义值。
+                 */
                 if (decor.isAttachedToWindow()) {
-                    hideNavBars(w);
+                    applySystemBarStyle(w);
                 } else {
                     decor.post(() -> {
                         try {
-                            hideNavBars(w);
+                            applySystemBarStyle(w);
                         } catch (Throwable t) {
                             DashLog.w(TAG, "applyImmersive(post) 失败（忽略）: " + t);
                         }
@@ -4427,10 +4507,12 @@ public class MainActivity extends Activity {
                 return;
             }
 
+            /*
+             * 老 API：只保留 LAYOUT_STABLE + LAYOUT_HIDE_NAVIGATION 让内容延伸，
+             * 去掉 SYSTEM_UI_FLAG_HIDE_NAVIGATION（那才是"藏起来"）。
+             */
             decor.setSystemUiVisibility(
-                    View.SYSTEM_UI_FLAG_HIDE_NAVIGATION
-                    | View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY
-                    | View.SYSTEM_UI_FLAG_LAYOUT_STABLE
+                    View.SYSTEM_UI_FLAG_LAYOUT_STABLE
                     | View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION);
         } catch (Throwable t) {
             /* 任何机型差异都不该让 App 起不来 —— 藏导航栏只是锦上添花 */
@@ -4438,13 +4520,32 @@ public class MainActivity extends Activity {
         }
     }
 
-    /** 真正执行隐藏导航栏。调用前必须确认 DecorView 已 attach。 */
-    private void hideNavBars(Window w) {
+    /*
+     * **只设系统栏样式，不隐藏**（2026-11-07 改）。
+     *
+     * 原来这个方法叫 hideNavBars，里面 `ctl.hide(navigationBars())` 把导航栏
+     * 彻底藏了。现在保留 dock 栏，只做两件事：
+     *
+     *   · show(navigationBars()) —— 确保它是可见的（有些 ROM 会记住上次的隐藏态）
+     *   · 图标深浅 —— 我们的页面是浅灰底（#F3F3F2），系统栏图标必须是深色，
+     *     否则白图标压在浅底上完全看不见。LIGHT_APPEARANCE 就是干这个的。
+     *
+     * 同时给状态栏也设 LIGHT_APPEARANCE —— 顶部同样的问题。
+     */
+    private void applySystemBarStyle(Window w) {
         WindowInsetsController ctl = w.getInsetsController();
         if (ctl == null) return;
-        ctl.hide(WindowInsets.Type.navigationBars());
-        ctl.setSystemBarsBehavior(
-                WindowInsetsController.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE);
+        /*
+         * 显式 show：车机的 framework 有时会把窗口不显示的 flag 记住，
+         * 上一版隐藏过的窗口重新进来可能仍是隐藏态。
+         */
+        ctl.show(WindowInsets.Type.navigationBars());
+        ctl.show(WindowInsets.Type.statusBars());
+        ctl.setSystemBarsAppearance(
+                WindowInsetsController.APPEARANCE_LIGHT_NAVIGATION_BARS
+                        | WindowInsetsController.APPEARANCE_LIGHT_STATUS_BARS,
+                WindowInsetsController.APPEARANCE_LIGHT_NAVIGATION_BARS
+                        | WindowInsetsController.APPEARANCE_LIGHT_STATUS_BARS);
     }
 
     private void appendLog(String raw) {

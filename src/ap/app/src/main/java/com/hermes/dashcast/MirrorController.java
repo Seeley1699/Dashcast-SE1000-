@@ -361,27 +361,28 @@ public class MirrorController {
                         DashLog.i(TAG, "HUD 模式：忽略后台事件（无需虚拟屏跟随）");
                     } else {
                         /*
-                         * **窗口还在就别搬**（2026-11-06 修「按 HOME 后投到桌面」）
+                         * ══════════════════════════════════════════════════════════
+                         * **按 HOME 必须进后台跟随**（2026-11-07 三次修正，此前判断全错）
+                         * ══════════════════════════════════════════════════════════
                          *
-                         * 用户反馈：carplay 投屏成功后一回 HOME，
-                         * 仪表上就变成桌面，锁不住 carplay。
+                         * 这里曾经写过 `if (hasTargetWindow()) 保持主屏抓取 else enterBg()`，
+                         * 那个判断的前提是错的：
                          *
-                         * 根因：这里原来无条件 enterBg()，它要把目标搬进虚拟屏。
-                         *   · 普通 App：move-stack 成功 → 虚拟屏里继续渲染 → 正常
-                         *   · 系统级 App：move-stack 被系统拒绝
-                         *     （日志 IllegalArgumentException: Trying to move stack）
-                         *     → 搬不进 → 主屏上只剩桌面 → dcapd2 抓到桌面
-                         *     → 仪表跟着变桌面
+                         *   ✗ 错误假设：「窗口还在 → 合成器还在画它 → captureScreen 能抓到」
                          *
-                         * 关键事实：carplay 的窗口**没被销毁**，只是不在最前面。
-                         * 合成器仍在合成它，captureScreen 抓那块矩形照样拿到像素。
-                         * 所以窗口还在时完全不动作，维持主屏抓取。
+                         *   ✓ 事实：captureScreen 抓的是**合成器最终输出**。
+                         *     按 HOME 后桌面盖在最上层，那块矩形合成出来就是桌面，
+                         *     哪怕下面的窗口对象活得好好的。
+                         *
+                         * 所以"窗口存在"和"画面可见"是两件事。判断窗口存在性没有任何意义 ——
+                         * 只要按了 HOME，主屏的像素就变成桌面，继续抓主屏就是错的。
+                         *
+                         * 唯一能拿到目标画面的办法是**把它搬进虚拟屏**：
+                         * 虚拟屏里没有桌面，只有 App 自己。
+                         *   · 搬成功 → 仪表继续显示 App
+                         *   · 搬失败 → enterBg 内部会 setPause() 停在最后一帧，绝不推桌面
                          */
-                        if (hasTargetWindow()) {
-                            DashLog.i(TAG, "按 HOME：目标窗口仍在，保持主屏抓取（不搬虚拟屏）");
-                        } else {
-                            enterBg(myGen);
-                        }
+                        enterBg(myGen);
                     }
                 } finally {
                     pr.finish();
@@ -1080,15 +1081,19 @@ public class MirrorController {
                          * 日志里「虚拟屏 15/16/17/18...」不断新建。
                          */
                         /*
-                         * **窗口还在就别进后台跟随**（2026-11-06）。
+                         * **无条件进后台跟随，不再判窗口存在性**（2026-11-07 修正）。
                          *
-                         * 系统级 App 永远不在前台，原逻辑会一直触发 enterBg，
-                         * 而 move-stack 对它无效（日志 IllegalArgumentException），
-                         * 结果判定「投屏失败」。但它的窗口一直在，
-                         * 主屏抓取本来就能拿到，不需要搬。
+                         * 这里曾经有 `&& !hasTargetWindow()`，本意是"窗口还在就别搬"，
+                         * 但按 HOME 后目标窗口**确实还在**（只是被桌面盖住），
+                         * 于是条件恒为 false → 后台跟随永远不触发 →
+                         * dcapd2 继续抓主屏 → **抓到的就是桌面**。
+                         *
+                         * 这就是"投屏 App 返回 home，仪表也跟着回 home"的直接原因。
+                         *
+                         * 保留的只有冷却期判断（vdFailCooldownUntil），
+                         * 防止 enterBg → VD 无帧 → exitBg 的死循环。
                          */
-                        if (SystemClock.elapsedRealtime() >= vdFailCooldownUntil
-                                && !hasTargetWindow()) {
+                        if (SystemClock.elapsedRealtime() >= vdFailCooldownUntil) {
                             enterBg(myGen);
                             if (gen.get() != myGen) return;
                         }
