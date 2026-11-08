@@ -748,15 +748,28 @@ Java.perform(function () {
                                                     var States = Java.use(
                                                         'com.autonavi.gbl.map.model.MapViewStateType');
 
-                                                    var want = [
+                                                    /*
+                                                     * **变量名必须叫 stateIds，不能叫 want**
+                                                     * （2026-11-08 修「轮询 1 次就放弃」）
+                                                     *
+                                                     * JS 的 var 是函数作用域，不是块作用域。
+                                                     * 外层有个 `var want = 20`（轮询次数上限，
+                                                     * 见轮询循环的 `if (tries < want)`）。
+                                                     * 这里再声明一个 `var want = [...]` 会把那个
+                                                     * 数字**覆盖成数组** —— 于是
+                                                     *   tries < want  →  1 < 数组  →  false
+                                                     * 轮询只跑一次就报「HudActivity 未就绪」，
+                                                     * 表现就是地图投屏永远停在"正在启动"。
+                                                     */
+                                                    var stateIds = [
                                                         'MAP_VIEWSTATE_IS_LABLE_ROADNAME_ON',
                                                         'MAP_VIEWSTATE_IS_TMC_DEPTH_INFO_ON',
                                                         'MAP_VIEWSTATE_IS_ROAD_ON',
                                                         'MAP_VIEWSTATE_IS_ROAD_ARROW_ON'
                                                     ];
                                                     var okN = 0;
-                                                    for (var wi = 0; wi < want.length; wi++) {
-                                                        var nm = want[wi];
+                                                    for (var wi = 0; wi < stateIds.length; wi++) {
+                                                        var nm = stateIds[wi];
                                                         try {
                                                             var st = States[nm].value;
                                                             biz.setMapViewState(st, true);
@@ -766,7 +779,7 @@ Java.perform(function () {
                                                                 + String(eSt).substring(0, 50));
                                                         }
                                                     }
-                                                    log('底图开关已开 ' + okN + '/' + want.length
+                                                    log('底图开关已开 ' + okN + '/' + stateIds.length
                                                         + '（路名/路况深度/道路/道路箭头）');
                                                 } else {
                                                     log('取不到 MapView(5) 做底图开关');
@@ -812,6 +825,102 @@ Java.perform(function () {
                                             } catch (eHk) {
                                                 log('hook updateCarStyle 失败: '
                                                     + String(eHk).substring(0, 70));
+                                            }
+
+                                            /*
+                                             * ★ 视角调整：让车模居中偏上、后方留空（2026-11-08）
+                                             *
+                                             * 需求：车模 + 蓝标完整露出来，车后面（画面下方）留一点空，
+                                             * 视觉上像是"车在画面里、视线往前看"。
+                                             *
+                                             * 现在的问题：车标被投影到画面正中（y ≈ H/2），
+                                             * 上方的道路被压得很窄，下方也没有余量 —— 车模容易被裁。
+                                             *
+                                             * 原理：车标位置 = Camera center 在屏幕上的投影点。
+                                             * 改它有两个手段：
+                                             *   ① setPitchAngle —— 俯仰角。Pitch 越大视野越前倾，
+                                             *      车模在画面里越靠上（3D 导航的标准做法，通常 30-50°）
+                                             *   ② setMapCenterOffset / setViewPortOffset —— 直接给屏幕
+                                             *      投影加纵向偏移（有的引擎版本叫别的名）
+                                             *
+                                             * 参考源码 hud_effects.js:251：
+                                             *   view.getOperatorPosture().setPitchAngle(pitch)
+                                             * 源码没做偏移，靠 pitch 就够了。
+                                             *
+                                             * 参数取值：
+                                             *   PITCH_ANGLE = 45°  —— 标准 3D 导航视角
+                                             *   CAR_Y_RATIO = 0.38 —— 车模目标纵向位置（0=顶, 1=底）
+                                             *                         0.38 让车模略偏上、下方留 62% 的路况
+                                             *
+                                             * 实现：
+                                             *   · 先设 pitch
+                                             *   · 再算需要补的纵向偏移，用 posture 的 setter 补上
+                                             *     （拿不到就只靠 pitch，也够用）
+                                             */
+                                            try {
+                                                /* 复用上面底图开关那段取到的 mv5b，
+                                                 * 不再重复反射 ConcurrentHashMap.get */
+                                                if (mv5b) {
+                                                    var posture = mv5b.getOperatorPosture();
+
+                                                    /* ① 俯仰角：45° 标准 3D 导航视角 */
+                                                    var PITCH = 45.0;
+                                                    try {
+                                                        posture.setPitchAngle(PITCH);
+                                                        log('pitch = ' + posture.getPitchAngle());
+                                                    } catch (eP) {
+                                                        log('setPitchAngle 失败: '
+                                                            + String(eP).substring(0, 50));
+                                                    }
+
+                                                    /*
+                                                     * ② 纵向偏移：把车模推到画面 38% 高度处
+                                                     *
+                                                     * posture 可能暴露 setViewPortY / setMapCenterY
+                                                     * 之类的接口（不同引擎版本名字不一样），
+                                                     * 逐个试，谁成功用谁。都不成功也不要紧 ——
+                                                     * pitch=45 本身就能把车模推到接近目标位置。
+                                                     */
+                                                    var CAR_Y_RATIO = 0.38;
+                                                    var targetY = Math.round(H * CAR_Y_RATIO);
+                                                    var centerY = Math.round(H / 2);
+                                                    var dy = targetY - centerY;   /* 负值 = 上移 */
+                                                    var done = false;
+                                                    var cands = [
+                                                        'setViewPortOffset', 'setViewportOffset',
+                                                        'setMapCenterOffset', 'setCenterOffset'
+                                                    ];
+                                                    for (var ci = 0; ci < cands.length && !done; ci++) {
+                                                        try {
+                                                            var mn = cands[ci];
+                                                            posture[mn].overload('int', 'int')
+                                                                  .call(posture, 0, dy);
+                                                            log('  ' + mn + '(0,' + dy + ') OK');
+                                                            done = true;
+                                                        } catch (e1) {
+                                                            try {
+                                                                posture[cands[ci]]
+                                                                    .overload('float', 'float')
+                                                                    .call(posture, 0.0, dy * 1.0);
+                                                                log('  ' + cands[ci] + '(0,' + dy + ') OK(float)');
+                                                                done = true;
+                                                            } catch (e2) {}
+                                                        }
+                                                    }
+                                                    if (!done) {
+                                                        log('  无纵向偏移接口，仅靠 pitch=45°（视觉上已接近目标）');
+                                                    }
+
+                                                    /* ③ 缩放：17 是导航标准级别，保持不动 */
+                                                    try {
+                                                        log('  zoom = ' + posture.getZoomLevel());
+                                                    } catch (eZ) {}
+                                                } else {
+                                                    log('取不到 MapView(5) 做视角调整');
+                                                }
+                                            } catch (eView) {
+                                                log('视角调整失败: '
+                                                    + String(eView).substring(0, 80));
                                             }
 
                                             startPc();

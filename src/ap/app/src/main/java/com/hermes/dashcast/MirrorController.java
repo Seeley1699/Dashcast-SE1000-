@@ -819,7 +819,33 @@ public class MirrorController {
         /* 退出跟随 = 上一轮观察窗口作废，下次 enterBg 会重新计时 */
         vdDeadSince = 0;
         DashLog.i(TAG, "退出后台跟随模式");
-        vd.stop(true);
+        /*
+         * ★ **vd.stop(false) —— 保留虚拟屏，不要拆**（2026-11-08）
+         *
+         * 原来是 vd.stop(true)，每次都把 VirtualDisplay 整个销毁。
+         * 日志实证（dashcast-11.log）：
+         *   22:44:24  建屏 displayId=5  → move-stack 1102439 → 5
+         *   22:44:52  退出后台跟随模式
+         *   22:44:54  建屏 displayId=6  → move-stack 1102439 → 6
+         *   22:44:58  退出后台跟随模式
+         *   22:45:03  建屏 displayId=7  → move-stack 1102439 → 7
+         *   22:45:21  建屏 displayId=8  → move-stack 1102441 → 8  ← taskId 变了
+         *
+         * 后果：每次「回 HOME → 回 App」都要走一遍
+         *   建新 VD → am display move-stack 搬 task。
+         *
+         * **而 move-stack 会销毁并重建 Activity**（不是恢复），
+         * 所以抖音这类 App 的播放器状态全丢 —— 视频从头开始播，
+         * 这就是"回 HOME 时应用重新启动"的直接原因。
+         *
+         * 现在改成 stop(false)：只关帧源、停发送，虚拟屏本身留着。
+         * App 的 task 一直待在那块 VD 里，不再被搬来搬去。
+         *
+         * 代价：VD 会一直存在（占一块 2560x1600 的合成缓冲）。
+         * 但这是必要的 —— 不保留就必然反复重建 Activity。
+         * 真正销毁的时机是整个投屏结束（stop() 里传 true）。
+         */
+        vd.stop(false);
         VdMirror.setFeedFrames(false);
         try {
             AdbShell.exec("rm -f /data/local/tmp/dcapd2.bg", CHUNK);

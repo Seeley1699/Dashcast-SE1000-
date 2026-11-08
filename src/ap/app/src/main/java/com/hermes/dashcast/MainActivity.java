@@ -77,10 +77,25 @@ public class MainActivity extends Activity {
     private LinearLayout btnCodecBgra, btnCodecH264;   /* 编码档二选一 */
     private LinearLayout btnMapMode;                 /* 地图模式开关 */
 
-    /* 地图投屏（方案 ①：注入地图进程，2026-11-08 新增）
-     * 与「开始投屏」（搬别的 App 进虚拟屏）是两条独立链路 */
+    /*
+     * 地图投屏（方案 ①：注入地图进程，2026-11-08）
+     *
+     * **已并入「投屏模式」选择（2026-11-08 晚）**：
+     * 原来是一行独立的「地图投屏 / 停地图」按钮，但它和普通投屏在底下做的是
+     * 同一件重活 —— 部署 CP 服务、起 dcapd2、占 layer 99 —— 两套同时跑会
+     * 互相踩（dashcastd 被重启、dcapd2 被杀、图层争抢）。
+     *
+     * 现在合并成「模式：普通投屏 / 地图投屏」+ 一组开始/停止按钮。
+     * 这两个字段保留声明（别处 `if (btnMapCast != null)` 还在用），但恒为 null。
+     */
     private LinearLayout btnMapCast, btnMapStop;
     private TextView mapCastState;
+
+    /* 投屏模式：0=普通投屏（抓主屏/指定 App），1=地图投屏（注入地图进程） */
+    private int castMode = 0;
+    private LinearLayout btnModeNormal, btnModeMap;
+    /** 「选择投屏 App」按钮 —— 地图模式下隐藏（那条链路不需要选 App） */
+    private LinearLayout btnPickApp;
     private LinearLayout btnMapHud;                  /* 地图 HUD 开关 */
     private LinearLayout viewRow;                    /* 视角三档容器 */
     private LinearLayout[] viewBtns;                 /* 远景/中景/近景 */
@@ -384,47 +399,64 @@ public class MainActivity extends Activity {
         targetHint.setLayoutParams(thLp);
         castCard.addView(targetHint);
 
-        castCard.addView(iconButton("选择投屏 App", R.drawable.ic_target, R.drawable.btn_secondary,
-                R.color.accent_soft, v -> showAppPicker()));
+        btnPickApp = iconButton("选择投屏 App", R.drawable.ic_target, R.drawable.btn_secondary,
+                R.color.accent_soft, v -> showAppPicker());
+        castCard.addView(btnPickApp);
+
+        /*
+         * ══════════════════════════════════════════════════════════════
+         * **投屏模式切换（2026-11-08 合并普通投屏 / 地图投屏）**
+         * ══════════════════════════════════════════════════════════════
+         *
+         * 之前是两套独立按钮：
+         *   [开始投屏][停投屏]   普通 App 投屏
+         *   [地图投屏][停地图]   地图专用投屏
+         *
+         * 但底下重复了三件重活，两套同时跑会互相踩：
+         *   · 部署 CP 服务（dashcastd）—— 会重启对方的会话，画面中断
+         *   · 启动 dcapd2 —— 同一时间只能有一个，起来就把对方杀了
+         *   · 占用 CP layer 99 —— 同一个图层两边抢
+         *
+         * 现在合并成一个模式选择 + 一组开始/停止按钮：
+         *   普通投屏 —— 抓主屏/指定 App
+         *   地图投屏 —— 注入地图进程，抓它的 VirtualDisplay
+         *
+         * 两条路径共享同一套 CP 部署、dcapd2 管理、图层管理、遮罩下发，
+         * 只有「画面源」不同。
+         */
+        castMode = 0;
+        LinearLayout modeRow = new LinearLayout(this);
+        modeRow.setOrientation(LinearLayout.HORIZONTAL);
+        btnModeNormal = chipButton("", v -> switchCastMode(0));
+        modeRow.addView(btnModeNormal, rowLp(1f));
+        btnModeMap = chipButton("", v -> switchCastMode(1));
+        modeRow.addView(btnModeMap, rowLp(1f));
+        LinearLayout.LayoutParams modeLp = new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT);
+        modeLp.setMargins(0, 0, 0, dp(6));
+        modeRow.setLayoutParams(modeLp);
+        castCard.addView(modeRow);
+        refreshModeButtons();
 
         LinearLayout castMainRow = new LinearLayout(this);
         castMainRow.setOrientation(LinearLayout.HORIZONTAL);
         btnStart = iconButton("开始投屏", R.drawable.ic_play, R.drawable.btn_primary,
-                android.R.color.white, v -> startCast());
+                android.R.color.white, v -> startCastByMode());
         castMainRow.addView(btnStart, rowLp(1.5f));
         btnStop = iconButton("停投屏", R.drawable.ic_stop, R.drawable.btn_danger,
-                R.color.state_error, v -> stopCastOnly());
+                R.color.state_error, v -> stopCastByMode());
         castMainRow.addView(btnStop, rowLp(1f));
         castCard.addView(castMainRow);
 
         /*
-         * 地图投屏（2026-11-08 新增）
-         *
-         * 与「开始投屏」的区别：
-         *   开始投屏 —— 把**别的 App** 搬进虚拟屏（ImageReader 抓整块）
-         *   地图投屏 —— **注入地图进程**，让它把地图直接渲染到我们建的
-         *                VirtualDisplay（PixelCopy 抓 Surface 内容，无 UI 叠加）
-         *
-         * 为什么必须注入：
-         *   Dashcast 进程没有 CAPTURE_VIDEO_OUTPUT（signature 级），
-         *   自己建不了 1920x532 的 VirtualDisplay；地图进程有。
-         *   注入后地图用它自己的 HUDControl.initSurfaceView 注册 slot 5，
-         *   再 PixelCopy 抓帧 → VDF1 → dcapd2 → CP。
+         * 原来这里还有一行独立的「地图投屏 / 停地图」按钮（2026-11-08 已并进
+         * 上方的模式选择）。保留两个字段的声明（btnMapCast / btnMapStop），
+         * 因为其它地方（enabled 联动、状态刷新）还在引用，但按 null 处理，
+         * 所有 `if (btnMapCast != null)` 都会安全跳过。
          */
-        LinearLayout mapRow = new LinearLayout(this);
-        mapRow.setOrientation(LinearLayout.HORIZONTAL);
-        btnMapCast = iconButton("地图投屏", R.drawable.ic_play, R.drawable.btn_secondary,
-                R.color.accent_soft, v -> startMapCast());
-        mapRow.addView(btnMapCast, rowLp(1.5f));
-        btnMapStop = iconButton("停地图", R.drawable.ic_stop, R.drawable.btn_secondary,
-                R.color.state_error, v -> stopMapCast());
-        mapRow.addView(btnMapStop, rowLp(1f));
-        LinearLayout.LayoutParams mapLp = new LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT,
-                LinearLayout.LayoutParams.WRAP_CONTENT);
-        mapLp.setMargins(0, dp(6), 0, 0);
-        mapRow.setLayoutParams(mapLp);
-        castCard.addView(mapRow);
+        btnMapCast = null;
+        btnMapStop = null;
 
         mapCastState = new TextView(this);
         mapCastState.setTextSize(14);
@@ -3840,7 +3872,15 @@ public class MainActivity extends Activity {
             if (dialogRef[0] != null) dialogRef[0].dismiss();
             if (MirrorController.isMirroring() || running) {
                 setStatus("状态：切换投屏目标 → " + e.label + "…");
-                startCast();
+                /*
+                 * **用 startCastByMode() 而不是 startCast()**（2026-11-08）
+                 *
+                 * 选 App 面板在地图模式下是隐藏的，正常走不到这里；
+                 * 但代码路径不排除被其它地方触发（比如以后加了快捷键），
+                 * 那时 castMode=1 却调 startCast() 会走普通投屏链路，
+                 * 和地图投屏抢 dcapd2 / layer 99 —— 正是这次合并要消除的冲突。
+                 */
+                startCastByMode();
             } else {
                 setStatus("状态：已选择 " + e.label + "（点「开始投屏」生效）");
             }
@@ -3996,6 +4036,100 @@ public class MainActivity extends Activity {
 
         /* 直接进投屏流程（不校验 targetPkg） */
         startCastInner();
+    }
+
+    /*
+     * ═══════════════════════════════════════════════════════════════════
+     * **投屏模式切换（2026-11-08 合并两套按钮）**
+     * ═══════════════════════════════════════════════════════════════════
+     *
+     * 合并理由：普通投屏和地图投屏底下做的是同一批重活 ——
+     *   · 部署 CP 服务（dashcastd）→ 会重启对方会话，画面中断
+     *   · 启动 dcapd2 → 同一时间只能有一个，起来就把对方杀了
+     *   · 占用 CP layer 99 → 同一个图层两边抢
+     *
+     * 两套同时点必然互相踩。合并成一个模式选择后，同一时间只有一条链路在跑。
+     */
+
+    /** 切换投屏模式并刷新按钮 */
+    private void switchCastMode(int mode) {
+        if (busy) {
+            DashLog.i(TAG, "操作进行中，忽略模式切换");
+            return;
+        }
+        if (castMode == mode) return;
+
+        /* 正在投的时候不允许换模式 —— 换了等于让底下那套重活互相踩
+         *
+         * 注意用的是静态的 isMirroring()，不是 isRunning()：
+         * MirrorController.isRunning() 是实例方法，静态调用编不过。
+         * 地图投屏那边 MapCastService.get() 是单例，可以直接调 isRunning()。
+         */
+        boolean running = MirrorController.isMirroring() || MapCastService.get().isRunning();
+        if (running) {
+            setStatus("状态：请先「停投屏」再切换模式");
+            return;
+        }
+
+        castMode = mode;
+        refreshModeButtons();
+        setStatus("状态：" + (mode == 0 ? "普通投屏" : "地图投屏") + "（未启动）");
+        appendLog("投屏模式 · " + (mode == 0 ? "普通投屏" : "地图投屏"));
+    }
+
+    /** 两个模式按钮的选中态 + 文案，并按模式隐藏不需要的控件 */
+    private void refreshModeButtons() {
+        if (btnModeNormal == null || btnModeMap == null) return;
+        setChipSelected(btnModeNormal, castMode == 0, "普通投屏");
+        setChipSelected(btnModeMap, castMode == 1, "地图投屏");
+
+        /*
+         * 地图模式不需要「选择投屏 App」—— 那条链路是注入地图进程，
+         * 目标固定是 com.geely.map，用户选了别的 App 也没用。
+         * 留着按钮只会让人以为要选、选了又不生效。
+         */
+        if (btnPickApp != null) {
+            btnPickApp.setVisibility(castMode == 0 ? View.VISIBLE : View.GONE);
+        }
+        if (targetHint != null) {
+            targetHint.setVisibility(castMode == 0 ? View.VISIBLE : View.GONE);
+        }
+    }
+
+    /**
+     * chip 按钮的选中态。
+     *
+     * **直接用项目里的 styleToggle**（2026-11-08 修）。
+     *
+     * 一开始我自己写了套 setBackgroundResource(btn_primary/btn_secondary) +
+     * setTextColor(white/accent_soft)，和全项目其它 chip（编码档、遮罩形状、
+     * 视角三档）的选中态不一致 —— 别处用的是 btn_selected + accent_on。
+     * 同一个界面里两套选中样式，用户看到的是"有的按钮点了变蓝、有的变深灰"。
+     *
+     * styleToggle 还额外处理了「所有子 View 文字变色」（applyTextColorRecursive），
+     * 而我的版本只改了第一个 TextView —— chipButton 目前只有一个 TextView 所以
+     * 看不出问题，但带图标的 chip 就会漏。
+     */
+    private void setChipSelected(LinearLayout chip, boolean on, String label) {
+        if (chip == null) return;
+        TextView tv = (TextView) chip.getChildAt(0);
+        if (tv != null) tv.setText(on ? label + " ✓" : label);
+        styleToggle(chip, on);
+    }
+
+    /** 按当前模式开投 */
+    private void startCastByMode() {
+        if (castMode == 0) {
+            startCast();       /* 普通投屏：抓主屏/指定 App */
+        } else {
+            startMapCast();    /* 地图投屏：注入地图进程 */
+        }
+    }
+
+    /** 按当前模式停投（两条链路都要清，防止上一次残留） */
+    private void stopCastByMode() {
+        stopCastOnly();        /* 停普通投屏 */
+        stopMapCast();         /* 停地图投屏（内部有 isRunning 保护，没跑就跳过） */
     }
 
     private void startCast() {
@@ -4429,13 +4563,17 @@ public class MainActivity extends Activity {
     }
 
     private void stopMapCast() {
+        /* 没在跑就静默跳过 —— stopCastByMode() 会同时调 stopCastOnly()
+         * 和 stopMapCast()，两个都无条件执行的话，永远会多打一条
+         * "地图投屏已停止，仪表已还原" 的状态，用户以为出问题了。 */
+        if (!MapCastService.get().isRunning()) {
+            if (mapCastState != null) mapCastState.setText("地图投屏：未启动");
+            return;
+        }
         setStatus("状态：正在停止地图投屏…");
         appendLog("地图投屏 · 停止");
         MapCastService.get().stop();
         if (mapCastState != null) mapCastState.setText("地图投屏：未启动");
-        if (btnMapCast != null) btnMapCast.setEnabled(true);
-        if (btnMapStop != null) btnMapStop.setEnabled(false);
-        setStatus("状态：地图投屏已停止，仪表已还原");
     }
 
     /** [停止投屏] 停镜像抓帧进程；CP 端图层随之还原 */

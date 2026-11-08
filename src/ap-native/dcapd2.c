@@ -77,6 +77,23 @@ using namespace android;
 #define CAPTURE_W 1280          /* 整屏回读宽度，按主屏比例推高度 */
 #define PAUSE_FILE "/data/local/tmp/dcapd2.pause"
 #define BG_FILE    "/data/local/tmp/dcapd2.bg"
+
+/*
+ * 地图投屏专用的构图配置文件（2026-11-08）
+ *
+ * 为什么单独一个文件、不复用 dcapd2.layer：
+ *   dcapd2.layer 是**应用投屏**的遮罩配置，由 App 的遮罩编辑器写，
+ *   普通投屏和地图投屏都会下发它。往里面塞地图专用键，会让应用投屏
+ *   也读到这些值（哪怕不用），风险高且语义混乱。
+ *
+ * 这个文件只有一行：cover_dy=<像素>
+ *   · 存在且文件里有值 → 地图投屏按这个偏移调整取景
+ *   · 不存在 → 地图投屏保持原构图
+ *   · **应用投屏完全不读这个文件**，所以永远不会被影响
+ *
+ * 由 MapCastService 在启动地图投屏前写入 / 清理。
+ */
+#define MAPCFG_FILE "/data/local/tmp/dcapd2.map"
 #define PROXY_PORT 8450
 #define VDFRAME_MAGIC 0x56444631u   /* 'VDF1'：App 侧 VD 帧的包头 */
 #define CMD_BG        0x47424344u   /* 'DCBG'：4 字节控制命令 —— 立刻停抓主屏 */
@@ -180,6 +197,21 @@ static int          g_dst_x = 0, g_dst_y = 0, g_dst_w = 0, g_dst_h = 0;
  * 由 recompute_dst() 按遮罩宽高比算出来。
  */
 static int          g_cover_sx = 0, g_cover_sy = 0, g_cover_sw = 0, g_cover_sh = 0;
+
+/*
+ * 地图投屏专用的「纵向构图偏移」（2026-11-08）
+ *
+ * 只影响 **VD 模式**（src=VD，也就是地图投屏），对主屏/App 投屏完全无感。
+ *
+ * 用途：把地图画面在遮罩里往上推一点，让车模居中偏上、后方留空。
+ * 引擎没暴露「车模屏幕位置」接口（实测 setProjectionCenter 是摄像机
+ * 投影中心，设错会把地图整体移出画面且无法复位，只能重启地图），
+ * 所以改从**取景**这一侧做 —— 多取源图下方一点、少取上方，画面自然上移。
+ *
+ * 单位是**源图素**（VD 帧坐标系里的像素）。0 = 不偏移，保持现有构图。
+ * 由配置文件地图段的 cover_dy 控制，见 dc_layer_parse 里 map_ 前缀的键。
+ */
+static int          g_map_cover_dy = 0;
 static int          g_cap_w = 0, g_cap_h = 0;   /* 抓帧尺寸，重算映射用 */
 static int          g_src_x = 0, g_src_y = 0, g_src_w = 0, g_src_h = 0;  /* 抓帧内源矩形 */
 
@@ -773,6 +805,40 @@ static void set_nonblock(int fd, int on)
     int fl = fcntl(fd, F_GETFL, 0);
     if (fl < 0) return;
     fcntl(fd, F_SETFL, on ? (fl | O_NONBLOCK) : (fl & ~O_NONBLOCK));
+}
+
+/*
+ * 从 dcapd2.map 里读 cover_dy=<像素>（地图投屏专用构图偏移）
+ *
+ * 格式就一行 `cover_dy=-64`。读不到 / 值不合理都返回 -1，
+ * 调用方据此把偏移归零（保持原构图）。
+ *
+ * 为什么在 dcapd2 里自己实现而不复用 layer_mask.c 的 kv_get_int：
+ * 那个函数是 static，且绑死在遮罩解析的语义上（缺键就保留默认）。
+ * 这里要的是"文件不存在 = 不偏移"，语义不同，独立实现更清楚。
+ */
+static int kv_read_map_dy(const char *path, int *out)
+{
+    if (!path || !out) return -1;
+    FILE *fp = fopen(path, "r");
+    if (!fp) return -1;
+    char line[128];
+    int got = 0;
+    while (fgets(line, sizeof(line), fp)) {
+        const char *p = line;
+        while (*p == ' ' || *p == '\t') p++;
+        if (strncmp(p, "cover_dy=", 9) == 0) {
+            int v = atoi(p + 9);
+            /* 合理范围：±1/3 画面高度，超出肯定是配置写错了 */
+            if (v < -400) v = -400;
+            if (v > 400) v = 400;
+            *out = v;
+            got = 1;
+            break;
+        }
+    }
+    fclose(fp);
+    return got ? 0 : -1;
 }
 
 static int make_listen(int port)
@@ -1918,8 +1984,96 @@ int main(int argc, char **argv)
                             g_blit_src_h = vh;
                             recompute_dst();
                         }
+
+                        /*
+                         * ★ VD 分支也要吃 cover 裁切（2026-11-08 修）
+                         *
+                         * 原来这里直接把 vx/vy/vw/vh 丢给 blit_bilinear ——
+                         * 而 g_cover_sx/sy/sw/sh 只在**主屏分支**（App 投屏）
+                         * 里被应用。结果地图投屏（走 VD 分支）根本没走 cover 逻辑，
+                         * fit=2 设了半天对地图无效，画面还是按 fit=0 拉伸变形。
+                         *
+                         * 现在两边统一：都先取 cover 子矩形，再做纵向构图偏移。
+                         */
+                        int fvx = vx, fvy = vy, fvw = vw, fvh = vh;
+                        if (g_cover_sw > 0 && g_cover_sh > 0) {
+                            fvx = vx + g_cover_sx;
+                            fvy = vy + g_cover_sy;
+                            fvw = g_cover_sw;
+                            fvh = g_cover_sh;
+                        }
+
+                        /*
+                         * ★ 地图纵向构图偏移（2026-11-08）
+                         *
+                         * 只对 VD 帧生效，读的是 **dcapd2.map** 这个独立文件
+                         * （应用投屏从不读它，所以绝不会影响原有遮罩/构图）。
+                         *
+                         * 做法：把取景窗口上下平移 dy 像素。
+                         *   dy > 0 → 往下多取（画面内容整体上移，车模靠上）
+                         *   dy < 0 → 往上多取（画面内容整体下移）
+                         *
+                         * 高度保持不变 —— 变了画面会被缩放，构图反而乱。
+                         * 越界时夹住，保证不越界读。
+                         *
+                         * 文件每 2 秒重读一次（改配置不用重启 dcapd2），
+                         * 用静态时间戳节流，避免每帧都 stat。
+                         */
+                        static int s_map_dy = 0;
+                        static long long s_map_cfg_ms = 0;
+                        if (now - s_map_cfg_ms >= 2000) {
+                            s_map_cfg_ms = now;
+                            int v = 0;
+                            if (kv_read_map_dy(MAPCFG_FILE, &v) == 0) {
+                                if (v != s_map_dy) {
+                                    LOGI("地图构图偏移 → dy=%d", v);
+                                }
+                                s_map_dy = v;
+                            } else {
+                                s_map_dy = 0;
+                            }
+                        }
+                        g_map_cover_dy = s_map_dy;
+
+                        if (g_map_cover_dy != 0) {
+                            /*
+                             * **取景窗口必须先缩小，才有空间上下平移**（2026-11-08 修）
+                             *
+                             * 第一版写的是「高度不变、只平移 fvy」——
+                             * 实测完全无效：VD 帧高 532、遮罩高也 532（全屏），
+                             * fvy 只能是 0，任何 dy 都会被下面的越界夹紧吃掉。
+                             *
+                             * 正确做法：把取景窗口按 |dy| 缩小一点（腾出活动空间），
+                             * 再把窗口整体平移 dy。代价是画面轻微缩放
+                             * （532 → 532-|dy|，dy=64 时缩 12%），但构图真的会变。
+                             *
+                             * dy > 0 → 窗口下移 → 画面内容上移（车模靠上）
+                             * dy < 0 → 窗口上移 → 画面内容下移
+                             *
+                             * 缩小量 = min(|dy|, 帧高的 1/4)，防止缩得太狠把画面压糊。
+                             */
+                            int ady = g_map_cover_dy > 0 ? g_map_cover_dy : -g_map_cover_dy;
+                            int maxShrink = g_px_h / 4;
+                            if (ady > maxShrink) ady = maxShrink;
+
+                            int newH = fvh - ady;
+                            if (newH < fvh / 2) newH = fvh / 2;   /* 兜底：不低于一半 */
+
+                            /* 腾出 ady 像素的活动空间，再把窗口移过去 */
+                            if (g_map_cover_dy > 0) {
+                                /* 下移：吃掉上方 ady，窗口从 fvy+ady 开始 */
+                                fvy = fvy + ady;
+                            }
+                            fvh = newH;
+
+                            /* 夹住，保证不越界 */
+                            if (fvy < 0) fvy = 0;
+                            if (fvy + fvh > g_px_h) fvy = g_px_h - fvh;
+                            if (fvy < 0) fvy = 0;
+                        }
+
                         blit_bilinear(g_px_buf, g_px_stride, g_px_w, g_px_h,
-                                      vx, vy, vw, vh, canvas, outW, outH,
+                                      fvx, fvy, fvw, fvh, canvas, outW, outH,
                                       g_dst_x, g_dst_y, g_dst_w, g_dst_h);
                         applied++;
                         do_push = 1;

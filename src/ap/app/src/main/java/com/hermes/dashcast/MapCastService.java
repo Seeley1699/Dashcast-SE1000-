@@ -57,6 +57,27 @@ public final class MapCastService {
     private static final int W = 1920;
     private static final int H = 532;
 
+    /*
+     * 地图构图偏移（2026-11-08）
+     *
+     * 车模在画面里的纵向位置。dcapd2 读 /data/local/tmp/dcapd2.map 里的
+     * cover_dy=，只在 **VD 帧分支** 生效 —— 应用投屏走主屏分支，
+     * 根本不读这个文件，所以原有遮罩/构图完全不受影响。
+     *
+     * 实测取值（画面 528x416，车模占画面高度百分比）：
+     *    0    → 中心 50%（正中，3D 导航标准构图里偏上了）
+     *    -100 → 中心 61%
+     *    -133 → 中心 66%  ← 参考图那个效果（车偏下、视野朝前）
+     *    +100 → 中心 30%（车贴近顶部）
+     *
+     * 负值 = 车模下移（取景窗口上移），正是 3D 导航该有的样子：
+     * 上方大面积前瞻道路 + 导航卡片，下方留一小段车后空间。
+     *
+     * 上限由 dcapd2 自己夹住（|dy| <= 帧高/4），这里填超了也不会崩。
+     */
+    private static final String MAPCFG = TMP + "/dcapd2.map";
+    private static final int MAP_COVER_DY = -133;
+
     /* 地图包名 */
     private static final String MAP_PKG = "com.geely.map";
 
@@ -112,27 +133,57 @@ public final class MapCastService {
 
     /** 停止地图投屏 */
     public boolean stop() {
+        /*
+         * **CP 停服必须放 worker 线程**（2026-11-08 修「启动地图投屏卡住」）
+         *
+         * 日志实证（dashcast-11.log:22:43:14.465）：
+         *   E/DashcastCp  停止 dashcastd 失败: null
+         *   android.os.NetworkOnMainThreadException
+         *     at com.jcraft.jsch.Session.connect(Session.java:256)
+         *     at com.hermes.dashcast.CpManager.acquireSession(CpManager.java:150)
+         *
+         * 原因：stop() 被 MainActivity 在主线程直接调用，而它内部同步跑
+         * cpm.stopDashcastd() / cpm.restoreDashboard()，这两个都要建 SSH 连接。
+         * StrictMode 拦下 → dashcastd 没停、图层没还原 → 再启动地图投屏时
+         * 旧 dashcastd 还占着 8444，新的 dcapd2 连不上 → 卡在"正在启动"。
+         *
+         * 现在：立即置 running=false（UI 立刻响应），真正的清理丢到 worker。
+         * 注意 worker 可能还没建（从没启动过投屏就点停止），所以按需创建。
+         */
         synchronized (lock) {
             running = false;
             injectedPid = -1;
             dcapd2Pid = "";
-            /*
-             * **先释放长活通道**（2026-11-08）。
-             *
-             * LongLivedShell 持有的 socket 一关，adbd 立刻回收它创建的
-             * 进程组 —— dcapd2 / hudcast-inject 跟着退，不用再 pkill。
-             * 顺序很重要：先释放再 pkill，否则 pkill 前进程可能已被
-             * 重新拉起（地图是系统应用，它的注入器被杀了不影响地图本身，
-             * 但 dcapd2 被 KeepAlive 之类拉起过一次，实测会残留）。
-             */
+        }
+
+        if (worker == null) {
+            worker = new HandlerThread("mapcast");
+            worker.start();
+            wh = new Handler(worker.getLooper());
+        }
+        wh.post(this::stopSequence);
+        return true;
+    }
+
+    /** 停止流程本体（跑在 worker 线程） */
+    private void stopSequence() {
+        {
             try {
                 LongLivedShell.releaseAll();
             } catch (Throwable t) {
                 Log.w(TAG, "releaseAll err: " + t);
             }
             try {
+                /*
+                 * 顺手清掉地图构图配置（2026-11-08）。
+                 *
+                 * 不清的话，下次「应用投屏」启动 dcapd2 时这个文件还在 ——
+                 * 虽然应用投屏走主屏分支、根本不读它，但留着容易让人以为
+                 * 它有全局副作用。清掉最干净。
+                 */
                 AdbShell.exec("pkill -9 -f hudcast-inject 2>/dev/null; "
-                        + "pkill -9 -f dcapd2 2>/dev/null; echo DONE", 6000);
+                        + "pkill -9 -f dcapd2 2>/dev/null; "
+                        + "rm -f " + MAPCFG + "; echo DONE", 6000);
             } catch (Throwable t) {
                 Log.w(TAG, "stop err: " + t);
             }
@@ -144,7 +195,6 @@ public final class MapCastService {
                 Log.w(TAG, "cp stop err: " + t);
             }
             notify2("已停止");
-            return true;
         }
     }
 
@@ -466,6 +516,28 @@ public final class MapCastService {
                 }
             } catch (Throwable t) {
                 Log.w(TAG, "下发遮罩配置失败（不影响投屏）: " + t);
+            }
+
+            /*
+             * 写地图构图偏移配置（2026-11-08）
+             *
+             * 单独一个文件 /data/local/tmp/dcapd2.map，内容就一行
+             * `cover_dy=-133`。dcapd2 只在 **VD 帧分支** 每秒重读一次，
+             * 所以：
+             *   · 地图投屏 —— 车模下移到画面 66%（参考图那个构图）
+             *   · 应用投屏 —— 走主屏分支，**根本不读这个文件**，
+             *     原来的遮罩/取景/构图一个字都不受影响
+             *
+             * 用 base64 写，避免 shell 引号问题（和 LayerConfig.push 一个套路）。
+             */
+            try {
+                String body = "cover_dy=" + MAP_COVER_DY + "\n";
+                String b64 = android.util.Base64.encodeToString(
+                        body.getBytes("UTF-8"), android.util.Base64.NO_WRAP);
+                AdbShell.exec("echo " + b64 + " | base64 -d > " + MAPCFG, 4000);
+                Log.i(TAG, "地图构图偏移已下发 cover_dy=" + MAP_COVER_DY);
+            } catch (Throwable t) {
+                Log.w(TAG, "写地图构图配置失败（不影响投屏）: " + t);
             }
 
             AdbShell.exec(": > " + TMP + "/dcapd2.log; "
