@@ -4126,10 +4126,43 @@ public class MainActivity extends Activity {
         }
     }
 
-    /** 按当前模式停投（两条链路都要清，防止上一次残留） */
+    /**
+     * 按当前模式停投（两条链路都要清，防止上一次残留）
+     *
+     * **必须串行**（2026-11-08 修「刚启动就被杀」）
+     *
+     * stopCastOnly() 和 stopMapCast() 内部各自往 worker 线程丢任务，
+     * 两个 worker 并发跑时，pkill 的执行顺序不确定 ——
+     * 实测踩到过：
+     *   23:48:15  同时发起两个 stop
+     *   23:48:20  用户已经点了「地图投屏」，新 dcapd2 起来了
+     *   23:48:29  普通投屏那边的清理才执行 pkill -9 -f dcapd2
+     *   23:48:30  新的 dcapd2 被误杀 → "抓帧服务未启动"
+     *
+     * 现在：先同步停普通投屏（它是后台线程但 stop 本身很快返回），
+     * 隔 1.5 秒让它的清理走完，再停地图投屏。用户点停止时看到的
+     * 只是"慢了一点点"，换来的是后续启动绝不被旧清理干扰。
+     */
     private void stopCastByMode() {
-        stopCastOnly();        /* 停普通投屏 */
-        stopMapCast();         /* 停地图投屏（内部有 isRunning 保护，没跑就跳过） */
+        /*
+         * 整段丢到后台线程 —— 里面要 sleep 1.5 秒，
+         * 放 UI 线程会卡住界面（ANR 风险）。
+         * setStatus / appendLog 内部都会 post 回主线程，跨线程安全。
+         */
+        new Thread(() -> {
+            stopCastOnly();        /* 停普通投屏 */
+            try {
+                /*
+                 * 给普通投屏的异步清理留时间 —— 内部那条
+                 * `pkill -9 -f dcapd2` 是丢在线程池里跑的，
+                 * 不等就会和下面地图投屏的启动撞车（实测日志见方法注释）。
+                 */
+                Thread.sleep(1500);
+            } catch (InterruptedException ignored) {
+                Thread.currentThread().interrupt();
+            }
+            stopMapCast();         /* 停地图投屏（内部有 isRunning 保护，没跑就跳过） */
+        }, "stop-cast").start();
     }
 
     private void startCast() {

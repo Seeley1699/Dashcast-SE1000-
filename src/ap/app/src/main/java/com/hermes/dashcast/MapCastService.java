@@ -181,8 +181,8 @@ public final class MapCastService {
                  * 虽然应用投屏走主屏分支、根本不读它，但留着容易让人以为
                  * 它有全局副作用。清掉最干净。
                  */
-                AdbShell.exec("pkill -9 -f hudcast-inject 2>/dev/null; "
-                        + "pkill -9 -f dcapd2 2>/dev/null; "
+                AdbShell.exec("pkill -9 -x hudcast-inject 2>/dev/null; "
+                        + "pkill -9 -x dcapd2 2>/dev/null; "
                         + "rm -f " + MAPCFG + "; echo DONE", 6000);
             } catch (Throwable t) {
                 Log.w(TAG, "stop err: " + t);
@@ -485,7 +485,7 @@ public final class MapCastService {
              *   ③ 正确顺序：kill → **等 2 秒真的死透** → truncate → 启动。
              *      分两次 AdbShell.exec，中间 Thread.sleep。
              */
-            AdbShell.exec("pkill -9 -f dcapd2 2>/dev/null; echo KILLED", 6000);
+            AdbShell.exec("pkill -9 -x dcapd2 2>/dev/null; echo KILLED", 6000);
             Thread.sleep(2000);
 
             /*
@@ -567,9 +567,28 @@ public final class MapCastService {
                 return;
             }
 
-            Thread.sleep(3000);
-            String chk = AdbShell.exec("pidof dcapd2", 6000);
-            String p = chk == null ? "" : chk.trim();
+            /*
+             * **轮询等 dcapd2 起来，别只看一眼**（2026-11-08 修）
+             *
+             * 日志实证（dashcast 23:48）：
+             *   23:48:25.116  启动抓帧服务…
+             *   23:48:29.938  （普通投屏异步清理里那条 pkill -9 -f dcapd2 才执行）
+             *   23:48:30.314  抓帧服务未启动
+             *
+             * 原来 sleep(3000) 后 pidof 一次就下结论。两个问题：
+             *   ① 3 秒对 58MB injector 的启动流程偏短
+             *   ② 前一秒普通投屏的 worker 线程可能刚执行 pkill -9 -f dcapd2，
+             *      把**这个刚起来的进程**一起干掉 —— pidof 那一刻正好空窗
+             *
+             * 改成最多等 10 秒、每 1.2 秒查一次。真起不来才报失败。
+             */
+            String p = "";
+            for (int i = 0; i < 8; i++) {
+                Thread.sleep(1200);
+                String chk = AdbShell.exec("pidof dcapd2", 6000);
+                p = chk == null ? "" : chk.trim();
+                if (!p.isEmpty()) break;
+            }
             Log.i(TAG, "dcapd2 pid = [" + p + "]");
             if (p.isEmpty()) {
                 notify2("抓帧服务未启动");
@@ -633,7 +652,7 @@ public final class MapCastService {
             notify2("注入地图进程 " + pid + " …");
             /* 同 startDcapd2：LongLivedShell 持有通道，adbd 才不动这个进程 */
             /* 同 startDcapd2：kill → 等死透 → truncate，不能一条命令串做完 */
-            AdbShell.exec("pkill -9 -f hudcast-inject 2>/dev/null; echo KILLED", 6000);
+            AdbShell.exec("pkill -9 -x hudcast-inject 2>/dev/null; echo KILLED", 6000);
             Thread.sleep(1500);
             AdbShell.exec(": > " + TMP + "/mapcast.log; echo OK", 6000);
             String cmd = INJECTOR + " -p " + pid
