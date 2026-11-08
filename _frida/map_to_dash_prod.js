@@ -201,58 +201,8 @@ Java.perform(function () {
     var R = Java.use('java.lang.Runnable');
     var ByteBuffer = Java.use('java.nio.ByteBuffer');
 
-    var Main = Java.registerClass({
-        name: 'com.dashcast.MapProd3' + Process.id,
-        implements: [R],
-        methods: {
-            run: function () {
+    var startPc = function () {
                 try {
-                    /* ② MapView 挂到我们的 VirtualDisplay */
-                    var DM = Java.use('android.hardware.display.DisplayManager');
-                    var mgr2 = app.getSystemService(Context.DISPLAY_SERVICE.value);
-                    var tgt = null;
-                    DM.getDisplay.overloads.forEach(function (m) {
-                        if (m.argumentTypes.length === 1 &&
-                            m.argumentTypes[0].className === 'int') {
-                            tgt = m.call(mgr2, displayId);
-                        }
-                    });
-                    var dctx = app.createDisplayContext(tgt);
-
-                    var MVC = Java.use('ecarx.navi.engine.basemap.MapView');
-                    var mv = MVC.$new(dctx);
-                    mv.setSurfaceWidthAndHeight(W, H);
-
-                    var vm = Java.cast(dctx.getSystemService(Context.WINDOW_SERVICE.value),
-                        Java.use('android.view.ViewManager'));
-                    var WLP = Java.use('android.view.WindowManager$LayoutParams');
-                    var lp = WLP.$new();
-                    lp.width.value = W;
-                    lp.height.value = H;
-                    lp.type.value = CFG.WIN_TYPE;
-                    lp.format.value = -3;
-                    lp.gravity.value = 51;
-                    lp.flags.value = 0x00000100;
-                    vm.addView(mv, lp);
-                    CTX.mv = mv;
-                    log('addView OK (type=' + CFG.WIN_TYPE + ')');
-
-                    /* ③ HUDControl —— 引擎在这里自动注册 slot 5 的 MapView */
-                    var HC = Java.use('ecarx.navi.engine.feature.external.control.HUDControl');
-                    var hc = HC.$new();
-                    hc.surfaceViewID.value = CFG.HUD_SLOT;
-                    hc.initSurfaceView(mv, true, W, H);
-                    CTX.hc = hc;
-                    log('initSurfaceView OK, isInitOk=' + hc.isInitOk());
-
-                    try { hc.setCarLogoVisible(true); } catch (e) {}
-                    try { hc.setLayerVisible(true); } catch (e) {}
-                    try { hc.setDynamicLevel(true); } catch (e) {}
-                    try { hc.renderResume(); } catch (e) {}
-                    try { hc.drawRoute(); } catch (e) {}
-                    log('渲染启动');
-
-                    /* ④ PixelCopy + 原生内存拷贝（无 JS 循环） */
                     var Bitmap = Java.use('android.graphics.Bitmap');
                     var Config = Java.use('android.graphics.Bitmap$Config');
                     var bmp = Bitmap.createBitmap(W, H, Config.ARGB_8888.value);
@@ -381,14 +331,36 @@ Java.perform(function () {
                             run: function () {
                                 if (CTX.stopper) return;
                                 try {
-                                    /* ★ 用 Surface 版：只抓 Surface 内容，
-                                       不含覆盖其上的 View（搜索框等 UI） */
-                                    PC.request.overload(
-                                        'android.view.Surface',
-                                        'android.graphics.Bitmap',
-                                        'android.view.PixelCopy$OnPixelCopyFinishedListener',
-                                        'android.os.Handler'
-                                    ).call(PC, mv.getHolder().getSurface(), bmp, CTX.listener, hh);
+                                    /* ★ 抓 HudActivity 自己的 SurfaceView
+                                     *
+                                     * 原来是 mv.getHolder().getSurface()，mv 是我们手动
+                                     * 创建的 basemap.MapView —— 那条路引擎不给导航图层。
+                                     * 现在抓 HudActivity 内建的 SurfaceView，
+                                     * 它背后是完整的 GuidanceLayer。
+                                     *
+                                     * 优先用 Surface 重载（不含盖在上面的 View），
+                                     * 拿不到 Surface 再退回 SurfaceView 重载。
+                                     */
+                                    var surface = null;
+                                    try {
+                                        surface = CTX.sv.getHolder().getSurface();
+                                    } catch (e) {}
+
+                                    if (surface && surface.isValid()) {
+                                        PC.request.overload(
+                                            'android.view.Surface',
+                                            'android.graphics.Bitmap',
+                                            'android.view.PixelCopy$OnPixelCopyFinishedListener',
+                                            'android.os.Handler'
+                                        ).call(PC, surface, bmp, CTX.listener, hh);
+                                    } else {
+                                        PC.request.overload(
+                                            'android.view.SurfaceView',
+                                            'android.graphics.Bitmap',
+                                            'android.view.PixelCopy$OnPixelCopyFinishedListener',
+                                            'android.os.Handler'
+                                        ).call(PC, CTX.sv, bmp, CTX.listener, hh);
+                                    }
                                 } catch (e) {
                                     FP.err++;
                                     if (FP.err <= 3) log('request 失败 ' + String(e).substring(0, 60));
@@ -399,7 +371,7 @@ Java.perform(function () {
                     });
                     var trigInst = TrigCls.$new();
 
-                    hh.postDelayed(trigInst, 2500);
+                    hh.postDelayed(trigInst, 1200);
                     log('PixelCopy 链已启动（目标 ' + CFG.FPS + 'fps）');
 
                     if (CFG.RUN_SECONDS > 0) {
@@ -419,9 +391,185 @@ Java.perform(function () {
                 } catch (e) {
                     log('ERR ' + String(e).substring(0, 130));
                 }
+    };
+    var Main = Java.registerClass({
+        name: 'com.dashcast.MapProd3' + Process.id,
+        implements: [R],
+        methods: {
+            run: function () {
+                try {
+                    /*
+                     * ② 启动 HudActivity 到我们的 VirtualDisplay
+                     *
+                     * **为什么不用手动 HUDControl.initSurfaceView**（2026-11-08）
+                     *
+                     * 之前的做法是自己 new HUDControl() + initSurfaceView(MapView)，
+                     * 引擎只给了底图（MapLayer），不给 GuidanceLayer ——
+                     * 结果仪表盘上没有导航路线、没有红绿灯、没有车道指引。
+                     *
+                     * 实测原因：引擎把「路线/红绿灯/车道」这些 native 层
+                     * （RoutePathLayer / 对应 BizControl）只在 Activity 生命周期内
+                     * 创建。手动挂载的 MapView 拿不到。
+                     *
+                     * HudActivity 是地图 App 内置的 HUD 投屏 Activity
+                     * （com.ecarx.navi.multiscreen.hud.HudActivity，exported=true,
+                     * launchMode=singleTask）。把它启动到我们的 VD 上，引擎会：
+                     *   ① 自动建好 SurfaceView (1920x532)
+                     *   ② 创建 HUDControl（surfaceViewID=5, mScreenWidth/Height 正确）
+                     *   ③ 完整创建 GuidanceLayer(slot5) + 9 个 Control
+                     *   ④ initMapParam(ExternalMapParam{isTmcVisible=true, ...})
+                     *
+                     * 我们随后只做一件事：从 HUDControl 的 surfaceViewControl
+                     * 里取出 SurfaceView，对它 PixelCopy 抓帧。
+                     */
+                    /*
+                     * ③ 发起 HudActivity
+                     *
+                     * **实测教训（2026-11-08）**：
+                     *   从 App 上下文 startActivity 到「别人创建的 VirtualDisplay」会抛
+                     *     SecurityException: Permission Denial: starting Intent {...}
+                     *   跨 display 启动需要 INTERNAL_SYSTEM_WINDOW 级权限，普通 App 拿不到。
+                     *
+                     *   而 `adb shell am start --display N -n ...` 用 shell 身份能成功
+                     *   （已实测：dumpsys 显示 Activity Resumed 在 display 35）。
+                     *
+                     *   所以策略：这里把 displayId 打到日志（VDID=<n>），
+                     *   由 Dashcast 侧读日志后调 adb shell 发起。
+                     *
+                     *   **这里必须 try/catch**：异常漏到外层会让整段 Main 中断，
+                     *   轮询和 PixelCopy 都不会启动（第一次改就是这样，0.0fps）。
+                     */
+                    log('VDID=' + displayId);
+                    try {
+                        var Intent = Java.use('android.content.Intent');
+                        var CN = Java.use('android.content.ComponentName');
+                        var AO = Java.use('android.app.ActivityOptions');
+                        var it = Intent.$new();
+                        it.setComponent(CN.$new('com.geely.map',
+                            'com.ecarx.navi.multiscreen.hud.HudActivity'));
+                        it.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK.value);
+                        var opts = AO.makeBasic();
+                        opts.setLaunchDisplayId(displayId);
+                        app.startActivity(it, opts.toBundle());
+                        log('HudActivity 已在进程内发起（displayId=' + displayId + '）');
+                    } catch (eSelf) {
+                        log('进程内启动被拒（预期，等 adb shell 发起）');
+                    }
+
+                    /* 必须在主线程轮询：Activity 启动是异步的，onCreate 要几秒 */
+                    var want = 20;      /* 最多轮询 20 次 x 1.5s = 30s */
+                    var tries = 0;
+
+                    var Poll = Java.registerClass({
+                        name: 'com.dashcast.Poll' + Process.id,
+                        implements: [R],
+                        methods: {
+                            run: function () {
+                                if (CTX.stopper) return;
+                                tries++;
+                                try {
+                                    var found = null;
+                                    Java.choose('com.ecarx.navi.multiscreen.hud.HudActivity', {
+                                        onMatch: function (a) {
+                                            try {
+                                                if (a.getDisplay().getDisplayId() === displayId
+                                                    && !a.isDestroyed() && !found) {
+                                                    found = a;
+                                                }
+                                            } catch (e) {}
+                                        },
+                                        onComplete: function () {}
+                                    });
+
+                                    if (found) {
+                                        /*
+                                         * **全部私有字段都要用反射**（2026-11-08，两次踩坑）
+                                         *
+                                         * 这条链上有三个 private 字段：
+                                         *   HudActivity.service
+                                         *   HUDService.mControl
+                                         *   HUDControl.surfaceViewControl
+                                         *   SurfaceViewControl.mSurfaceView
+                                         *
+                                         * frida 的 `obj.field.value` 只对 **public** 字段有效；
+                                         * private 字段读出来是 undefined，再取 .value 就抛
+                                         *   TypeError: Cannot read properties of undefined
+                                         *
+                                         * 第一次只改了最后一个，仍然在 `found.service.value`
+                                         * 这一步失败 —— 日志里的 "轮询 2/3 :: TypeError" 就是这个。
+                                         * 统一写个 rf() 帮手，四个字段全走 getDeclaredField。
+                                         */
+                                        var rf = function (obj, fname) {
+                                            try {
+                                                var f = obj.getClass()
+                                                    .getDeclaredField(fname);
+                                                f.setAccessible(true);
+                                                return f.get(obj);
+                                            } catch (e) {
+                                                return null;
+                                            }
+                                        };
+
+                                        var svc = rf(found, 'service');
+                                        if (!svc) { return; }
+                                        var hc = rf(svc, 'mControl');
+                                        if (!hc) { return; }
+                                        var sfc = rf(hc, 'surfaceViewControl');
+                                        if (!sfc) { return; }
+                                        var msv = rf(sfc, 'mSurfaceView');
+                                        if (msv) {
+                                            CTX.hudAct = found;
+                                            CTX.hc = hc;
+                                            CTX.sv = msv;
+                                            log('HudActivity 就绪：surfaceViewID='
+                                                + rf(hc, 'surfaceViewID')
+                                                + '  ' + rf(hc, 'mScreenWidth') + 'x'
+                                                + rf(hc, 'mScreenHeight'));
+                                            log('SurfaceView = ' + msv);
+
+                                            /* 把导航相关的开关全打开 */
+                                            var MP = Java.use(
+                                                'ecarx.navi.engine.bean.map.ExternalMapParam');
+                                            var mp = MP.$new();
+                                            try { mp.isTmcVisible.value = true; } catch (e) {}
+                                            try { mp.isCrossVisible.value = true; } catch (e) {}
+                                            try { mp.isDynamicLevel.value = true; } catch (e) {}
+                                            try { mp.isLayerVisible.value = true; } catch (e) {}
+                                            try {
+                                                mp.mapLevel.value = 17.0;
+                                            } catch (e) {}
+                                            try {
+                                                svc.initMapParam(mp);
+                                                log('initMapParam OK（路况/路口/图层全开）');
+                                            } catch (e2) {
+                                                log('initMapParam 失败 ' + String(e2).substring(0, 60));
+                                            }
+                                            startPc();
+                                            return;
+                                        }
+                                    }
+                                } catch (e) {
+                                    if (tries <= 3) log('轮询 ' + tries + ' :: ' + String(e).substring(0, 70));
+                                }
+                                if (tries < want) {
+                                    CTX.hh.postDelayed(pollInst, 1500);
+                                } else {
+                                    log('HudActivity 未就绪（轮询 ' + tries + ' 次后放弃）');
+                                }
+                            }
+                        }
+                    });
+                    var pollInst = Poll.$new();
+                    CTX.hh.postDelayed(pollInst, 1500);
+                    log('等待 HudActivity 初始化…');
+                } catch (e) {
+                    log('主流程异常: ' + String(e).substring(0, 130));
+                }
             }
         }
     });
+
+    /* ── PixelCopy 链（等 HudActivity 就绪后再启动） ── */
 
     CTX.hh.post(Main.$new());
 });

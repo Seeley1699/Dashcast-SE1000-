@@ -208,6 +208,56 @@ public final class MapCastService {
             injectMap();
             Log.i(TAG, "← injectMap 完成");
 
+            /*
+             * ⑥.5 用 shell 身份把 HudActivity 拉到我们的 VirtualDisplay
+             *
+             * **为什么必须从 App 侧发这条 adb 命令**（2026-11-08）
+             *
+             * 注入的脚本跑在 com.geely.map 进程里，它调 startActivity 到「别人
+             * 创建的 VirtualDisplay」会被系统拒绝：
+             *   SecurityException: Permission Denial: starting Intent {...}
+             * 跨 display 启动需要 INTERNAL_SYSTEM_WINDOW 级权限，普通 App 拿不到。
+             *
+             * 而 `adb shell am start --display N -n ...` 用 shell 身份能成功
+             * （实测：dumpsys 显示 Activity Resumed 在 display 35）。
+             *
+             * 所以脚本只把 VDID 打到日志，这里读出来再用 adb shell 发起。
+             *
+             * 换成 HudActivity 的原因：引擎只在 Activity 生命周期内给
+             * 「路线 / 红绿灯 / 车道」创建 native 图层（RoutePathLayer 等）。
+             * 手动 HUDControl.initSurfaceView 拿到的只有底图。
+             */
+            int vdId = readVdid(10000);
+            if (vdId >= 0) {
+                /*
+                 * **launchMode=singleTask 会阻止 activity 换 display**（2026-11-08）
+                 *
+                 * HudActivity 在清单里是 launchMode=singleTask，配合
+                 * FLAG_ACTIVITY_NEW_TASK 时系统行为是：
+                 *   "Warning: Activity not started, its current task has been
+                 *    brought to the front"
+                 * 即把它**已有那个 task 提到前台**，而不是在 --display 指定
+                 * 的新 display 上创建。实测：display 37 建起来了但 stacks=0，
+                 * HudActivity 仍留在旧 task 1102405。
+                 *
+                 * 用 --activity-clear-task 先把旧 task 里的实例清掉，再让它在新
+                 * display 上 onCreate。注意**不能** force-stop 地图 App 或
+                 * Dashcast（会把正在跑的进程一起杀掉）。
+                 */
+                AdbShell.exec("am start --display " + vdId
+                        + " --activity-clear-task --activity-new-task"
+                        + " -n com.geely.map/com.ecarx.navi.multiscreen.hud.HudActivity",
+                        12000);
+                String lr = AdbShell.exec("am start --display " + vdId
+                        + " -n com.geely.map/com.ecarx.navi.multiscreen.hud.HudActivity",
+                        12000);
+                Log.i(TAG, "HudActivity launch(display=" + vdId + ") → " + lr);
+                /* 给它几秒 onCreate + 建 SurfaceView */
+                Thread.sleep(2500);
+            } else {
+                Log.w(TAG, "拿不到 VDID，HudActivity 未拉起");
+            }
+
             /* ⑦ 巡检 */
             startWatchdog();
             Log.i(TAG, "bootSequence 完成");
@@ -539,6 +589,42 @@ public final class MapCastService {
         if (c != null) {
             try { c.onState(msg); } catch (Throwable ignored) {}
         }
+    }
+
+    /**
+     * 从 mapcast.log 里读脚本打出来的 `VDID=<n>`。
+     *
+     * 脚本在创建 VirtualDisplay 后立刻打这一行，是我们和脚本之间唯一
+     * 可靠的「displayId 握手」——因为 App 进程没法直接读到地图进程里的 VD 对象。
+     *
+     * 注意日志是 `>>` 追加的，所以要取**最后一条** VDID（上一次会话的残留
+     * 会留在文件里），injectMap() 每次启动前已经 truncate 过，但要防
+     * truncate 因进程持有 fd 而失效（见 startDcapd2 的注释），所以用 tail -1。
+     */
+    private int readVdid(long timeoutMs) {
+        long deadline = System.currentTimeMillis() + timeoutMs;
+        while (System.currentTimeMillis() < deadline) {
+            try {
+                String r = AdbShell.exec(
+                        "grep -o 'VDID=[0-9]*' " + TMP + "/mapcast.log 2>/dev/null | tail -1",
+                        5000);
+                if (r != null) {
+                    String t = r.trim();
+                    if (t.startsWith("VDID=")) {
+                        try {
+                            int id = Integer.parseInt(t.substring(5));
+                            if (id > 0) {
+                                Log.i(TAG, "读到 VDID=" + id);
+                                return id;
+                            }
+                        } catch (NumberFormatException ignored) {}
+                    }
+                }
+            } catch (Throwable ignored) {
+            }
+            try { Thread.sleep(800); } catch (Throwable ignored) {}
+        }
+        return -1;
     }
 
     /**
