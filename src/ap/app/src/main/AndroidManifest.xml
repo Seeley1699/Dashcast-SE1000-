@@ -35,11 +35,31 @@
     -->
     <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
 
+    <!--
+        车机导航 OpenAPI（2026-11-07 实测确认）。
+
+        **这是"不用 root 拿导航数据"的关键**：
+          · 权限级别 = normal（pm list permissions 实测 protectionLevel:normal）
+            → 声明即得，无需用户授权，无需 root
+          · 服务端 = ecarx.naviservice/.service.NaviService
+          · 接口   = ecarx.naviservice.INaviServer
+          · 数据   = getTurnId / laneInfos / lightCountDown /
+                     ISpeedLimitInfoBean / getRemainTime / trafficLightDistance
+
+        对比 Frida 路线（需注入 com.geely.map 进程，需要 root）：
+          · 这套是正规 AIDL 接口，零侵入
+          · 而且比参考源码的 Frida 脚本**多一项限速**（ISpeedLimitInfoBean），
+            flyme_navigation_reader.js 里没有提取限速
+    -->
+    <uses-permission android:name="ecarx.oem.permission.OPENAPI_NAVI_PERMISSION" />
+
     <queries>
         <intent>
             <action android:name="android.intent.action.MAIN" />
             <category android:name="android.intent.category.LAUNCHER" />
         </intent>
+        <!-- Android 11+ 包可见性：要 bind ecarx.naviservice 必须能看见它 -->
+        <package android:name="ecarx.naviservice" />
     </queries>
 
     <application
@@ -108,6 +128,24 @@
             android:exported="true"
             android:launchMode="singleTask"
             android:label="浮窗测试" />
+
+        <!--
+            导航 OpenAPI 绑定验证页。
+
+            验证「不用 root 能不能拿到导航数据」：
+              ① 声明 ecarx.oem.permission.OPENAPI_NAVI_PERMISSION（normal 级）
+              ② bind ecarx.naviservice/.service.NaviService
+              ③ 拿到 IBinder 后打印 interface descriptor
+              ④ 探测事务码看 Binder 是否响应
+
+            用法：
+              adb shell am start -n com.hermes.dashcast/.NaviBindTestActivity
+        -->
+        <activity
+            android:name=".NaviBindTestActivity"
+            android:exported="true"
+            android:launchMode="singleTask"
+            android:label="导航绑定验证" />
 
         <!--
             小窗（浮窗）。

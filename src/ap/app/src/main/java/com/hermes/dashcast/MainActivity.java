@@ -76,6 +76,11 @@ public class MainActivity extends Activity {
     private static final int LOG_MAX = 12;
     private LinearLayout btnCodecBgra, btnCodecH264;   /* 编码档二选一 */
     private LinearLayout btnMapMode;                 /* 地图模式开关 */
+
+    /* 地图投屏（方案 ①：注入地图进程，2026-11-08 新增）
+     * 与「开始投屏」（搬别的 App 进虚拟屏）是两条独立链路 */
+    private LinearLayout btnMapCast, btnMapStop;
+    private TextView mapCastState;
     private LinearLayout btnMapHud;                  /* 地图 HUD 开关 */
     private LinearLayout viewRow;                    /* 视角三档容器 */
     private LinearLayout[] viewBtns;                 /* 远景/中景/近景 */
@@ -391,6 +396,43 @@ public class MainActivity extends Activity {
                 R.color.state_error, v -> stopCastOnly());
         castMainRow.addView(btnStop, rowLp(1f));
         castCard.addView(castMainRow);
+
+        /*
+         * 地图投屏（2026-11-08 新增）
+         *
+         * 与「开始投屏」的区别：
+         *   开始投屏 —— 把**别的 App** 搬进虚拟屏（ImageReader 抓整块）
+         *   地图投屏 —— **注入地图进程**，让它把地图直接渲染到我们建的
+         *                VirtualDisplay（PixelCopy 抓 Surface 内容，无 UI 叠加）
+         *
+         * 为什么必须注入：
+         *   Dashcast 进程没有 CAPTURE_VIDEO_OUTPUT（signature 级），
+         *   自己建不了 1920x532 的 VirtualDisplay；地图进程有。
+         *   注入后地图用它自己的 HUDControl.initSurfaceView 注册 slot 5，
+         *   再 PixelCopy 抓帧 → VDF1 → dcapd2 → CP。
+         */
+        LinearLayout mapRow = new LinearLayout(this);
+        mapRow.setOrientation(LinearLayout.HORIZONTAL);
+        btnMapCast = iconButton("地图投屏", R.drawable.ic_play, R.drawable.btn_secondary,
+                R.color.accent_soft, v -> startMapCast());
+        mapRow.addView(btnMapCast, rowLp(1.5f));
+        btnMapStop = iconButton("停地图", R.drawable.ic_stop, R.drawable.btn_secondary,
+                R.color.state_error, v -> stopMapCast());
+        mapRow.addView(btnMapStop, rowLp(1f));
+        LinearLayout.LayoutParams mapLp = new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT);
+        mapLp.setMargins(0, dp(6), 0, 0);
+        mapRow.setLayoutParams(mapLp);
+        castCard.addView(mapRow);
+
+        mapCastState = new TextView(this);
+        mapCastState.setTextSize(14);
+        mapCastState.setTextColor(getColor(R.color.content_secondary));
+        mapCastState.setGravity(Gravity.CENTER);
+        mapCastState.setPadding(dp(8), dp(4), dp(8), dp(4));
+        mapCastState.setText("地图投屏：未启动");
+        castCard.addView(mapCastState);
 
         /* 编码档：二选一（默认 BGRA+LZ4）。这两个按钮是 H.264 档唯一的入口，
          * 重构时漏掉过一次，导致完全无法切档 —— 现在固定在主操作下方。 */
@@ -4317,6 +4359,53 @@ public class MainActivity extends Activity {
             DashLog.e(TAG, "adbd 通道失败: " + t);
             return false;
         }
+    }
+
+    /* ═══════════════════════════════════════════════════════════
+     * 地图投屏（方案 ①，2026-11-08）
+     *
+     * 链路：
+     *   MapCastService
+     *     → 解压 assets/hudcast-inject.gz 到 /data/local/tmp/
+     *     → hudcast-inject -p <地图pid> -s mapcast.js
+     *     → 地图进程内：VirtualDisplay(1920x532, 0x3) + MapView + HUDControl
+     *        .initSurfaceView（引擎注册 slot 5）→ PixelCopy(Surface) → VDF1
+     *     → dcapd2 (1920x532) → CP:8444 → dashcastd → layer 99 → 仪表盘
+     *
+     * 为什么不能纯 APK 实现：
+     *   Dashcast 没有 CAPTURE_VIDEO_OUTPUT，建不了大尺寸 VirtualDisplay；
+     *   地图进程有 —— 所以必须注入。
+     * ═══════════════════════════════════════════════════════════ */
+    private void startMapCast() {
+        /*
+         * **不要在 UI 线程调 AdbShell.available()**（2026-11-08 修）。
+         *
+         * 它内部走 Socket 连 adbd:5555 → 在 UI 线程会抛
+         * NetworkOnMainThreadException → 异常被 catch 掉 → available() 返回 false
+         * → 这里直接 return，按钮看起来"没反应"。
+         *
+         * 所以整段都交给 MapCastService 的 worker 线程，UI 线程只改按钮状态。
+         */
+        setStatus("状态：正在启动地图投屏…");
+        appendLog("地图投屏 · 启动");
+        if (mapCastState != null) mapCastState.setText("地图投屏：启动中…");
+
+        MapCastService.get().start(this, msg -> mainHandler.post(() -> {
+            if (mapCastState != null) mapCastState.setText("地图投屏：" + msg);
+        }));
+
+        if (btnMapCast != null) btnMapCast.setEnabled(false);
+        if (btnMapStop != null) btnMapStop.setEnabled(true);
+    }
+
+    private void stopMapCast() {
+        setStatus("状态：正在停止地图投屏…");
+        appendLog("地图投屏 · 停止");
+        MapCastService.get().stop();
+        if (mapCastState != null) mapCastState.setText("地图投屏：未启动");
+        if (btnMapCast != null) btnMapCast.setEnabled(true);
+        if (btnMapStop != null) btnMapStop.setEnabled(false);
+        setStatus("状态：地图投屏已停止，仪表已还原");
     }
 
     /** [停止投屏] 停镜像抓帧进程；CP 端图层随之还原 */

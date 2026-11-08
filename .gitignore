@@ -29,3 +29,19 @@ _backup/
 
 # 编译中间产物（build-dcapd2.ps1 重建时的旧二进制）
 *.old
+
+# ── 注入器二进制（2026-11-08）────────────────────────────────
+# hudcast-inject.xz 从原车「银河世界.apk」的 assets/runtime/ 里提取，
+# gzip 后约 24MB。体积太大不进版本库，用 tools/fetch-injector.ps1 生成。
+# 缺它构建会失败（APK assets 里必须有这个文件），README 已写明前置步骤。
+src/ap/app/src/main/assets/hudcast-inject.bin
+
+# Frida 调试中间产物（保留下面的白名单，其余忽略）
+_frida/*.js
+!_frida/map_to_dash_prod.js
+_frida/hudcast-inject
+_frida/hudcast-inject.gz
+_frida/hudcast-inject.xz
+_frida/mapbridge/
+# _frida 里的原车提取物（16.7MB xz，由 tools/fetch-injector.ps1 从 APK 现取）
+_frida/assets/

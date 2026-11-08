@@ -60,7 +60,27 @@ public class DiagReceiver extends BroadcastReceiver {
         }
 
         if (ACTION_CPCMD.equals(action)) {
-            final String cmd = intent.getStringExtra("cmd");
+            final String rawCmd = intent.getStringExtra("cmd");
+            /*
+             * **先解码 b64:**（2026-11-08 修）
+             *
+             * adb broadcast 传中文/特殊字符必须走 base64，所以入口的 cmd
+             * 常常是 `b64:<base64>`。原来这里只对"非 b64"分支做判断，
+             * 于是 `mapcast:start` 被包成 b64 后永远匹配不到，
+             * 全落到最后的 `raw()` 分支 —— 表现为"命令收到了但不生效"。
+             */
+            final String cmd;
+            if (rawCmd != null && rawCmd.startsWith("b64:")) {
+                String dec = rawCmd.substring(4);
+                try {
+                    dec = new String(android.util.Base64.decode(dec,
+                            android.util.Base64.NO_WRAP), "UTF-8");
+                } catch (Throwable ignored) {
+                }
+                cmd = dec;
+            } else {
+                cmd = rawCmd;
+            }
             new Thread(() -> {
                 try {
                     // 先把"我收到了"写下来 —— 否则出问题时无法区分
@@ -72,6 +92,29 @@ public class DiagReceiver extends BroadcastReceiver {
 
                     if (cmd == null || cmd.trim().isEmpty()) {
                         sb.append("(空命令)\n");
+                    } else if (cmd.startsWith("mapcast:")) {
+                        /*
+                         * mapcast:start / mapcast:stop / mapcast:status
+                         *
+                         * 给 adb 用的无 UI 入口（2026-11-08 新增）。
+                         * 为什么需要：UI 上点「地图投屏」在某些窗口配置下收不到
+                         * 点击（input tap 坐标和实际控件对不上），有这个通道就能
+                         * 直接验证链路，也方便脚本化。
+                         */
+                        String sub = cmd.substring(8).trim();
+                        MapCastService svc = MapCastService.get();
+                        if ("start".equals(sub)) {
+                            boolean ok = svc.start(context.getApplicationContext(), null);
+                            sb.append("MAPCAST_START=").append(ok).append('\n');
+                        } else if ("stop".equals(sub)) {
+                            boolean ok = svc.stop();
+                            sb.append("MAPCAST_STOP=").append(ok).append('\n');
+                        } else if ("status".equals(sub)) {
+                            sb.append("running=").append(svc.isRunning())
+                              .append(" pid=").append(svc.injectedPid()).append('\n');
+                        } else {
+                            sb.append("(未知子命令: ").append(sub).append(")\n");
+                        }
                     } else if (cmd.startsWith("push:")) {
                         // push:<AP路径>:<CP路径>[:exec]
                         String[] p = cmd.split(":");
