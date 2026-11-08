@@ -4391,7 +4391,23 @@ public class MainActivity extends Activity {
         if (mapCastState != null) mapCastState.setText("地图投屏：启动中…");
 
         MapCastService.get().start(this, msg -> mainHandler.post(() -> {
+            /*
+             * **进度也要反映到顶部大状态**（2026-11-08 修）。
+             *
+             * 原来只更新 mapCastState 那行小字，顶部 status 永远停在
+             * "正在启动地图投屏…"，用户看到的就是"卡住了"——
+             * 其实后台早就跑完了（实测 bootSequence 11 秒就完成）。
+             */
             if (mapCastState != null) mapCastState.setText("地图投屏：" + msg);
+            setStatus("状态：" + msg);
+            if (msg.contains("失败") || msg.contains("未启动")) {
+                if (btnMapCast != null) btnMapCast.setEnabled(true);
+                if (btnMapStop != null) btnMapStop.setEnabled(false);
+            }
+            /* 真正就绪的信号：抓到帧了。这时把按钮状态定下来 */
+            if (msg.contains("注入成功")) {
+                appendLog("地图投屏 · 已就绪");
+            }
         }));
 
         if (btnMapCast != null) btnMapCast.setEnabled(false);

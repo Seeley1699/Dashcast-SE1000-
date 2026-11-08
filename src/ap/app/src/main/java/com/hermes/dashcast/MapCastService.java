@@ -212,6 +212,32 @@ public final class MapCastService {
             startWatchdog();
             Log.i(TAG, "bootSequence 完成");
 
+            /* ⑧ 等第一帧真画面，再报"运行中" */
+            /*
+             * **必须等 dcapd2 真的出帧才算就绪**（2026-11-08）
+             *
+             * bootSequence 结束时只是"进程都起来了"，地图那边还要：
+             *   VirtualDisplay 建好 → MapView 加窗 → initSurfaceView 注册 slot 5
+             *   → 引擎开始画 → PixelCopy 出帧 → VDF1 到 dcapd2
+             * 这段实测要 5-10 秒。提前报"已就绪"会让用户以为投上了，
+             * 结果仪表还是原厂画面。
+             */
+            /*
+             * **窗口给到 25 秒**（2026-11-08 实测）
+             *
+             * 从 injectMap 返回到 dcapd2 真的收到 VD 帧，实测要 15-20 秒：
+             *   injector 起来（3s）→ 建 VirtualDisplay → addView
+             *   → initSurfaceView 注册 slot 5 → 引擎开始画
+             *   → PixelCopy 出第一帧 → VDF1 到 dcapd2 → 日志出现 "VD 帧"
+             * 原来给 12 秒，日志显示 "capture=11 tiles=4 totalKB=816"
+             * 已经在推流了，但判据那次采样还没看到 → 误报"未出帧"。
+             */
+            if (waitFirstFrame(25000)) {
+                notify2("地图投屏运行中");
+            } else {
+                notify2("已启动，但暂未出帧（地图可能刚重启，稍等会自动重注入）");
+            }
+
         } catch (Throwable t) {
             Log.e(TAG, "boot fail", t);
             notify2("启动失败: " + brief(t));
@@ -299,9 +325,27 @@ public final class MapCastService {
      */
     private void startDcapd2() {
         try {
-            /* 先清场（用普通通道，短命令没问题） */
-            AdbShell.exec("pkill -9 -f dcapd2 2>/dev/null; rm -f "
-                    + TMP + "/dcapd2.layer; echo OK", 8000);
+            /* 清场分两步，中间必须真的等进程死透
+             *
+             * （2026-11-08，第三次才搞对。前两次的失败原因都记在这里）
+             *
+             *   ① `rm -f dcapd2.log` —— 旧进程持有 fd，`rm` 只是 unlink，
+             *      内容继续写进已删的 inode；新进程重建同名文件 → 两份交错。
+             *
+             *   ② `pkill; : > log` 一条命令串 —— 还是不行。
+             *      实测：`pkill` 发完信号立刻 truncate，被杀进程的缓冲区
+             *      还没来得及 flush 到 inode 就被清掉了，但内核回收 fd 时
+             *      **会把它最后一次 flush 写回去**，日志又变回旧内容。
+             *      手动复现：先 echo 一行 → 跑这条命令串 → wc -l 仍是 25。
+             *
+             *   ③ 正确顺序：kill → **等 2 秒真的死透** → truncate → 启动。
+             *      分两次 AdbShell.exec，中间 Thread.sleep。
+             */
+            AdbShell.exec("pkill -9 -f dcapd2 2>/dev/null; echo KILLED", 6000);
+            Thread.sleep(2000);
+            AdbShell.exec("rm -f " + TMP + "/dcapd2.layer; "
+                    + ": > " + TMP + "/dcapd2.log; "
+                    + "wc -l " + TMP + "/dcapd2.log", 8000);
 
             String cmd = DCAPD2
                     + " " + W + " " + H + " 0 0 " + W + " " + H + " " + W + " " + H
@@ -331,23 +375,57 @@ public final class MapCastService {
     /** 找地图 pid 并注入 */
     private boolean injectMap() {
         try {
-            String r = AdbShell.exec("pidof " + MAP_PKG, 5000);
+            /* **必须挑 u11 那个进程，不能取 pidof 的最后一个**（2026-11-08）
+             *
+             * 实测地图有两个同包名进程：
+             *   766  u11_a128  com.geely.map   ← 真正的 UI/渲染进程，要注这个
+             *   8788 u0_a128   com.geely.map   ← 辅助进程，注它的话
+             *                                    PixelCopy 全部 ERROR_SOURCE_INVALID(3)
+             *
+             * 原来看起来"取最后一个正合适"只是碰巧顺序，pidof 的输出顺序
+             * 没有任何保证。而且当时日志里 VirtualDisplay 建在 displayId=23，
+             * 但地图根本没在上面画 —— 因为 8788 这个进程没有 UI、没有窗口。
+             *
+             * 改为：ps 全量列出来，按用户名筛 u11 前缀的那个。
+             */
+            String r = AdbShell.exec(
+                    "ps -A -o pid,user,args 2>/dev/null | grep 'com.geely.map' "
+                    + "| grep -v grep", 6000);
             if (r == null) return false;
-            String s = r.trim();
-            if (s.isEmpty()) {
-                notify2("地图未运行，等待…");
+
+            int pid = -1;
+            String picked = "";
+            for (String line : r.split("\n")) {
+                String t = line.trim();
+                if (t.isEmpty()) continue;
+                String[] cols = t.split("\\s+");
+                if (cols.length < 3) continue;
+                String user = cols[1];
+                if (user.startsWith("u11")) {
+                    try {
+                        pid = Integer.parseInt(cols[0]);
+                        picked = t;
+                    } catch (NumberFormatException ignored) {}
+                }
+            }
+
+            if (pid < 0) {
+                /* 没有 u11 进程 → 地图可能刚重启还没起 UI，稍后 watchdog 会重试 */
+                notify2("地图主进程(u11)未就绪，等待…");
+                Log.w(TAG, "ps 输出:\n" + r);
                 return false;
             }
-            /* 可能返回多个 pid，取最后一个（u11 主进程通常在最后） */
-            String[] parts = s.split("\\s+");
-            int pid = Integer.parseInt(parts[parts.length - 1]);
+
             if (pid == injectedPid) {
                 return true;   /* 同一个进程，已注入 */
             }
 
             notify2("注入地图进程 " + pid + " …");
             /* 同 startDcapd2：LongLivedShell 持有通道，adbd 才不动这个进程 */
-            AdbShell.exec("pkill -9 -f hudcast-inject 2>/dev/null; echo OK", 8000);
+            /* 同 startDcapd2：kill → 等死透 → truncate，不能一条命令串做完 */
+            AdbShell.exec("pkill -9 -f hudcast-inject 2>/dev/null; echo KILLED", 6000);
+            Thread.sleep(1500);
+            AdbShell.exec(": > " + TMP + "/mapcast.log; echo OK", 6000);
             String cmd = INJECTOR + " -p " + pid
                     + " -s " + SCRIPT + " -R v8"
                     + " >> " + TMP + "/mapcast.log 2>&1";
@@ -381,12 +459,25 @@ public final class MapCastService {
         task[0] = () -> {
             if (!running) return;
             try {
-                String r = AdbShell.exec("pidof " + MAP_PKG, 3000);
-                if (r != null && !r.trim().isEmpty()) {
-                    String[] parts = r.trim().split("\\s+");
-                    int pid = Integer.parseInt(parts[parts.length - 1]);
-                    if (pid != injectedPid) {
-                        Log.i(TAG, "地图进程变了 " + injectedPid + " → " + pid + "，重注入");
+                /* 和 injectMap 用同一套挑 pid 的规则：只看 u11 那个进程，
+                 * 否则 u0 的辅助进程会让这里一直误判"进程变了"→ 反复重注入 */
+                String r = AdbShell.exec(
+                        "ps -A -o pid,user,args 2>/dev/null | grep 'com.geely.map' "
+                        + "| grep -v grep", 5000);
+                if (r != null) {
+                    int pid = -1;
+                    for (String line : r.split("\n")) {
+                        String t = line.trim();
+                        if (t.isEmpty()) continue;
+                        String[] cols = t.split("\\s+");
+                        if (cols.length < 3) continue;
+                        if (cols[1].startsWith("u11")) {
+                            try { pid = Integer.parseInt(cols[0]); }
+                            catch (NumberFormatException ignored) {}
+                        }
+                    }
+                    if (pid > 0 && pid != injectedPid) {
+                        Log.i(TAG, "地图主进程变了 " + injectedPid + " → " + pid + "，重注入");
                         notify2("地图重启，重新注入…");
                         injectMap();
                     }
@@ -404,6 +495,50 @@ public final class MapCastService {
         if (c != null) {
             try { c.onState(msg); } catch (Throwable ignored) {}
         }
+    }
+
+    /**
+     * 等 dcapd2 收到来自我们虚拟屏的第一帧。
+     *
+     * **判据：日志里出现 `VD 帧`（且 `live=1` 或中心像素非黑）**
+     * （2026-11-08，六版才定稿。前面为什么全错，记下来免得再踩）
+     *
+     *   ① `tail -20 | grep '出真画面'` —— 只在启动时打一次，尾部全是 STAT → 永不命中
+     *   ② 全文 grep + 行数基线 —— `>>` 追加时 `rm -f` 清不掉 fd，基线错位
+     *   ③ `totalKB>0` —— **假阳性**：dcapd2 启动先推主屏（src=SCREEN, 492KB）
+     *   ④ `src=VD && tiles>0` —— **假阴性**：静止画面无差量，tiles=0 是常态
+     *   ⑤ `totalKB` 增长 —— **还是假阴性**：画面静止时 totalKB 也不涨
+     *      （实测卡在 599 十几秒不动，但链路其实是好的）
+     *
+     * **关键认知**：dcapd2 只在画面**有变化**时才编码发图块。地图静止 →
+     * tiles=0 / totalKB 不变，但**帧源已经切到 VD 且帧持续流入**了。
+     * 所以真正该看的是 "VD 帧N: ... " 这行 —— 它由帧源收到的每一帧触发，
+     * 不受"有没有差量"影响。
+     */
+    private boolean waitFirstFrame(long timeoutMs) {
+        long deadline = System.currentTimeMillis() + timeoutMs;
+        while (System.currentTimeMillis() < deadline) {
+            try {
+                String r = AdbShell.exec(
+                        "grep -c 'VD 帧[0-9]' " + TMP + "/dcapd2.log 2>/dev/null || echo 0",
+                        5000);
+                if (r != null && r.trim().matches("\\d+") && Integer.parseInt(r.trim()) > 0) {
+                    /* 再确认不是空屏：取最后一帧的 live/空屏 字段 */
+                    String detail = AdbShell.exec(
+                            "grep 'VD 帧[0-9]' " + TMP + "/dcapd2.log 2>/dev/null | tail -1",
+                            5000);
+                    String d = detail == null ? "" : detail.trim();
+                    if (d.contains("空屏=0")) {
+                        Log.i(TAG, "首帧已出（" + d + "）");
+                        return true;
+                    }
+                    Log.i(TAG, "VD 帧已到但仍是空屏：" + d);
+                }
+            } catch (Throwable ignored) {
+            }
+            try { Thread.sleep(1000); } catch (Throwable ignored) {}
+        }
+        return false;
     }
 
     private static String brief(Throwable t) {
