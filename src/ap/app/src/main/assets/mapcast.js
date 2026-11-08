@@ -2414,22 +2414,182 @@ Java.perform(function () {
                                                 + rf(hc, 'mScreenHeight'));
                                             log('SurfaceView = ' + msv);
 
-                                            /* 把导航相关的开关全打开 */
+                                            /*
+                                             * ★ 先把 HUDControl 的屏幕尺寸改对（2026-11-08）
+                                             *
+                                             * 初值是 2560×1440 —— HudActivity 启动时读的是
+                                             * **主屏** DisplayMetrics，不是我们 VD 的 1920×532。
+                                             * 两个字段都是 private int，走反射 setInt。
+                                             */
+                                            try {
+                                                var fw = hc.getClass()
+                                                    .getDeclaredField('mScreenWidth');
+                                                fw.setAccessible(true);
+                                                fw.setInt(hc, W);
+                                                var fhgt = hc.getClass()
+                                                    .getDeclaredField('mScreenHeight');
+                                                fhgt.setAccessible(true);
+                                                fhgt.setInt(hc, H);
+                                                log('HUDControl 尺寸 → ' + W + 'x' + H);
+                                            } catch (eS) {
+                                                log('尺寸修正失败: '
+                                                    + String(eS).substring(0, 60));
+                                            }
+
+                                            /*
+                                             * ★ 修正 MapView 的 viewport（2026-11-08 实测）
+                                             *
+                                             * mapViewMap 里 slot5 的 MapView 视口是
+                                             *   2560×1440
+                                             * —— 读的是主屏 DisplayMetrics，不是我们的 VD。
+                                             * 于是引擎按 2560×1440 的比例渲染地图，
+                                             * 我们只抓左上 1920×532 那块，画面就成了
+                                             * 「放大的道路局部」（踩了很久）。
+                                             *
+                                             * 正确做法：构造 MapViewPortParam 设成 1920×532，
+                                             * 连 screenWidth/Height 一起设（两个字段是 long，
+                                             * 必须用 setLong，用 set 会抛类型不匹配）。
+                                             *
+                                             * MapView 只能通过 MapServiceManager.mapViewMap
+                                             * 拿到；HashMap 的 get/values 不能直接用 frida
+                                             * wrapper 调（会报 argument types do not match），
+                                             * 要反射 invok + Java.cast 成 MapView。
+                                             */
+                                            try {
+                                                var CH = Java.use('java.util.concurrent.ConcurrentHashMap');
+                                                var MSM2 = Java.use(
+                                                    'ecarx.navi.engine.manager.map.MapServiceManager');
+                                                var msmInst = MSM2.getInstance();
+                                                var fmv = msmInst.getClass()
+                                                    .getDeclaredField('mapViewMap');
+                                                fmv.setAccessible(true);
+                                                var mGet = CH.class.getMethod('get',
+                                                    [Java.use('java.lang.Object').class]);
+                                                var MapV = Java.use('com.autonavi.gbl.map.MapView');
+                                                var mv5r = mGet.invoke(fmv.get(msmInst),
+                                                    [Java.use('java.lang.Integer').valueOf(5)]);
+                                                var mv5 = mv5r ? Java.cast(mv5r, MapV) : null;
+                                                if (mv5) {
+                                                    var PP = Java.use(
+                                                        'com.autonavi.gbl.map.model.MapViewPortParam');
+                                                    var pp = PP.$new();
+                                                    var sfL = function (o, n, v) {
+                                                        var fd = o.getClass()
+                                                            .getDeclaredField(n);
+                                                        fd.setAccessible(true);
+                                                        fd.setLong(o, v);
+                                                    };
+                                                    sfL(pp, 'x', 0);
+                                                    sfL(pp, 'y', 0);
+                                                    sfL(pp, 'width', W);
+                                                    sfL(pp, 'height', H);
+                                                    sfL(pp, 'screenWidth', W);
+                                                    sfL(pp, 'screenHeight', H);
+                                                    var before = mv5.getMapviewPort();
+                                                    mv5.setMapviewPort(pp);
+                                                    var after = mv5.getMapviewPort();
+                                                    log('viewport ' + before.width.value + 'x'
+                                                        + before.height.value + ' → '
+                                                        + after.width.value + 'x'
+                                                        + after.height.value);
+                                                } else {
+                                                    log('取不到 slot5 的 MapView');
+                                                }
+                                            } catch (eVP) {
+                                                log('viewport 修正失败: '
+                                                    + String(eVP).substring(0, 80));
+                                            }
+
+                                            /*
+                                             * ★ 把所有导航开关打开（2026-11-08）
+                                             *
+                                             * **必须用 .overload().call()**，不能 svc.initMapParam(mp)。
+                                             * 直接调用会报 "svc.initMapParam is not a function"，
+                                             * 因为 frida 对重载方法要求显式指定签名。
+                                             *
+                                             * *.value = true 那几行也必须走反射：这些字段
+                                             * 是 private boolean / private float，frida 里
+                                             * mp.isTmcVisible 是 undefined（不是 wrapper），
+                                             * 直接赋值会抛 TypeError。
+                                             */
                                             var MP = Java.use(
                                                 'ecarx.navi.engine.bean.map.ExternalMapParam');
                                             var mp = MP.$new();
-                                            try { mp.isTmcVisible.value = true; } catch (e) {}
-                                            try { mp.isCrossVisible.value = true; } catch (e) {}
-                                            try { mp.isDynamicLevel.value = true; } catch (e) {}
-                                            try { mp.isLayerVisible.value = true; } catch (e) {}
+                                            var sfB = function (o, n, v) {
+                                                try {
+                                                    var fd = o.getClass().getDeclaredField(n);
+                                                    fd.setAccessible(true);
+                                                    fd.setBoolean(o, v);
+                                                } catch (e) {}
+                                            };
+                                            sfB(mp, 'isTmcVisible', true);
+                                            sfB(mp, 'isCrossVisible', true);
+                                            sfB(mp, 'isDynamicLevel', true);
+                                            sfB(mp, 'isLayerVisible', true);
+                                            sfB(mp, 'isShowMutiRoute', true);
                                             try {
-                                                mp.mapLevel.value = 17.0;
+                                                var fdLv = mp.getClass()
+                                                    .getDeclaredField('mapLevel');
+                                                fdLv.setAccessible(true);
+                                                fdLv.setFloat(mp, 17.0);
                                             } catch (e) {}
                                             try {
-                                                svc.initMapParam(mp);
+                                                var HS = Java.use(
+                                                    'ecarx.navi.business.external.HUDService');
+                                                HS.initMapParam.overload(
+                                                    'ecarx.navi.engine.bean.map.ExternalMapParam'
+                                                ).call(svc, mp);
                                                 log('initMapParam OK（路况/路口/图层全开）');
                                             } catch (e2) {
-                                                log('initMapParam 失败 ' + String(e2).substring(0, 60));
+                                                log('initMapParam 失败 '
+                                                    + String(e2).substring(0, 70));
+                                            }
+
+                                            /*
+                                             * ★ 3D 车模（验证成功，2026-11-08）
+                                             *
+                                             * 参考源码 hud_effects.js:91-116 applyCarStyle()。
+                                             * 默认只有一个蓝色三角箭头，因为：
+                                             *   · carMode 虽然是 2 (CAR_MODEL)
+                                             *   · setSkeletonData 也成功
+                                             *   · 但 updateCarStyle(2002) 是「普通模式」
+                                             *     → 引擎走 2D 箭头路径
+                                             *
+                                             * 三个必须一起做的动作：
+                                             *   ① setSkeletonData(assets, CarLogoEnum.CAR_MODEL)
+                                             *      加载 car_skeleton_logo/2/carLogoLow.dat（971KB 的 3D 模型）
+                                             *   ② updateCarStyle(2001)  ← 关键！2001 = 导航中 = 3D 渲染
+                                             *   ③ setCarMode(2, true)    ← 第二参数 true 才真正启用 3D
+                                             *
+                                             * 实测按源码写 updateCarStyle(isGuidance()?2001:2002) 时
+                                             * isGuidance()=false → 走 2002 → 一直是箭头。
+                                             * 强制 2001 后就变成 3D 车模了。
+                                             *
+                                             * setCarScale 放大一点让车模更显眼（1.5 是视觉上舒服的值）。
+                                             */
+                                            try {
+                                                var LC5 = Java.use(
+                                                    'ecarx.navi.engine.manager.layer.LayerController');
+                                                var ml5 = LC5.getInstance().getMapLayer(5);
+                                                if (ml5) {
+                                                    var CLE = Java.use(
+                                                        'ecarx.navi.engine.bean.CarLogoEnum');
+                                                    var CHA = Java.use(
+                                                        'ecarx.navi.utils.utils.ContextHolder');
+                                                    var amA = CHA.getContext().getAssets();
+
+                                                    ml5.setSkeletonData(amA, CLE.CAR_MODEL.value);
+                                                    ml5.updateCarStyle(2001);
+                                                    var cmOk = ml5.setCarMode(2, true);
+                                                    ml5.setCarScale(1.5);
+                                                    ml5.setCarAnimationSwitch(true);
+                                                    log('3D 车模：setCarMode(2,true)=' + cmOk
+                                                        + '  carMode=' + ml5.getCarMode()
+                                                        + '  ready=' + ml5.isCarReady());
+                                                }
+                                            } catch (eCar) {
+                                                log('车模设置失败: '
+                                                    + String(eCar).substring(0, 80));
                                             }
                                             startPc();
                                             return;
