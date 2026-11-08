@@ -94,7 +94,20 @@ int dc_layer_parse(dc_layer_cfg_t *cfg, const char *text)
     if (kv_get_int(text, "feather",  &v) == 0) cfg->feather  = v;
 
     cfg->fit = 0;                                  /* 默认铺满 */
-    if (kv_get_int(text, "fit", &v) == 0) cfg->fit = v ? 1 : 0;
+    /*
+     * fit 三档（2026-11-08 新增 2）：
+     *   0 = 铺满遮罩（拉伸，比例不匹配时变形）
+     *   1 = 遮罩内等比（留黑边）
+     *   2 = cover 裁切（保持比例、放大填满、超出裁掉）
+     *
+     * **原来是 `cfg->fit = v ? 1 : 0`** —— 任何非 0 值都变 1，
+     * 所以配置里写 fit=2 会被这里吃成 1。现在按 0..2 原样保留。
+     */
+    if (kv_get_int(text, "fit", &v) == 0) {
+        if (v < 0) v = 0;
+        if (v > 2) v = 2;
+        cfg->fit = v;
+    }
 
     return 0;
 }

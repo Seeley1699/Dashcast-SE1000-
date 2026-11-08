@@ -703,7 +703,18 @@ public final class LayerConfig {
         canvasFill = (x == 0 && y == 0 && w == canvasW && h == canvasH);
 
         if (shape < SHAPE_RECT || shape > SHAPE_ELLIPSE) shape = SHAPE_RECT;
-        if (fit != 0) fit = 1;
+        /*
+         * fit 三档（2026-11-08 加 2）：
+         *   0 = 铺满遮罩（拉伸，比例不匹配时变形）
+         *   1 = 遮罩内等比（留黑边）
+         *   2 = cover 裁切（保持比例、放大填满、超出裁掉）
+         *
+         * **原来是 `if (fit != 0) fit = 1;`** —— 任何非 0 值都被压成 1，
+         * 所以 fit=2 在这里就丢了，下发给 dcapd2 永远只有 0/1。
+         * 现在按 0..2 保留。
+         */
+        if (fit < 0) fit = 0;
+        if (fit > 2) fit = 2;
     }
 
     /** 返回按编码档对齐后的 {x,y,w,h}，不改自身（给下发用） */

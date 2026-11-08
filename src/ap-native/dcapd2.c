@@ -172,6 +172,14 @@ static int          g_after_dumped = 0;
  * 由 layer_mask_reload() 更新，blit 时用它，这样编辑器改形状大小后
  * 画面立刻跟着重排，不再是固定死在中间的 1013x532。 */
 static int          g_dst_x = 0, g_dst_y = 0, g_dst_w = 0, g_dst_h = 0;
+
+/*
+ * fit=2（cover）的源裁切区（2026-11-08）
+ *
+ * 0 表示"不裁"，用整块源；>0 时 blit 会把这个子矩形当作真正的源。
+ * 由 recompute_dst() 按遮罩宽高比算出来。
+ */
+static int          g_cover_sx = 0, g_cover_sy = 0, g_cover_sw = 0, g_cover_sh = 0;
 static int          g_cap_w = 0, g_cap_h = 0;   /* 抓帧尺寸，重算映射用 */
 static int          g_src_x = 0, g_src_y = 0, g_src_w = 0, g_src_h = 0;  /* 抓帧内源矩形 */
 
@@ -444,7 +452,26 @@ static void recompute_dst(void)
 
     int dw, dh;
 
-    if (g_codec == DASHCAST_CODEC_H264 || (g_mask_ready && !g_mask.cfg.fit)) {
+    /*
+     * fit 三档（2026-11-08 新增 fit=2）：
+     *   0 = 铺满遮罩（拉伸，比例不匹配时会变形）
+     *   1 = 遮罩内等比（留黑边，比例不匹配时画面缩成一条）
+     *   2 = ★ cover 裁切（保持比例、放大填满、超出部分裁掉，不变形不留边）
+     *
+     * fit=2 是为地图投屏加的：地图源是 1920x532（比例 3.61），
+     * 遮罩可能是 528x416（比例 1.27）。前两档都会失败：
+     *   fit=0 → 横向压扁 2.85 倍（车模变形）
+     *   fit=1 → 缩成 525x146 细条（上下大量黑边）
+     * fit=2 的做法是按 max(缩放比) 放大，源上下（或左右）多出来的部分裁掉，
+     * 这样画面比例正确、填满遮罩、不变形。
+     */
+    int fit_mode = g_mask_ready ? g_mask.cfg.fit : 0;
+
+    if (fit_mode == 2) {
+        /* cover：目标永远是整个遮罩框，源按比例裁 */
+        dw = boxW;
+        dh = boxH;
+    } else if (g_codec == DASHCAST_CODEC_H264 || (g_mask_ready && !fit_mode)) {
         /* H.264 永远铺满（等比会留边，等于黑边）；BGRA 尊重用户的 fit 选择 */
         dw = boxW;
         dh = boxH;
@@ -474,13 +501,62 @@ static void recompute_dst(void)
     int dx = boxX + (boxW - dw) / 2;
     int dy = boxY + (boxH - dh) / 2;
 
+    /*
+     * ★ fit=2 的源裁切（2026-11-08）
+     *
+     * cover 模式要"放大到填满 + 裁掉超出"，所以除了目标矩形，
+     * 还得告诉 blit **_源要从哪裁、裁多大_**。
+     *
+     * 做法：按目标框的宽高比，从源里取一个同比的子矩形（居中）。
+     *   源 1280x354 (3.61) + 目标 528x416 (1.27)
+     *   → 源按 1.27 比例取：宽 = 354*1.27 = 450，高保持 354
+     *   → 裁掉左右各 (1280-450)/2 = 415
+     *   然后 450x354 → 528x416，等比放大 1.17 倍，不变形。
+     *
+     * 结果存到全局，blit 调用处会把它们并进 bsx/bsw/srcY2/srcH2。
+     * 非 fit=2 时置 0，表示"用原来的整块源"。
+     */
+    if (fit_mode == 2) {
+        int sw_ref = g_blit_src_w > 0 ? g_blit_src_w : g_src_w;
+        int sh_ref = g_blit_src_h > 0 ? g_blit_src_h : g_src_h;
+        if (sw_ref > 0 && sh_ref > 0) {
+            double target_ar = (double) boxW / (double) boxH;
+            double src_ar    = (double) sw_ref / (double) sh_ref;
+
+            if (src_ar > target_ar) {
+                /* 源更宽 → 裁左右 */
+                int nw = (int) (sh_ref * target_ar);
+                if (nw < 2) nw = 2;
+                g_cover_sx = (sw_ref - nw) / 2;
+                g_cover_sy = 0;
+                g_cover_sw = nw;
+                g_cover_sh = sh_ref;
+            } else {
+                /* 源更高 → 裁上下 */
+                int nh = (int) (sw_ref / target_ar);
+                if (nh < 2) nh = 2;
+                g_cover_sx = 0;
+                g_cover_sy = (sh_ref - nh) / 2;
+                g_cover_sw = sw_ref;
+                g_cover_sh = nh;
+            }
+        }
+    } else {
+        g_cover_sx = 0; g_cover_sy = 0; g_cover_sw = 0; g_cover_sh = 0;
+    }
+
     if (dx != g_dst_x || dy != g_dst_y || dw != g_dst_w || dh != g_dst_h) {
         LOGI("画面映射: 源 %dx%d → 画布 %d,%d %dx%d（%s）",
              g_blit_src_w > 0 ? g_blit_src_w : g_src_w,
              g_blit_src_h > 0 ? g_blit_src_h : g_src_h,
              dx, dy, dw, dh,
-             g_mask_ready ? (g_mask.cfg.fit ? "遮罩内等比" : "铺满遮罩")
-                          : "画布居中");
+             !g_mask_ready ? "画布居中"
+                           : (fit_mode == 2 ? "cover裁切" :
+                              (fit_mode ? "遮罩内等比" : "铺满遮罩")));
+        if (fit_mode == 2 && g_cover_sw > 0) {
+            LOGI("  cover 源裁切: x=%d y=%d %dx%d（保留比例）",
+                 g_cover_sx, g_cover_sy, g_cover_sw, g_cover_sh);
+        }
     }
     g_dst_x = dx; g_dst_y = dy; g_dst_w = dw; g_dst_h = dh;
 }
@@ -2006,9 +2082,34 @@ int main(int argc, char **argv)
                             g_blit_src_h = srcH2;
                             recompute_dst();
                         }
+
+                        /*
+                         * ★ fit=2（cover）的源裁切（2026-11-08）
+                         *
+                         * recompute_dst() 会按遮罩宽高比算出该裁哪块
+                         * （g_cover_sx/sy/sw/sh）。这里把它应用到 blit 的源矩形。
+                         *
+                         * 注意是在 bsw/srcH2 **之后**叠加 —— 因为 cover 裁切是
+                         * 在"已经去过黑边的有效区域"里再裁，顺序不能反。
+                         */
+                        int fbx = bsx, fby = srcY2, fbw = bsw, fbh = srcH2;
+                        if (g_cover_sw > 0 && g_cover_sh > 0) {
+                            fbx = bsx + g_cover_sx;
+                            fby = srcY2 + g_cover_sy;
+                            fbw = g_cover_sw;
+                            fbh = g_cover_sh;
+                            /* clamp 到有效范围内，防止越界读 */
+                            if (fbx < bsx) fbx = bsx;
+                            if (fby < srcY2) fby = srcY2;
+                            if (fbx + fbw > bsx + bsw) fbw = bsx + bsw - fbx;
+                            if (fby + fbh > srcY2 + srcH2) fbh = srcY2 + srcH2 - fby;
+                            if (fbw < 2) { fbx = bsx; fbw = bsw; }
+                            if (fbh < 2) { fby = srcY2; fbh = srcH2; }
+                        }
+
                         blit_bilinear((const uint8_t *) pixels, gb->getStride(),
                                       frameW, frameH,
-                                      bsx, srcY2, bsw, srcH2, canvas, outW, outH,
+                                      fbx, fby, fbw, fbh, canvas, outW, outH,
                                       g_dst_x, g_dst_y, g_dst_w, g_dst_h);
                         applied++;
 

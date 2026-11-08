@@ -437,10 +437,54 @@ public final class MapCastService {
              */
             AdbShell.exec("pkill -9 -f dcapd2 2>/dev/null; echo KILLED", 6000);
             Thread.sleep(2000);
-            AdbShell.exec("rm -f " + TMP + "/dcapd2.layer; "
-                    + ": > " + TMP + "/dcapd2.log; "
+
+            /*
+             * ★ 和「图层遮罩」关联（2026-11-08）
+             *
+             * 原来这里写的是 `rm -f dcapd2.layer` —— 每次地图投屏都**删掉**遮罩
+             * 配置，所以界面上调的遮罩对地图投屏完全不起作用。
+             *
+             * 但 dcapd2 本身是支持遮罩的：
+             *   · 启动时 dc_layer_load_file(LAYER_CFG_FILE) 读配置（dcapd2.c:338）
+             *   · 每帧编码前 dc_layer_apply(&g_mask, ...) 应用（dcapd2.c:2108）
+             *   · VD 模式下同样生效
+             *
+             * 现在改成：先把 App 里当前的遮罩配置推下去（LayerConfig.push()），
+             * dcapd2 启动时自然读到 —— 这样地图投屏用的就是界面上设置的遮罩。
+             *
+             * 注意 push() 内部会检查线程（主线程调用会抛异常），
+             * 而 startDcapd2() 本身就跑在 worker 线程，可以直接调。
+             */
+            try {
+                LayerConfig lc = LayerConfig.loadFromPrefs(appCtx, W, H);
+                if (lc != null) {
+                    lc.push();
+                    Log.i(TAG, "已下发遮罩配置（enabled=" + lc.enabled
+                            + " shape=" + lc.shape
+                            + " " + lc.x + "," + lc.y + " " + lc.w + "x" + lc.h
+                            + " 圆角=" + lc.rTl + " 羽化=" + lc.feather + "）");
+                }
+            } catch (Throwable t) {
+                Log.w(TAG, "下发遮罩配置失败（不影响投屏）: " + t);
+            }
+
+            AdbShell.exec(": > " + TMP + "/dcapd2.log; "
                     + "wc -l " + TMP + "/dcapd2.log", 8000);
 
+            /*
+             * 启动参数里的 srcRect / dstRect 也要跟遮罩对齐。
+             *
+             * dcapd2 的 argv 是：
+             *   argv[1] dispW   argv[2] dispH     ← 画布（固定 1920x532）
+             *   argv[3] srcX    argv[4] srcY      ← 抓取源矩形
+             *   argv[5] srcW    argv[6] srcH
+             *   argv[7..]                         ← 目标/画布尺寸
+             *
+             * 地图投屏的「源」是我们自己的 VirtualDisplay，它本身就是 1920×532
+             * 全幅，所以 srcRect 保持 0,0,W,H 不动 —— 遮罩裁切交给
+             * dc_layer_apply 在编码前做，这样遮罩的圆角/羽化/梯形都能用上，
+             * 而不是只能靠 srcRect 裁一个硬边矩形。
+             */
             String cmd = DCAPD2
                     + " " + W + " " + H + " 0 0 " + W + " " + H + " " + W + " " + H
                     + " " + CP_HOST + " " + CP_PORT + " 30 0"

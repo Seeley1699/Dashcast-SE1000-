@@ -1073,7 +1073,15 @@ public class MainActivity extends Activity {
         r1.addView(maskBtnShape, rowLp(1f));
 
         maskBtnFit = chipButton(fitLabel(), v -> {
-            maskCfg.fit = maskCfg.fit == 0 ? 1 : 0;
+            /* 三档循环：铺满(0) → 等比(1) → cover裁切(2) → 铺满(0)
+             *
+             * cover 是 2026-11-08 为地图投屏加的：
+             * 地图源比例 3.61:1，遮罩可能是 1.27:1，
+             *   fit=0 → 横向压扁变形
+             *   fit=1 → 缩成细条留黑边
+             *   fit=2 → 保持比例放大填满，超出裁掉  ← 车模不变形
+             */
+            maskCfg.fit = (maskCfg.fit + 1) % 3;
             ((TextView) maskBtnFit.getChildAt(0)).setText(fitLabel());
             refreshMask();
         });
@@ -1593,8 +1601,14 @@ public class MainActivity extends Activity {
      */
     private String fitLabel() {
         if (MirrorController.getCodec() == MirrorController.CODEC_H264) {
-            return "铺满(固定)";
+            /*
+             * H.264 无 alpha，只能靠图层矩形挖洞，所以一直铺满。
+             * 但 fit=2（cover）在 H.264 下同样需要 —— 它是「保持比例 + 裁掉超出」，
+             * 也是铺满图层，只是源裁得不一样。所以 H.264 也允许切到 cover。
+             */
+            return maskCfg.fit == 2 ? "裁切填满 ✓" : "铺满(固定)";
         }
+        if (maskCfg.fit == 2) return "裁切填满 ✓";
         return maskCfg.fit == 0 ? "铺满 ✓" : "等比（留边）";
     }
 

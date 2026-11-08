@@ -704,6 +704,116 @@ Java.perform(function () {
                                                 log('车模设置失败: '
                                                     + String(eCar).substring(0, 80));
                                             }
+
+                                            /*
+                                             * ★ 底图元素可见性：路名 / 路况深度 / 道路（2026-11-08）
+                                             *
+                                             * 参考源码 hud_effects.js:55-64 + 232-239：
+                                             *   const States = Java.use(
+                                             *       'com.autonavi.gbl.map.model.MapViewStateType');
+                                             *   function idState(name){ return Number(States[name].value); }
+                                             *   const set = (name,on) =>
+                                             *       biz.setMapViewState(idState(name), on);
+                                             *
+                                             * 实测问题：仪表上只有红绿灯和路线，**没有路名、没有路况**。
+                                             * 原因是我们只调了 setTmcVisible(5,true) —— 那只是 TMC 主开关，
+                                             * 底图上「路名文字」和「路况路段的深度信息」各自有独立的
+                                             * MAP_VIEWSTATE_* 开关，默认没开。
+                                             *
+                                             * 关键 ID（从源码 names 表抄下来的，都是 MapViewStateType 的静态字段）：
+                                             *   MAP_VIEWSTATE_IS_LABLE_ROADNAME_ON    ← 路名
+                                             *   MAP_VIEWSTATE_IS_TMC_DEPTH_INFO_ON    ← 路况深度（红黄绿路段）
+                                             *   MAP_VIEWSTATE_IS_ROAD_ON              ← 道路本身
+                                             *   MAP_VIEWSTATE_IS_ROAD_ARROW_ON        ← 道路箭头
+                                             *
+                                             * biz 从 MapView 拿：view.getOperatorBusiness()。
+                                             */
+                                            try {
+                                                var CHB = Java.use('java.util.concurrent.ConcurrentHashMap');
+                                                var MSMb = Java.use(
+                                                    'ecarx.navi.engine.manager.map.MapServiceManager');
+                                                var msmb = MSMb.getInstance();
+                                                var fb = msmb.getClass().getDeclaredField('mapViewMap');
+                                                fb.setAccessible(true);
+                                                var mGetB = CHB.class.getMethod('get',
+                                                    [Java.use('java.lang.Object').class]);
+                                                var MapVB = Java.use('com.autonavi.gbl.map.MapView');
+                                                var mv5bRaw = mGetB.invoke(fb.get(msmb),
+                                                    [Java.use('java.lang.Integer').valueOf(5)]);
+                                                var mv5b = mv5bRaw
+                                                    ? Java.cast(mv5bRaw, MapVB) : null;
+
+                                                if (mv5b) {
+                                                    var biz = mv5b.getOperatorBusiness();
+                                                    var States = Java.use(
+                                                        'com.autonavi.gbl.map.model.MapViewStateType');
+
+                                                    var want = [
+                                                        'MAP_VIEWSTATE_IS_LABLE_ROADNAME_ON',
+                                                        'MAP_VIEWSTATE_IS_TMC_DEPTH_INFO_ON',
+                                                        'MAP_VIEWSTATE_IS_ROAD_ON',
+                                                        'MAP_VIEWSTATE_IS_ROAD_ARROW_ON'
+                                                    ];
+                                                    var okN = 0;
+                                                    for (var wi = 0; wi < want.length; wi++) {
+                                                        var nm = want[wi];
+                                                        try {
+                                                            var st = States[nm].value;
+                                                            biz.setMapViewState(st, true);
+                                                            okN++;
+                                                        } catch (eSt) {
+                                                            log('  ' + nm + ' 失败: '
+                                                                + String(eSt).substring(0, 50));
+                                                        }
+                                                    }
+                                                    log('底图开关已开 ' + okN + '/' + want.length
+                                                        + '（路名/路况深度/道路/道路箭头）');
+                                                } else {
+                                                    log('取不到 MapView(5) 做底图开关');
+                                                }
+                                            } catch (eBiz) {
+                                                log('底图开关失败: '
+                                                    + String(eBiz).substring(0, 80));
+                                            }
+
+                                            /*
+                                             * ★ hook updateCarStyle 防止导航时车模被覆盖（2026-11-08）
+                                             *
+                                             * 现象：车停着时是 3D 车模，一开导航就变回箭头。
+                                             *
+                                             * 原因：导航状态变化时，引擎/业务层会自己调
+                                             * MapLayer.updateCarStyle(...)，把之前设的 2001 覆盖成
+                                             * 2002（普通模式）→ 引擎退回 2D 箭头渲染。
+                                             *
+                                             * 源码用的是同一套思路（hud_effects.js:82-84 hook
+                                             * HUDControl.updateMapTheme 保护主题不被 OEM 改）：
+                                             * 把方法 hook 住，链到原实现之前先把参数改回我们要的值。
+                                             *
+                                             * 这里 hook MapLayer.updateCarStyle(int)：
+                                             * 无论谁传什么，一律改成 2001（导航态 = 3D 车模）。
+                                             * 注意要 return 原方法的返回值，否则调用方拿到 undefined 会出错。
+                                             */
+                                            try {
+                                                var MLH = Java.use(
+                                                    'ecarx.navi.engine.manager.layer.MapLayer');
+                                                var ucs = MLH.updateCarStyle.overload('int');
+                                                /*
+                                                 * **必须用 ucs.call(this, 2001) 而不是
+                                                 * this.updateCarStyle(2001)** —— 后者会再次
+                                                 * 进入这个 implementation，无限递归直到栈溢出
+                                                 * （一开导航就崩）。
+                                                 *
+                                                 * ucs.call 直接走原始实现，绕过 hook。
+                                                 */
+                                                ucs.implementation = function (style) {
+                                                    return ucs.call(this, 2001);
+                                                };
+                                                log('updateCarStyle 已 hook（强制 2001，防导航时车模退化）');
+                                            } catch (eHk) {
+                                                log('hook updateCarStyle 失败: '
+                                                    + String(eHk).substring(0, 70));
+                                            }
+
                                             startPc();
                                             return;
                                         }
