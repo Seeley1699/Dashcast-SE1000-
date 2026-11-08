@@ -30,7 +30,39 @@
 
 var CFG = {
     W: 1920, H: 532,
-    FPS: 12,
+    /*
+     * FPS = 30（2026-11-08 从 12 提到 30）
+     *
+     * 实测对照（同一台车，dcapd2 maxFps=30）：
+     *   FPS=12 → 抓 11.0fps，发 11.0fps，dcapd2 capture=11/秒
+     *   FPS=30 → 抓 24.8fps，发 19.8fps，dcapd2 capture=19~21/秒
+     *   收益 +82%，地图侧 CPU 仍 23%（不变），按 2ms 一帧算每帧只占 6% 核心
+     *
+     * 上限在哪：不是引擎，是 dcapd2 的 VD 分支
+     *   `poll(&pf, 1, g_proxy_active ? 20 : 0)` + 每轮只读一帧 → 实际 20fps。
+     *   再往上要改 dcapd2.c（一轮多读几帧），光调 FPS 或 maxFps 都没用：
+     *   实测 maxFps=60 时 capture 仍是 20，只把 dcapd2 CPU 从 23% 拉到 75%。
+     */
+    FPS: 30,
+    /*
+     * 动态帧率（2026-11-08）
+     *
+     * 实测 CPU：30fps 固定 → 地图 25% + dcapd2 30% = 55%
+     *           15fps 静止 → 约 40%
+     * 这台车机本身负载就高（loadavg 5.2 / 6 核，内存只剩 935MB），
+     * 所以导航和不导航分档跑：
+     *   画面在动（导航中，路线/车标/车道箭头一直变）→ FPS(30)
+     *   画面静止超过 IDLE_MS（停车、没路线）      → IDLE_FPS(15)
+     *
+     * 判据不依赖任何私有导航 API，直接采样 16 个像素点比对前后帧 —— 
+     * 试过 GuidanceManager / RouteManager / GuideService 找 isNaving，
+     * 都没暴露可用的状态方法，而且那些类初始化很重（探一次就超时）。
+     */
+    IDLE_FPS: 15,
+    /* 多久没动就降档：3 秒。太短会在低速转弯时来回切，太长了省不下电 */
+    IDLE_MS: 3000,
+    /* 发送节奏：50ms=20Hz。比 FPS 稍慢一点，让发送端自然丢弃重复帧，
+     * 避免 JS 线程和主线程抢同一份 buffer。实测设 33ms 反而掉到 15fps。 */
     SEND_MS: 50,
     D2_HOST: '127.0.0.1',
     D2_PORT: 8450,
@@ -47,6 +79,30 @@ var FP  = { seq: 0, arr: null, prod: 0, sent: 0, err: 0 };
 var CTX = { stopper: false, hh: null, bmp: null, buf: null, mv: null, hc: null, listener: null };
 /* 双缓冲：两个 ByteBuffer 轮换，避免 JS 线程读到正在写的缓冲 */
 var BUF = { b0: null, b1: null, wi: 0 };
+
+/*
+ * 动态帧率的采样点：4×4 网格，每格取中心
+ * （BGRA 每像素 4 字节，所以下标 = (y*W + x) * 4）
+ * 16 个点足够判断"地图在不在动"，成本 16 次数组访问 = 微秒级
+ */
+var SAMPLE_OFFS = (function () {
+    var a = [];
+    for (var gy = 0; gy < 4; gy++) {
+        for (var gx = 0; gx < 4; gx++) {
+            var x = Math.floor(CFG.W * (gx + 0.5) / 4);
+            var y = Math.floor(CFG.H * (gy + 0.5) / 4);
+            a.push((y * CFG.W + x) * 4);
+        }
+    }
+    return a;
+})();
+
+/* 动态帧率状态 */
+var DYN = {
+    last: new Array(16).fill(-1),   /* 上一帧的 16 个采样值 */
+    lastMoveAt: Date.now(),          /* 最后一次检测到"画面在动"的时刻 */
+    fps: 30                          /* 当前生效帧率，初始按高帧率 */
+};
 
 /* ── 网络 ─────────────────────────────────────────────────── */
 function d2_connect() {
@@ -107,6 +163,7 @@ setInterval(function () {
     log('STAT 抓=' + FP.prod + '(' + pf.toFixed(1) + 'fps)'
         + ' 发=' + FP.sent + '(' + sf.toFixed(1) + 'fps)'
         + ' 耗时=' + (FP.cost || 0) + 'ms 错=' + FP.err
+        + ' 帧率=' + DYN.fps + (DYN.fps === CFG.IDLE_FPS ? '(静止)' : '(活动)')
         + ' 网=' + (NET.ok ? 'OK' : 'DOWN'));
 }, 5000);
 
@@ -263,6 +320,42 @@ Java.perform(function () {
                                         FP.seq++;
                                         FP.prod++;
                                         FP.cost = Date.now() - t0;
+
+                                        /* ── 画面变化检测（动态帧率用） ──
+                                         *
+                                         * 采样 16 个点（4×4 网格，各取中心），逐帧比对。
+                                         * 变化点数 > 阈值就用高帧率，否则降档。
+                                         *
+                                         * 为什么采样而不是全图比对：全图 1920×532×4 = 4MB，
+                                         * 每帧扫一遍在 JS 里会拖垮主线程（实测能到 100ms+）。
+                                         * 16 个点足够判断"地图有没有在动" —— 导航中路线、
+                                         * 车标、车道箭头一直在动；停车时几乎全静止。
+                                         */
+                                        try {
+                                            var changed = 0;
+                                            for (var si = 0; si < SAMPLE_OFFS.length; si++) {
+                                                var off = SAMPLE_OFFS[si];
+                                                var cur = arr[off] | (arr[off + 1] << 8) | (arr[off + 2] << 16);
+                                                if (cur !== DYN.last[si]) {
+                                                    changed++;
+                                                    DYN.last[si] = cur;
+                                                }
+                                            }
+                                            var now2 = Date.now();
+                                            if (changed >= SAMPLE_OFFS.length / 4) {
+                                                /* 4 个点以上变了 → 认为在动，立刻升档 */
+                                                DYN.lastMoveAt = now2;
+                                            }
+                                            /* 超过 3 秒没动 → 降档 */
+                                            var moving = (now2 - DYN.lastMoveAt) < CFG.IDLE_MS;
+                                            var targetFps = moving ? CFG.FPS : CFG.IDLE_FPS;
+                                            if (targetFps !== DYN.fps) {
+                                                DYN.fps = targetFps;
+                                                log('帧率切换 ' + targetFps + 'fps（'
+                                                    + (moving ? '画面在动' : '画面静止')
+                                                    + '，变化点 ' + changed + '/' + SAMPLE_OFFS.length + '）');
+                                            }
+                                        } catch (e) {}
                                     } catch (e) {
                                         FP.err++;
                                         if (FP.err <= 3) log('拷贝失败 ' + String(e).substring(0, 60));
@@ -272,9 +365,10 @@ Java.perform(function () {
                                     if (FP.err <= 3) log('PC 失败 code=' + res);
                                 }
 
-                                /* 自链：trigInst 是闭包变量 */
+                                /* 自链：trigInst 是闭包变量。
+                                 * 间隔用 DYN.fps（动态帧率），不是固定的 CFG.FPS */
                                 if (!CTX.stopper) {
-                                    hh.postDelayed(trigInst, Math.round(1000 / CFG.FPS));
+                                    hh.postDelayed(trigInst, Math.round(1000 / DYN.fps));
                                 }
                             }
                         }

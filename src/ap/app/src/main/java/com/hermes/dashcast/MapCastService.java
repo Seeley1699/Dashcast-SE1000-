@@ -248,14 +248,58 @@ public final class MapCastService {
     /** 把 assets 里的资源解压/复制到设备路径 */
     private boolean ensureBinary(String assetName, String devPath, boolean exec) {
         try {
+            /* 期望大小：assets 里的原始大小
+             *
+             * 对于 .bin（gzip 的 injector）要和**解压后**的大小比，
+             * 这里拿不到，所以用 asset 原始大小做下限即可 —— injector
+             * 解压后 56MB ≫ 24MB，不会被误判。
+             */
+            long assetSize = -1;
+            try {
+                /* openFd 只对**未压缩**的 assets 有效；APK 里 assets 默认是
+                 * deflate 压缩的，openFd 会直接抛 FileNotFoundException。
+                 * 测下来 /data/local/tmp/mapcast.js 一直显示 asset=-1B，
+                 * 于是退回老的 `>1024` 判断 —— 这就是上一次"明明换了脚本
+                 * 设备上还是旧版"的原因。
+                 *
+                 * available() 对压缩 asset 会给解压后的字节数，任何情况下都能用。 */
+                java.io.InputStream is = appCtx.getAssets().open(assetName);
+                try {
+                    assetSize = is.available();
+                } finally {
+                    try { is.close(); } catch (Throwable ignored) {}
+                }
+            } catch (Throwable ignored) {
+            }
+
             File f = new File(devPath);
-            /* 已存在且大小合理就跳过（避免每次解压 58MB） */
-            if (f.exists() && f.length() > 1024) {
-                Log.i(TAG, devPath + " 已存在 (" + f.length() + "B)，跳过");
+            /*
+             * **跳过条件必须比对大小，不能只看 >1024**（2026-11-08 修）
+             *
+             * 原来写 `f.length() > 1024` 就跳过。结果我调试时手工推了一份
+             * 16KB 的 map_to_dash_prod.js（**没拼 java-bridge**）到
+             * /data/local/tmp/mapcast.js，App 看 16KB > 1024 就认为"已就绪"，
+             * 一直复用它。mapcast.js 一跑就 ReferenceError: Java is not defined，
+             * 地图侧 frames 恒为 0，dcapd2 收不到帧 —— 但 UI 显示"运行中"，
+             * 极难查。
+             *
+             * 现在：dev 文件必须 >= assets 原始大小（.gz/.bin 用其压缩后大小
+             * 做下限是安全的，因为解压只会更大），否则重新解压覆盖。
+             */
+            boolean ok = f.exists() && (assetSize < 0
+                    ? f.length() > 1024
+                    : f.length() >= assetSize);
+            if (ok) {
+                Log.i(TAG, devPath + " 已存在 (" + f.length() + "B, asset="
+                        + assetSize + "B)，跳过");
                 if (exec) {
                     AdbShell.exec("chmod 755 " + devPath, 3000);
                 }
                 return true;
+            }
+            if (f.exists()) {
+                Log.w(TAG, devPath + " 大小不符（dev " + f.length()
+                        + "B < asset " + assetSize + "B），重新部署");
             }
             notify2("解压 " + assetName + " …");
             InputStream raw = appCtx.getAssets().open(assetName);
