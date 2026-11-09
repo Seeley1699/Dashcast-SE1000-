@@ -30,6 +30,28 @@ import android.util.Log;
  */
 public final class DashLog {
 
+    /**
+     * adb 协议逐包追踪开关（2026-11-09）
+     *
+     * AdbShell.readLoop 每读到一个 adb 协议包就打一行（A_OKAY / A_WRTE /
+     * A_CLSE …），投屏时每帧好几行。实测一个 logcat 文件 5644 行里
+     * 5550 行是这种噪音（98.3%），真正的业务日志只有 94 行。
+     *
+     * 更严重的是它把 logcat 的 main 环形缓冲区（12MiB）刷满：
+     *   main: ring buffer is 12 MiB (13 MiB consumed)
+     * 于是 DashcastMain 的「投屏运行中」「已停止」这些关键状态
+     * **被挤得一条都不剩** —— 用户回传日志时排查等于盲人摸象。
+     *
+     * 默认 false（不输出）。真要看协议细节时改成 true 重新构建。
+     *
+     * 为什么不用 BuildConfig.DEBUG：
+     *   这个项目的 Gradle 8.7 + JDK 25 组合下，一开
+     *   `buildFeatures { buildConfig true }` 就报
+     *   "Unsupported class file major version 69"（JDK 25 = 69），
+     *   整个构建直接挂掉。静态常量零依赖、不需要改 Gradle。
+     */
+    public static final boolean PKT_TRACE = false;
+
     /** 技术日志文件名（和 events.log 区分开） */
     private static final String FILE = "dashcast.log";
 

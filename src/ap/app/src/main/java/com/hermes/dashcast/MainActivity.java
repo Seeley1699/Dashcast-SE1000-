@@ -3723,9 +3723,35 @@ public class MainActivity extends Activity {
             running = false;
             setStatus("状态：已先停止投屏，再删除 CP 服务…");
         }
-        runOp("cp-stop", "状态：停止并删除文件…",
-                cpManager::stopDashcastd,
-                "状态：已停止，文件已删除", "状态：停止失败");
+        /*
+         * ★ **停服务必须连带还原仪表**（2026-11-09 修「图层不下来」）
+         *
+         * 原来只调 stopDashcastd() —— 它只 killall 进程。
+         * 而 CP 的 layer 99 是 dashcastd 建的，进程被杀后**图层不会自动消失**：
+         * 仪表上就留着一块投屏画面，怎么点都下不来。
+         *
+         * 日志实证（dashcast(1).log 22:40:24）：
+         *   停止并删除文件…
+         *   停止结果: DONE（二进制保留，下次启动免重推）
+         *   已停止，文件已删除
+         *   ← 全程没有出现「还原仪表」那行
+         *
+         * 而地图投屏那条路径（MapCastService.stopSequence）是有的：
+         *   cpm.stopDashcastd();
+         *   cpm.restoreDashboard();     ← 这一句普通投屏的停服务漏了
+         *   日志：「还原仪表（第 1 次）: 原表含99=false → 设为 [10] 验证=干净」
+         *
+         * 现在补上，并且**先停进程再还原**（顺序不能反：dashcastd 活着会
+         * 自己重建 layer 99，还原完又被它建回去）。
+         */
+        runOp("cp-stop", "状态：停止并还原仪表…",
+                () -> {
+                    boolean ok = cpManager.stopDashcastd();
+                    /* 无论 stop 成功与否都试一次还原 —— 半死状态下更需要兜住 */
+                    cpManager.restoreDashboard();
+                    return ok;
+                },
+                "状态：已停止，仪表已还原", "状态：停止失败");
     }
 
     private void showAppPicker() {
@@ -4145,24 +4171,37 @@ public class MainActivity extends Activity {
      */
     private void stopCastByMode() {
         /*
-         * 整段丢到后台线程 —— 里面要 sleep 1.5 秒，
-         * 放 UI 线程会卡住界面（ANR 风险）。
-         * setStatus / appendLog 内部都会 post 回主线程，跨线程安全。
+         * ★ **整段必须在主线程**（2026-11-09 修闪退）
+         *
+         * 上一版把这两步丢进了 `new Thread(...)`，理由是里面有 sleep(1500)
+         * 怕卡 UI。但 stopCastOnly() 内部第 4642 行会调 updateMapHudBtn()，
+         * 那里面是 `((TextView) btn.getChildAt(0)).setText(...)` —— 动的是
+         * View，只能在创建它的主线程执行。
+         *
+         * 崩溃日志（crash buffer，22:40:10）：
+         *   android.view.ViewRootImpl$CalledFromWrongThreadException:
+         *     Only the original thread that created a view hierarchy can touch its views.
+         *       at MainActivity.updateMapHudBtn(MainActivity.java:4875)
+         *       at MainActivity.stopCastOnly(MainActivity.java:4642)
+         *       at MainActivity.lambda$stopCastByMode$0(MainActivity.java:4153)
+         *       at java.lang.Thread.run(Thread.java:923)     ← 后台线程
+         *
+         * 后果是闪退 + 图层没还原（stop 中途被打断，CP 上 layer 99 残留）。
+         *
+         * 现在改用 **postDelayed**：主线程立刻停普通投屏，1.5 秒后再停地图投屏。
+         * 既不阻塞 UI（不是 sleep），又保证两步都在主线程、顺序也确定。
          */
-        new Thread(() -> {
-            stopCastOnly();        /* 停普通投屏 */
-            try {
-                /*
-                 * 给普通投屏的异步清理留时间 —— 内部那条
-                 * `pkill -9 -f dcapd2` 是丢在线程池里跑的，
-                 * 不等就会和下面地图投屏的启动撞车（实测日志见方法注释）。
-                 */
-                Thread.sleep(1500);
-            } catch (InterruptedException ignored) {
-                Thread.currentThread().interrupt();
-            }
-            stopMapCast();         /* 停地图投屏（内部有 isRunning 保护，没跑就跳过） */
-        }, "stop-cast").start();
+        stopCastOnly();        /* 停普通投屏（主线程，内部异步） */
+
+        /*
+         * 给普通投屏的异步清理留时间 —— 它内部那条
+         * `pkill -9 -x dcapd2` 是丢在线程池里跑的，
+         * 不等就会和地图投屏的启动撞车（实测日志见方法注释）。
+         */
+        mainHandler.postDelayed(() -> {
+            if (isFinishing() || isDestroyed()) return;
+            stopMapCast();     /* 停地图投屏（内部有 isRunning 保护，没跑就跳过） */
+        }, 1500);
     }
 
     private void startCast() {

@@ -224,18 +224,32 @@ public final class AdbShell {
         while (true) {
             Msg m = read(sIn);
             /*
-             * **pkt 逐包日志改成 V 级**（2026-11-05）。
+             * **pkt 逐包日志默认关闭**（2026-11-09 加强）
              *
-             * 实测一个 logcat 文件 5644 行里 5550 行是这种 pkt 噪音
-             * （98.3%），真正有用的业务日志只有 94 行。
-             * 用户把日志发过来，第一眼看到的就是一片 pkt。
+             * 历史上降到过 V 级（2026-11-05），但 V 级仍然**会写进 logcat
+             * 和落盘文件**——`logcat -d` 不看级别过滤，全都会出来。
              *
-             * 降到 V 级：默认 logcat 过滤掉，
-             * 排查协议问题时开 `adb logcat -v *:V` 还能看到。
+             * 实测后果：
+             *   main: ring buffer is 12 MiB (13 MiB consumed)   ← 满了
+             *   用户回传的日志里 98% 是 `pkt cmd=45545257 a0=6207 ...`
+             *   而 DashcastMain 的业务日志（"投屏运行中"/"已停止"）
+             *   **被挤得一条都不剩** —— 排查时等于盲人摸象。
+             *
+             * 用 DashLog.PKT_TRACE 静态开关门控：
+             *   · 默认 false → 不输出，缓冲区留给业务日志
+             *   · 排查协议时把那个常量改成 true 重新构建
+             *
+             * 为什么不用 BuildConfig.DEBUG：
+             *   这个项目的 Gradle 8.7 + JDK 25 组合下，一开
+             *   `buildFeatures { buildConfig true }` 就报
+             *   "Unsupported class file major version 69"（JDK 25 = 69），
+             *   整个构建直接挂掉。静态常量零依赖、零副作用。
              */
-            DashLog.v(TAG, "pkt cmd=" + Integer.toHexString(m.cmd)
-                    + " a0=" + m.arg0 + " a1=" + m.arg1
-                    + " len=" + (m.data == null ? 0 : m.data.length));
+            if (DashLog.PKT_TRACE) {
+                DashLog.v(TAG, "pkt cmd=" + Integer.toHexString(m.cmd)
+                        + " a0=" + m.arg0 + " a1=" + m.arg1
+                        + " len=" + (m.data == null ? 0 : m.data.length));
+            }
             if (m.cmd == A_OKAY) {
                 open = true;
                 remoteId = m.arg0;       // adbd 那边的流 id
