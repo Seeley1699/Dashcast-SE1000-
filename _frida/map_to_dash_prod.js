@@ -61,6 +61,30 @@ var CFG = {
     IDLE_FPS: 15,
     /* 多久没动就降档：3 秒。太短会在低速转弯时来回切，太长了省不下电 */
     IDLE_MS: 3000,
+    /*
+     * UI 叠加开关（2026-11-09）
+     *
+     * true  → 在地图上叠时间/车速/电池/油量/音乐卡片
+     * false → 纯地图
+     * 改这里不用动其它代码；ui_layer.js 里的 UIL 常量控制布局。
+     *
+     * **当前置 false** —— UI 层实验还没完成。
+     *
+     * uiInit() / uiComposite() 定义在 ui_layer.js 里，而那个文件**不在构建链里**
+     * （assets/mapcast.js 只拼 java-bridge + 本文件）。
+     * 之前 assets 里那份能跑，是因为某次手工把 ui_layer 段落也拼了进去 ——
+     * 那是未提交的本地状态，重新生成就会丢。
+     *
+     * 保持 true 而 ui_layer 段缺失的后果是致命的：
+     *   内部类回调里那句 `if (CFG.UI_ENABLED) uiComposite(bmp);` 没有 try/catch，
+     *   uiComposite 未定义 → 每帧抛 ReferenceError →
+     *   后面的 bmp.copyPixelsToBuffer(bb) 永远执行不到 →
+     *   帧数据一个字节都拷不出来 → 地图完全不出画面。
+     *
+     * 要启用 UI 层时：把 ui_layer.js 正式加进构建链
+     * （按 bridge → ui_layer → 本文件 的顺序拼接），再打开这个开关。
+     */
+    UI_ENABLED: false,
     /* 发送节奏：50ms=20Hz。比 FPS 稍慢一点，让发送端自然丢弃重复帧，
      * 避免 JS 线程和主线程抢同一份 buffer。实测设 33ms 反而掉到 15fps。 */
     SEND_MS: 50,
@@ -207,6 +231,16 @@ Java.perform(function () {
                     var Config = Java.use('android.graphics.Bitmap$Config');
                     var bmp = Bitmap.createBitmap(W, H, Config.ARGB_8888.value);
                     CTX.bmp = bmp;
+
+                    /* UI 层：bmp 建好后初始化。它自己维护一张独立的 UI Bitmap，
+                     * 每帧合成时才贴到 bmp 上（见 uiComposite 调用处） */
+                    if (CFG.UI_ENABLED) {
+                        try {
+                            uiInit();
+                        } catch (e) {
+                            log('UI 初始化失败 ' + String(e).substring(0, 80));
+                        }
+                    }
                     /* ★ 红蓝互换用的目标 Bitmap + Canvas（Java 层原生速度） */
                     var swapBmp = Bitmap.createBitmap(W, H, Config.ARGB_8888.value);
                     var CanvasC = Java.use('android.graphics.Canvas');
@@ -255,6 +289,15 @@ Java.perform(function () {
 
                                         var bb = (idx === 0) ? BUF.b0 : BUF.b1;
                                         var arr = (idx === 0) ? BUF.a0 : BUF.a1;
+
+                                        /* ★ UI 合成（必须在 copyPixelsToBuffer 之前）
+                                         *
+                                         * PixelCopy 每帧把地图覆盖写进 bmp，
+                                         * 所以每帧都要重新把 UI 贴上去。
+                                         * uiComposite 内部有 1 秒节流，UI 只在
+                                         * 数据变化时重绘，每帧只做一次 drawBitmap。
+                                         */
+                                        if (CFG.UI_ENABLED) uiComposite(bmp);
 
                                         /* ★ 直接拷贝（copyPixelsToBuffer 出的就是
                                            dcapd2 要的字节序，无需 ColorMatrix 转换）

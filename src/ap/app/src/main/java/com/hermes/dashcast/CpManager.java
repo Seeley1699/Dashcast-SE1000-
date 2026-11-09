@@ -442,17 +442,42 @@ public class CpManager {
         }
     }
 
-    /** 停止 dashcastd 并删除推送的文件，恢复 CP 原样（图层随进程退出自动消失） */
+    /** 停止 dashcastd（**保留二进制**，下次启动免重推） */
     public boolean stopDashcastd() {
         synchronized (pushLock) {
             try {
                 Session session = acquireSession();
                 try {
+                    /*
+                     * **只停进程，不删二进制**（2026-11-09 修「每次切模式重推 490KB」）
+                     *
+                     * 原来这里是：
+                     *   killall dashcastd; rm -f /data/dashcastd /data/*.b64 /run/*.log
+                     *
+                     * 删文件的后果，日志实证（dashcast-12:08:15:32）：
+                     *   08:15:24  地图投屏 stop → 「停止结果: DONE（已删除推送文件）」
+                     *   08:15:32  普通投屏 start → 「dashcastd 不存在或不可执行，需推送」
+                     *   08:15:35  重推 490KB → gzip 231KB → base64 308K 字符（约 3 秒）
+                     *
+                     * 两种模式共用同一个 dashcastd，一边 stop 就删、另一边 start
+                     * 又要重推 —— 每次切模式白等 3 秒，还多一轮 CP 写入。
+                     *
+                     * 现在的做法：
+                     *   · /data/dashcastd 保留（560KB，CP 上是 /data 持久分区，不是 tmpfs）
+                     *   · 只清 /data/*.b64（base64 中转文件，用完就没用）
+                     *   · /run/dashcastd.log 是 tmpfs，清掉不影响
+                     *
+                     * 下次 start 时 ensurePushed() 会校验 MD5：
+                     *   · 一致 → 直接启动，省掉推送
+                     *   · 不一致（App 升级换了二进制）→ 照常重推
+                     *
+                     * killall 仍然保留 —— 只是去掉删二进制那一步。
+                     */
                     String out = execOnSession(session,
                             "killall dashcastd 2>/dev/null; "
-                            + "rm -f " + CP_PATH + " " + CP_B64_PATH + " /run/dashcastd.log; "
+                            + "rm -f " + CP_B64_PATH + " /run/dashcastd.log; "
                             + "echo DONE");
-                    DashLog.i(TAG, "停止结果: " + out.trim() + "（已删除推送文件）");
+                    DashLog.i(TAG, "停止结果: " + out.trim() + "（二进制保留，下次启动免重推）");
                     return out.contains("DONE");
                 } finally {
                     /* 共享 Session：不断开，由 closeSession() 管理 */

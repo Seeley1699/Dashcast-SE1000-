@@ -118,7 +118,16 @@ private static final int CMD_SRC = 0x52534344;
 
     private ImageReader reader;
     private VirtualDisplay vd;
-    private int displayId = -1;
+    /*
+     * **必须 volatile**（2026-11-09）。
+     *
+     * createDisplay() 在 enterBg 线程里写，moveTaskIn() 可能被 loop 线程读 ——
+     * 不加 volatile 时，loop 线程可能读到旧值（上一块已销毁 VD 的 id），
+     * 于是 taskOnDisplay(pkg, 旧id) 返回 false，接着走 move-stack 把 task
+     * 搬到**已经不存在的屏**上。日志里那种"每次进后台跟随都 move-stack"
+     * 就是这么来的。
+     */
+    private volatile int displayId = -1;
 
     private HandlerThread cbThread;
     private Handler cbHandler;
@@ -571,6 +580,26 @@ private static final int CMD_SRC = 0x52534344;
          * 修法：先查一次「这个 pkg 的 task 是不是已经在 displayId 上」。
          * 是的话直接返回成功，不搬、不重启。
          */
+        /*
+         * **displayId 无效时直接失败，别瞎搬**（2026-11-09）
+         *
+         * 用户日志（dashcast-12）里每次进入后台跟随都执行一次 move-stack：
+         *   08:15:44 move-stack 1102491 → 25
+         *   08:16:10 move-stack 1102491 → 25     ← 明明已经搬过了
+         *   08:16:15 move-stack 1102491 → 25
+         *   08:16:37 move-stack 1102491 → 25
+         *
+         * 只有 08:16:00 那次打的是「无需搬运」。其余全部重复搬 ——
+         * 说明 taskOnDisplay(pkg, displayId) 返回了 false。
+         *
+         * 最可能的原因是 displayId 读到旧值（已销毁 VD 的 id），
+         * 于是 `am stack list` 里永远找不到那个 id，判定必然 false。
+         * displayId 已改 volatile，这里再加一道有效性检查兜住。
+         */
+        if (displayId < 0) {
+            DashLog.w(TAG, "displayId 无效（" + displayId + "），跳过搬运");
+            return false;
+        }
         if (taskOnDisplay(pkg, displayId)) {
             DashLog.i(TAG, pkg + " 的 task 已在虚拟屏 " + displayId + "，无需搬运");
             return true;
@@ -694,6 +723,19 @@ private static final int CMD_SRC = 0x52534344;
                     int slash = rest.indexOf('/');
                     String tpkg = slash > 0 ? rest.substring(0, slash) : "";
                     if (pkg.equals(tpkg) && curDisplay == wantDisplay) return true;
+                    /*
+                     * **诊断：目标包名找到了但不在期望屏上**（2026-11-09）
+                     *
+                     * 用户日志里每次都 move-stack，怀疑就是这里判定 false。
+                     * 把"目标 task 实际在哪个屏"打出来，一眼能看出是
+                     * displayId 读错（curDisplay 对不上）还是解析失败。
+                     *
+                     * 只打目标包名那一条，别把整张 stack 列表刷进日志。
+                     */
+                    if (pkg.equals(tpkg)) {
+                        DashLog.w(TAG, "taskOnDisplay: " + pkg + " 的 task 在 display "
+                                + curDisplay + "，期望 " + wantDisplay + "（将搬运）");
+                    }
                 }
             }
         } catch (Throwable t) {

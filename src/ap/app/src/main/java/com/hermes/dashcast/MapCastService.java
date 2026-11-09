@@ -237,7 +237,25 @@ public final class MapCastService {
             try {
                 CpManager cpm = new CpManager(appCtx);
                 if (!cpm.isDashcastdRunning()) {
-                    cpm.pushDashcastd();
+                    /*
+                     * **用 ensureDashcastd() 而不是 pushDashcastd()**
+                     * （2026-11-09 修「每次切模式重推 490KB」）
+                     *
+                     * 原来无条件 pushDashcastd() —— 不管 CP 上那份是不是
+                     * 已经是最新版，都硬推 490KB（gzip 231KB → base64 308K 字符，
+                     * 实测约 3.5 秒）。
+                     *
+                     * 而 CpManager.stopDashcastd() 现在**不再删二进制**了
+                     * （只 killall 进程），所以 CP 上那份通常还在且 MD5 一致。
+                     *
+                     * ensureDashcastd() 内部：
+                     *   ① checkDashcastd()  → test -x + md5sum，一致就直接返回 true
+                     *   ② 不一致才 pushDashcastd()
+                     *   ③ 推失败但 CP 上有可执行文件 → 继续用旧版（不阻断投屏）
+                     *
+                     * 省下的是每次切模式那 3.5 秒。
+                     */
+                    cpm.ensureDashcastd();
                     cpm.startDashcastd();
                 }
                 notify2("CP 服务就绪");

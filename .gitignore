@@ -45,3 +45,15 @@ _frida/hudcast-inject.xz
 _frida/mapbridge/
 # _frida 里的原车提取物（16.7MB xz，由 tools/fetch-injector.ps1 从 APK 现取）
 _frida/assets/
+# ── 未完成的实验（2026-11-09）────────────────────────────────
+# UI 叠加层：ui_layer.js 定义了 uiInit/uiComposite，但还没进构建链。
+# 启用方式见 _frida/map_to_dash_prod.js 里 UI_ENABLED 的注释。
+_frida/ui_layer*.js
+_frida/*.bak*
+tools/ui-preview*.ps1
+tools/render-ui.bat
+
+# CP 侧 UID 探测工具（一次性调试）
+src/cp/dashuid_probe*
+src/cp/build-dashuid-probe.sh
+src/cp/.build-probe/

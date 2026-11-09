@@ -294,6 +294,20 @@ public class MirrorController {
     private volatile String component;
     private volatile boolean running;
     private volatile boolean bgMode;
+    /*
+     * 目标回前台的**连续确认计数**（2026-11-09）
+     *
+     * 用户日志显示后台跟随 5 进 4 出，每次退出都紧跟一次 move-stack ——
+     * 而 move-stack 会销毁重建 Activity（播放器状态全丢），代价极高。
+     * 但两次进出之间只隔 1.5~13 秒，全都短于 VD 判死的 15 秒，
+     * 说明是 foregroundPkg() 在某几次采样里读到了目标 App（误判）。
+     *
+     * 加这个计数后：连续 3 次（间隔 1.5s，共 4.5s）都判定"目标回前台"
+     * 才真的退出跟随。单次抖动不会触发。
+     */
+    private int fgTargetStreak;
+    /** 退出后台跟随需要连续确认的次数（每次间隔 1.5s） */
+    private static final int FG_EXIT_STREAK = 3;
     private long lastCpLog;
     /*
      * 这几个字段是**跨线程**读写的，必须 volatile：
@@ -596,6 +610,13 @@ public class MirrorController {
         if (bgMode || !running || component == null) return;
 
         bgMode = true;
+        /*
+         * 重置"目标回前台"的连续确认计数（2026-11-09）。
+         *
+         * 新进入后台跟随 = 全新的观察窗口，上一轮残留的计数必须清零，
+         * 否则刚进来就可能因为历史计数 ≥ FG_EXIT_STREAK 立刻退出。
+         */
+        fgTargetStreak = 0;
         final String comp = component;
         /*
          * **清零虚拟屏无输出计时**（2026-11-05）。
@@ -818,7 +839,31 @@ public class MirrorController {
         bgMode = false;
         /* 退出跟随 = 上一轮观察窗口作废，下次 enterBg 会重新计时 */
         vdDeadSince = 0;
-        DashLog.i(TAG, "退出后台跟随模式");
+        /* 连续确认计数也清零（2026-11-09） */
+        fgTargetStreak = 0;
+        /*
+         * **记下是谁调用的**（2026-11-09）
+         *
+         * 用户日志（dashcast-12）里后台跟随 5 进 4 出：
+         *   08:15:44 进 → 08:15:50 出（6s）
+         *   08:16:00 进 → 08:16:05 出（5s）
+         *   08:16:10 进 + move-stack → 08:16:12 出（1.5s）
+         *   08:16:15 进 + move-stack → 08:16:28 出（13s）
+         *   08:16:37 进 + move-stack
+         *
+         * 带 move-stack 那几次退出，怀疑是 loop 里 foregroundPkg() 误判
+         * "目标回前台" —— 但用户按了 HOME，App 明明在后台。
+         * 光看现有日志分不清是哪条路径触发的，先把调用链打出来。
+         */
+        {
+            StackTraceElement[] st = Thread.currentThread().getStackTrace();
+            StringBuilder sb = new StringBuilder();
+            for (int i = 2; i < Math.min(st.length, 6); i++) {
+                if (sb.length() > 0) sb.append(" ← ");
+                sb.append(st[i].getMethodName());
+            }
+            DashLog.i(TAG, "退出后台跟随模式（调用链: " + sb + "）");
+        }
         /*
          * ★ **vd.stop(false) —— 保留虚拟屏，不要拆**（2026-11-08）
          *
@@ -1095,8 +1140,63 @@ public class MirrorController {
                     lastFgCheck = now;
                     String fg = foregroundPkg();
                     fgIsTarget = pkg != null && pkg.equals(fg);
+                    /*
+                     * **判定结果落日志**（2026-11-09，诊断后台跟随反复进出用）
+                     *
+                     * 只在 "要切换状态" 时打，稳态不刷屏：
+                     *   · 目标回前台 && 当前在后台跟随  → 即将 exitBg
+                     *   · 目标不在前台 && 当前在主屏    → 即将 enterBg
+                     * 把 fg 一起打出来，一眼能看出是不是 foregroundPkg 误判。
+                     */
+                    boolean willExit = fgIsTarget && bgMode;
+                    boolean willEnter = !fgIsTarget && !bgMode && !inGrace;
+                    if (willExit || willEnter) {
+                        DashLog.i(TAG, "前台判定: fg=" + fg + " 目标=" + pkg
+                                + " bgMode=" + bgMode
+                                + (willExit ? " → 退出跟随" : " → 进入跟随"));
+                    }
+                    /*
+                     * ★ **退出后台跟随要连续确认 N 次**（2026-11-09）
+                     *
+                     * 用户日志（dashcast-12）里后台跟随 5 进 4 出：
+                     *   08:15:44 进 → 08:15:50 出（6s）
+                     *   08:16:00 进 → 08:16:05 出（5s）
+                     *   08:16:10 进 + move-stack → 08:16:12 出（1.5s）
+                     *   08:16:15 进 + move-stack → 08:16:28 出（13s）
+                     *   08:16:37 进 + move-stack
+                     *
+                     * 间隔全部短于 VD 判死的 15 秒，所以只可能是
+                     * `fgIsTarget == true` —— 即 foregroundPkg() 在主屏焦点里
+                     * 读到了目标 App。
+                     *
+                     * 而 App 明明已被 move-stack 搬到虚拟屏，主屏焦点应该是桌面。
+                     * 两种可能：
+                     *   ① foregroundPkg() 解析串段了（dumpsys 输出里 display 顺序
+                     *      不是固定 0 在最前，实测是 1 → 2 → 0）
+                     *   ② 系统在某些瞬间把 VD 的焦点同步到主屏
+                     *
+                     * 不管哪种，**单次采样就退出跟随太激进** —— 退出后要重新
+                     * enterBg + move-stack，而 move-stack 会销毁重建 Activity
+                     * （播放器状态全丢），代价极高。
+                     *
+                     * 现在要求**连续 3 次前台检查（每次间隔 1.5s，共 4.5s）
+                     * 都判定"目标回前台"**才真的退出。单次抖动不会触发。
+                     * 用户真的切回 App 时，4.5 秒内必然稳定读到，体验不变。
+                     */
+                    if (fgIsTarget && bgMode) {
+                        fgTargetStreak++;
+                        if (fgTargetStreak < FG_EXIT_STREAK) {
+                            DashLog.i(TAG, "目标回前台确认 " + fgTargetStreak
+                                    + "/" + FG_EXIT_STREAK + "（暂不退出跟随）");
+                        }
+                    } else {
+                        if (fgTargetStreak > 0) fgTargetStreak = 0;
+                    }
                     if (fgIsTarget) {
-                        if (bgMode) exitBg();      /* 目标回前台 → 退出虚拟屏跟随 */
+                        if (bgMode && fgTargetStreak >= FG_EXIT_STREAK) {
+                            fgTargetStreak = 0;
+                            exitBg();      /* 目标连续回前台 → 退出虚拟屏跟随 */
+                        }
                         seenTargetAlive = true;
                     } else if (!bgMode && !inGrace) {
                         /*
