@@ -1556,6 +1556,43 @@ public class MirrorController {
             } catch (Throwable t) { warnThrottled("adhoc-cmd", "执行 ADB 命令失败", t);
             }
 
+            /*
+             * ══════════════════════════════════════════════════════════
+             * **重启后重新下发用户配置的遮罩**（2026-11-12 修）
+             * ══════════════════════════════════════════════════════════
+             *
+             * 问题：地图投屏会把 dcapd2.layer 强制改成 1920×532 全屏
+             * （见 MapCastService 里"地图投屏遮罩已强制全屏"那段）。
+             * 之后切回普通投屏，这一行只 `pkill` 重启 dcapd2，
+             * **不重写 layer 文件** —— 于是普通投屏继承了地图投屏留下的
+             * 全屏遮罩，用户自己在界面上设的 1280×532 被无视了。
+             *
+             * 实测症状：
+             *   prefs 里 layer_w=1280 / layer_x=320（用户设置）
+             *   但 dcapd2.layer 是 w=1920 / x=0（地图投屏残留）
+             *   → 普通投屏画面铺满全屏，不是用户要的尺寸
+             *
+             * 修法：pkill 之后、dcapd2 读配置之前，把 prefs 里的用户配置
+             * 重新 push 一次。LayerConfig.push() 内部有线程检查，
+             * 这里在 worker 线程，可以直接调。
+             *
+             * 注意顺序：必须在 exec(cmd) 之后（避免和 pkill 抢），
+             * 但要在 dcapd2 首次读 layer 文件之前（它启动时读一次）。
+             * 实测 dcapd2 起来要 1~2 秒，这里紧跟 exec 落盘来得及。
+             */
+            try {
+                LayerConfig lcUser = LayerConfig.loadFromPrefs(ctx, getOutputW(), getOutputH());
+                if (lcUser != null) {
+                    lcUser.push();
+                    DashLog.i(TAG, "普通投屏遮罩已重新下发 → "
+                            + lcUser.x + "," + lcUser.y
+                            + " " + lcUser.w + "x" + lcUser.h
+                            + "（覆盖地图投屏可能留下的全屏值）");
+                }
+            } catch (Throwable t) {
+                DashLog.w(TAG, "重启后下发遮罩失败（不影响投屏）: " + t);
+            }
+
             // 轮询到 3 秒：车机负载高时 dcapd2 起来要一两秒，单次判定会误报失败
             for (int i = 0; i < 8; i++) {
                 sleep(400);

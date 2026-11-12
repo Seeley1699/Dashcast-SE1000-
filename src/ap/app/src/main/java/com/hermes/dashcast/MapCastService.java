@@ -689,11 +689,46 @@ public final class MapCastService {
             try {
                 LayerConfig lc = LayerConfig.loadFromPrefs(appCtx, W, H);
                 if (lc != null) {
+                    /*
+                     * ══════════════════════════════════════════════════
+                     * **地图投屏强制铺满全屏，不跟随遮罩配置**（2026-11-12）
+                     * ══════════════════════════════════════════════════
+                     *
+                     * 需求：地图投屏要铺满整块仪表，不受「遮罩编辑器」影响。
+                     *
+                     * 为什么直接改这里而不动 LayerConfig.loadFromPrefs：
+                     *   那个方法被 MirrorController 调了 6 处（普通投屏的
+                     *   主屏抓取、遮罩下发、预设应用、还原等），改它会把
+                     *   普通投屏的遮罩功能一起改掉 —— 那是硬约束。
+                     *
+                     *   只在 MapCastService（地图投屏专用入口）里覆盖，
+                     *   普通投屏读到的仍是用户自己在界面上调的遮罩。
+                     *
+                     * 覆盖哪些字段：
+                     *   x/y/w/h  → 0,0 1920x532（整块画布）
+                     *   enabled  → true（必须启用，否则 dcapd2 走无遮罩路径）
+                     *   shape    → 矩形（SQUARE），全屏不需要圆角/梯形/椭圆
+                     *   圆角/羽化/梯形/边框 → 全部归零，避免边缘被裁
+                     *
+                     * canvasFill 也置 true：告诉下游「这是铺满状态」，
+                     * 画布尺寸变化时（换 CP 分辨率）能跟着自适应。
+                     */
+                    lc.enabled = true;
+                    lc.x = 0;
+                    lc.y = 0;
+                    lc.w = W;
+                    lc.h = H;
+                    lc.canvasFill = true;
+                    lc.shape = LayerConfig.SHAPE_RECT;
+                    lc.rTl = 0; lc.rTr = 0; lc.rBl = 0; lc.rBr = 0;
+                    lc.trapTop = 0; lc.trapBot = 0;
+                    lc.feather = 0;
+                    lc.border = 0;
+                    lc.fit = 0;
+
                     lc.push();
-                    Log.i(TAG, "已下发遮罩配置（enabled=" + lc.enabled
-                            + " shape=" + lc.shape
-                            + " " + lc.x + "," + lc.y + " " + lc.w + "x" + lc.h
-                            + " 圆角=" + lc.rTl + " 羽化=" + lc.feather + "）");
+                    Log.i(TAG, "地图投屏遮罩已强制全屏（不跟随界面配置）→ "
+                            + lc.x + "," + lc.y + " " + lc.w + "x" + lc.h);
                 }
             } catch (Throwable t) {
                 Log.w(TAG, "下发遮罩配置失败（不影响投屏）: " + t);
