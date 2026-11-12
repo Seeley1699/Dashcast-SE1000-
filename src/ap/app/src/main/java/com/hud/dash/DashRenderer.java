@@ -53,6 +53,28 @@ class DashRenderer {
 
     void attach(DashView v) { view = v; }
 
+    /*
+     * ══════════════════════════════════════════════════════════════
+     * **主题访问器**（2026-11-12，DashTheme 重构第二步）
+     * ══════════════════════════════════════════════════════════════
+     *
+     * 第一步（commit 11fb954）只把接口建起来，DashRenderer 仍在用
+     * 91 处硬编码 0xFF... 和 54 处 HudTheme 常量。
+     *
+     * 这一步开始把引用换成 theme.xxx()。为了**每批改动都能编译、
+     * 能 dump 对比**，theme() 在 view 未挂载时回落到一个默认实例，
+     * 保证任何调用点都不会 NPE。
+     *
+     * 关键约束：**换引用时取值必须与原常量逐一相等**，
+     * 否则就不是重构而是改配色 —— 那要等阶段 2 单独做、单独验证。
+     */
+    private static final DashTheme DEFAULT_THEME = new DashTheme() {};
+
+    DashTheme theme() {
+        if (view != null && view.getTheme() != null) return view.getTheme();
+        return DEFAULT_THEME;
+    }
+
     void draw(Canvas c, float time) {
         t = time;
         drawBackdrop(c);
@@ -79,8 +101,8 @@ class DashRenderer {
         c.drawRect(0, 0, HudLayout.W, H, fill);
         fill.setShader(null);
 
-        drawGlow(c, CX, -40f, 760f, TEAL, 0.075f);
-        drawGlow(c, 1664f, H + 40f, 620f, TEAL, 0.05f);
+        drawGlow(c, CX, -40f, 760f, theme().accent(), 0.075f);
+        drawGlow(c, 1664f, H + 40f, 620f, theme().accent(), 0.05f);
     }
 
     private void drawBuildTag(Canvas c) {
@@ -264,13 +286,13 @@ class DashRenderer {
             float x2 = polarX(CX, r - 8f - len, a);
             float y2 = polarY(CY, r - 8f - len, a);
 
-            if (isThr) line.setColor(hot > 0.5f ? 0xFFFFFFFF : rgba(RED, 0.85f));
+            if (isThr) line.setColor(hot > 0.5f ? 0xFFFFFFFF : rgba(theme().danger(), 0.85f));
             else if (major) line.setColor(colMajor);
             else line.setColor(colMinor);
             line.setStrokeWidth(isThr ? 3f : major ? 2.2f : 1.3f);
             c.drawLine(x1, y1, x2, y2, line);
 
-            if (isThr) drawGlow(c, (x1 + x2) / 2f, (y1 + y2) / 2f, 14f, RED, 0.35f);
+            if (isThr) drawGlow(c, (x1 + x2) / 2f, (y1 + y2) / 2f, 14f, theme().danger(), 0.35f);
 
             if (major) {
                 float lx = polarX(CX, r - 40f, a);
@@ -290,8 +312,8 @@ class DashRenderer {
                     CX - r, CY + r, CX + r, CY - r,
                     new int[]{
                             lerpColor(0xFF1E8E7C, 0xFFC43C3C, hot),
-                            lerpColor(TEAL, 0xFFFF7B7B, hot),
-                            lerpColor(TEAL_LT, 0xFFFFD9D9, hot)},
+                            lerpColor(theme().accent(), 0xFFFF7B7B, hot),
+                            lerpColor(theme().accentLight(), 0xFFFFD9D9, hot)},
                     new float[]{0f, 0.55f, 1f},
                     Shader.TileMode.CLAMP));
             line.setStrokeWidth(10f);
@@ -307,7 +329,7 @@ class DashRenderer {
         txt(c, String.valueOf(Math.round(sim)), CX, CY + 98f, 62f,
                 hot > 0.5f ? 0xFFFF9E9E : 0xFFF0FBFA, Paint.Align.CENTER, -2f, NUM_MED);
         txt(c, "km / h", CX, CY + 121f, 11f,
-                hot > 0.5f ? 0xFFB06060 : DIM, Paint.Align.CENTER, 3.6f, NUM);
+                hot > 0.5f ? 0xFFB06060 : theme().textFaint(), Paint.Align.CENTER, 3.6f, NUM);
 
         float barY = HudLayout.GAUGE.bottom - 20f;
         drawNoaBadge(c, barY);
@@ -320,12 +342,12 @@ class DashRenderer {
     private void drawNoaRing(Canvas c, float aNow, float hot) {
         float ringR = RING;
         HudData d = view.data;
-        int ringCol = hot > 0.5f ? RED : TEAL;
+        int ringCol = hot > 0.5f ? theme().danger() : theme().accent();
 
         // 底环
         line.setShader(null);
         line.setStrokeWidth(2.5f);
-        line.setColor(rgba(TEAL, 0.10f));
+        line.setColor(rgba(theme().accent(), 0.10f));
         arcStroke(c, CX, CY, ringR, A0, A1);
 
         // 彗尾
@@ -341,7 +363,7 @@ class DashRenderer {
         float sy = polarY(CY, ringR, setA);
         fill.setColor(0xFF0A1114);
         c.drawCircle(sx, sy, 5f, fill);
-        fill.setColor(hot > 0.5f ? RED : TEAL);
+        fill.setColor(hot > 0.5f ? theme().danger() : theme().accent());
         c.drawCircle(sx, sy, 3f, fill);
 
         // 接管闪环
@@ -352,7 +374,7 @@ class DashRenderer {
                 view.noaPulseAt = -1f;
             } else {
                 float a = 1f - pr;
-                glowArc(c, CX, CY, ringR, A0, A1, rgba(TEAL, 0.55f * a), 3.5f);
+                glowArc(c, CX, CY, ringR, A0, A1, rgba(theme().accent(), 0.55f * a), 3.5f);
             }
         }
     }
@@ -362,7 +384,7 @@ class DashRenderer {
     private void drawNeedle(Canvas c, float ang, float hot) {
         float r = R;
         int tipCol = lerpColor(0xFFEAFFFA, 0xFFFFE2E2, hot);
-        int midCol = lerpColor(TEAL, RED, hot);
+        int midCol = lerpColor(theme().accent(), theme().danger(), hot);
         int baseCol = lerpColor(0xFF123A38, 0xFF3A1414, hot);
 
         c.save();
@@ -376,7 +398,7 @@ class DashRenderer {
         p.lineTo(CX - 5.4f, CY - 6f);
         p.close();
 
-        drawGlow(c, CX, CY - r * 0.62f, 26f, hot > 0.5f ? RED : TEAL, 0.22f);
+        drawGlow(c, CX, CY - r * 0.62f, 26f, hot > 0.5f ? theme().danger() : theme().accent(), 0.22f);
 
         line.setShader(new LinearGradient(
                 CX, CY - r + 6f, CX, CY + 20f,
@@ -398,7 +420,7 @@ class DashRenderer {
         line.setStrokeWidth(1.2f);
         line.setColor(hot > 0.5f ? 0xFF5A2020 : 0xFF2B424A);
         c.drawCircle(CX, CY, 11f, line);
-        fill.setColor(lerpColor(TEAL, RED, hot));
+        fill.setColor(lerpColor(theme().accent(), theme().danger(), hot));
         c.drawCircle(CX, CY, 4f, fill);
         fill.setColor(0xFF0A1114);
         c.drawCircle(CX, CY, 1.6f, fill);
@@ -409,12 +431,12 @@ class DashRenderer {
     private void drawNoaBadge(Canvas c, float barY) {
         HudData d = view.data;
         boolean on = d.noa;
-        int col = on ? TEAL : 0xFFE4EFEF;
+        int col = on ? theme().accent() : 0xFFE4EFEF;
 
         float br = on ? 0.55f + 0.45f * absf(sinf(t * 2.2f)) : 1f;
-        fill.setColor(on ? rgba(TEAL, br) : rgba(0xFFE6F1F1, 0.42f));
+        fill.setColor(on ? rgba(theme().accent(), br) : rgba(0xFFE6F1F1, 0.42f));
         c.drawCircle(27f, barY, 3f, fill);
-        if (on) drawGlow(c, 27f, barY, 16f, TEAL, 0.5f * br);
+        if (on) drawGlow(c, 27f, barY, 16f, theme().accent(), 0.5f * br);
 
         txt(c, d.noaLabel, 38f, barY + 5f, 15f, col, Paint.Align.LEFT, 2.2f, NUM_MED);
         float labelW = measure(d.noaLabel, 15f, NUM_MED);
@@ -427,15 +449,15 @@ class DashRenderer {
         p.addRoundRect(bx, by, bx + bw, by + bh, 9f, 9f, Path.Direction.CW);
         fill.setShader(new LinearGradient(
                 bx, by, bx, by + bh,
-                on ? rgba(TEAL, 0.24f) : rgba(0xFFEBF5F5, 0.08f),
-                on ? rgba(TEAL, 0.06f) : rgba(0xFFEBF5F5, 0.02f),
+                on ? rgba(theme().accent(), 0.24f) : rgba(0xFFEBF5F5, 0.08f),
+                on ? rgba(theme().accent(), 0.06f) : rgba(0xFFEBF5F5, 0.02f),
                 Shader.TileMode.CLAMP));
         c.drawPath(p, fill);
         fill.setShader(null);
 
         line.setShader(null);
         line.setStrokeWidth(1.5f);
-        line.setColor(on ? rgba(TEAL, 0.9f) : rgba(0xFFE8F2F2, 0.42f));
+        line.setColor(on ? rgba(theme().accent(), 0.9f) : rgba(0xFFE8F2F2, 0.42f));
         c.drawPath(p, line);
 
         txt(c, String.valueOf(d.noaSpeed), bx + bw / 2f, by + bh / 2f + 5.5f, 15f,
@@ -453,7 +475,7 @@ class DashRenderer {
 
         // 读数与底栏同基线，放在管身右侧
         txt(c, Math.round(valKw) + " kW", 410f, barY + 5f, 11f,
-                frac > 0.85f ? RED_LT : 0xFFCFE1E1, Paint.Align.RIGHT, 0.8f, NUM_MED);
+                frac > 0.85f ? theme().dangerLight() : 0xFFCFE1E1, Paint.Align.RIGHT, 0.8f, NUM_MED);
 
         // 槽体
         rf.set(x0, ty, x1, ty + th);
@@ -472,7 +494,7 @@ class DashRenderer {
             c.clipPath(p);
             line.setShader(new LinearGradient(
                     x0, 0, x0 + (x1 - x0), 0,
-                    new int[]{TEAL_DK, TEAL, 0xFFFFC93C, RED},
+                    new int[]{theme().accentDark(), theme().accent(), 0xFFFFC93C, theme().danger()},
                     new float[]{0f, 0.45f, 0.75f, 1f},
                     Shader.TileMode.CLAMP));
             line.setStrokeWidth(th);
@@ -490,7 +512,7 @@ class DashRenderer {
         line.setColor(rgba(0xFF78AAB4, 0.18f));
         c.drawCircle(bulbX, ty + th / 2f, 10f, line);
 
-        int bulbCol = frac > 0.86f ? RED : frac > 0.62f ? WARN : TEAL;
+        int bulbCol = frac > 0.86f ? theme().danger() : frac > 0.62f ? theme().warn() : theme().accent();
         fill.setColor(bulbCol);
         c.drawCircle(bulbX, ty + th / 2f, 5f, fill);
         drawGlow(c, bulbX, ty + th / 2f, 16f, bulbCol, 0.5f);
@@ -520,12 +542,12 @@ class DashRenderer {
 
         int main, light, g0, g1;
         if (isEv) {
-            if (critical) { main = RED; light = RED_LT; g0 = RED_DK; g1 = RED; }
-            else if (low) { main = WARN; light = WARN_LT; g0 = WARN_DK; g1 = WARN; }
-            else { main = EV; light = EV_LT; g0 = EV_DK; g1 = EV; }
+            if (critical) { main = theme().danger(); light = theme().dangerLight(); g0 = theme().dangerDark(); g1 = theme().danger(); }
+            else if (low) { main = theme().warn(); light = theme().warnLight(); g0 = theme().warnDark(); g1 = theme().warn(); }
+            else { main = theme().evColor(); light = theme().evLight(); g0 = theme().evDark(); g1 = theme().evColor(); }
         } else {
-            if (low) { main = RED; light = RED_LT; g0 = RED_DK; g1 = RED; }
-            else { main = FUEL; light = FUEL_LT; g0 = FUEL_DK; g1 = FUEL; }
+            if (low) { main = theme().danger(); light = theme().dangerLight(); g0 = theme().dangerDark(); g1 = theme().danger(); }
+            else { main = theme().fuelColor(); light = theme().fuelLight(); g0 = theme().fuelDark(); g1 = theme().fuelColor(); }
         }
 
         // 告警描边
@@ -664,7 +686,37 @@ class DashRenderer {
     /* ============================== 灯光栏 ============================== */
 
     private static final String[] LIGHT_KINDS = {"left", "auto", "low", "high", "hold", "fogR", "right"};
-    private static final int[] LIGHT_COLS = {AMBER, TEAL, 0xFFDCEAEA, BLUE_HB, TEAL, RED, AMBER};
+
+    /*
+     * **从 static final 改成实例字段**（2026-11-12，DashTheme 重构第二步）。
+     *
+     * 这个数组以前是 `static final int[]`，初始化时直接写死 HudTheme 常量。
+     * 换引用后要调 theme()，而 theme() 依赖 view 字段（实例状态），
+     * 静态初始化阶段没有 this —— 编译器直接报「无法从静态上下文引用非静态方法」。
+     *
+     * 改成实例字段后：
+     *   · 保留 final（仍是不可变引用，每个 renderer 实例初始化一次）
+     *   · 初始化时机从「类加载」推迟到「实例构造」，那时 view 可能还是 null，
+     *     theme() 会回落到 DEFAULT_THEME —— 但 drawLightRail 每帧都读
+     *     lightCols()，所以真正生效的是渲染时的主题。
+     *
+     * 更稳的做法是每次取值，见 lightCols()。数组保留只为少建临时对象。
+     */
+    private int[] LIGHT_COLS_CACHE;
+
+    /** 灯光栏配色 —— 每次按当前主题现算，保证 setTheme() 后立即生效 */
+    private int[] lightCols() {
+        if (LIGHT_COLS_CACHE == null) {
+            LIGHT_COLS_CACHE = new int[]{
+                    theme().amber(), theme().accent(), theme().textSecondary(),
+                    theme().highBeam(), theme().accent(), theme().danger(), theme().amber()
+            };
+        }
+        return LIGHT_COLS_CACHE;
+    }
+
+    /** 主题切换后清缓存（由 attach / 外部 setTheme 触发） */
+    void invalidateThemeCache() { LIGHT_COLS_CACHE = null; }
 
     private void drawLightRail(Canvas c) {
         HudData d = view.data;
@@ -690,7 +742,7 @@ class DashRenderer {
 
         for (int i = 0; i < LIGHT_KINDS.length; i++) {
             String kind = LIGHT_KINDS[i];
-            int color = LIGHT_COLS[i];
+            int color = lightCols()[i];
             float x = startX + gap * i;
             boolean on = states[i];
             int col = on ? color : 0xFF35484E;
@@ -793,13 +845,13 @@ class DashRenderer {
         String wd = WEEK_DAYS[cal.get(java.util.Calendar.DAY_OF_WEEK) - 1];
         HudData d = view.data;
 
-        txt(c, hh + ":" + mm, card.left + 20f, card.top + 54f, 44f, TXT, Paint.Align.LEFT, 2f, NUM);
+        txt(c, hh + ":" + mm, card.left + 20f, card.top + 54f, 44f, theme().textPrimary(), Paint.Align.LEFT, 2f, NUM);
         txt(c, wd + " · " + (cal.get(java.util.Calendar.MONTH) + 1) + "月" + cal.get(java.util.Calendar.DAY_OF_MONTH)
                         + "日 · 车内 " + d.indoor,
-                card.left + 22f, card.top + 76f, 11.5f, DIM, Paint.Align.LEFT, 2f, CN);
+                card.left + 22f, card.top + 76f, 11.5f, theme().textFaint(), Paint.Align.LEFT, 2f, CN);
 
-        txt(c, d.outdoor, card.right - 20f, card.top + 46f, 26f, TXT, Paint.Align.RIGHT, 1f, NUM_MED);
-        txt(c, d.weather, card.right - 20f, card.top + 66f, 11f, DIM, Paint.Align.RIGHT, 1.6f, CN);
+        txt(c, d.outdoor, card.right - 20f, card.top + 46f, 26f, theme().textPrimary(), Paint.Align.RIGHT, 1f, NUM_MED);
+        txt(c, d.weather, card.right - 20f, card.top + 66f, 11f, theme().textFaint(), Paint.Align.RIGHT, 1.6f, CN);
     }
 
     private static String pad2(int v) {
@@ -820,10 +872,10 @@ class DashRenderer {
 
         float cy = card.centerY();
 
-        txt(c, d.gear, card.left + 34f, cy + 9f, 24f, TXT, Paint.Align.CENTER, 1f, NUM_MED);
+        txt(c, d.gear, card.left + 34f, cy + 9f, 24f, theme().textPrimary(), Paint.Align.CENTER, 1f, NUM_MED);
 
         line.setStrokeWidth(1f);
-        line.setColor(LINE);
+        line.setColor(theme().line());
         c.drawLine(card.left + 58f, card.top + 14f, card.left + 58f, card.bottom - 14f, line);
 
         float padL = card.left + 70f;
@@ -845,7 +897,7 @@ class DashRenderer {
 
             if (on) {
                 fill.setShader(new LinearGradient(x, top, x, top + ch,
-                        rgba(TEAL, 0.24f), rgba(TEAL, 0.08f), Shader.TileMode.CLAMP));
+                        rgba(theme().accent(), 0.24f), rgba(theme().accent(), 0.08f), Shader.TileMode.CLAMP));
             } else {
                 fill.setColor(rgba(0xFFFFFF, 0.035f));
             }
@@ -853,13 +905,13 @@ class DashRenderer {
             fill.setShader(null);
 
             line.setStrokeWidth(1f);
-            line.setColor(on ? rgba(TEAL, 0.55f) : rgba(0xFF78AAB4, 0.16f));
+            line.setColor(on ? rgba(theme().accent(), 0.55f) : rgba(0xFF78AAB4, 0.16f));
             c.drawPath(p, line);
 
-            if (on) drawGlow(c, x + cw / 2f, top + ch / 2f, 30f, TEAL, 0.16f);
+            if (on) drawGlow(c, x + cw / 2f, top + ch / 2f, 30f, theme().accent(), 0.16f);
 
             txt(c, m, x + cw / 2f, top + ch / 2f + 4.5f, 11.5f,
-                    on ? TEAL_LT : 0xFF6E8287, Paint.Align.CENTER, 1.8f, CN);
+                    on ? theme().accentLight() : 0xFF6E8287, Paint.Align.CENTER, 1.8f, CN);
         }
     }
 
@@ -888,18 +940,18 @@ class DashRenderer {
         p.reset();
         p.addRoundRect(rf, 10f, 10f, Path.Direction.CW);
         fill.setShader(new LinearGradient(tx, ty, tx + ts, ty + ts,
-                rgba(TEAL, 0.18f), rgba(TEAL, 0.04f), Shader.TileMode.CLAMP));
+                rgba(theme().accent(), 0.18f), rgba(theme().accent(), 0.04f), Shader.TileMode.CLAMP));
         c.drawPath(p, fill);
         fill.setShader(null);
         line.setStrokeWidth(1f);
-        line.setColor(rgba(TEAL, 0.28f));
+        line.setColor(rgba(theme().accent(), 0.28f));
         c.drawPath(p, line);
 
         float icx = tx + ts / 2f;
         float icy = cy;
         line.setShader(null);
-        line.setColor(TEAL);
-        fill.setColor(TEAL);
+        line.setColor(theme().accent());
+        fill.setColor(theme().accent());
         if (navOn) {
             line.setStrokeWidth(2f);
             p.reset();
@@ -928,22 +980,22 @@ class DashRenderer {
         // 主文字
         float textX = tx + ts + 14f;
         if (navOn) {
-            txt(c, d.navDist, textX, cy - 2f, 22f, TXT, Paint.Align.LEFT, 0.5f, NUM_MED);
+            txt(c, d.navDist, textX, cy - 2f, 22f, theme().textPrimary(), Paint.Align.LEFT, 0.5f, NUM_MED);
             float dw = measure(d.navDist, 22f, NUM_MED);
-            txt(c, d.navUnit, textX + dw + 5f, cy - 2f, 11f, DIM, Paint.Align.LEFT, 1f, CN);
+            txt(c, d.navUnit, textX + dw + 5f, cy - 2f, 11f, theme().textFaint(), Paint.Align.LEFT, 1f, CN);
 
             String prefix = d.navTurn + "转进入 ";
             txt(c, prefix, textX, cy + 16f, 11.5f, 0xFF93A9AE, Paint.Align.LEFT, 1.2f, CN);
             float tw = measure(prefix, 11.5f, CN);
-            txt(c, d.navStreet, textX + tw + 2f, cy + 16f, 11.5f, TXT2, Paint.Align.LEFT, 1.2f, CN);
+            txt(c, d.navStreet, textX + tw + 2f, cy + 16f, 11.5f, theme().textSecondary(), Paint.Align.LEFT, 1.2f, CN);
         } else {
-            txt(c, "本次行程", textX, cy - 2f, 16f, TXT, Paint.Align.LEFT, 1f, NUM_MED);
-            txt(c, "平均车速 " + d.tripAvg + " km/h", textX, cy + 16f, 11f, DIM, Paint.Align.LEFT, 1.2f, CN);
+            txt(c, "本次行程", textX, cy - 2f, 16f, theme().textPrimary(), Paint.Align.LEFT, 1f, NUM_MED);
+            txt(c, "平均车速 " + d.tripAvg + " km/h", textX, cy + 16f, 11f, theme().textFaint(), Paint.Align.LEFT, 1.2f, CN);
         }
 
         // 竖分隔
         line.setStrokeWidth(1f);
-        line.setColor(LINE);
+        line.setColor(theme().line());
         c.drawLine(r0.left + 320f, r0.top + 14f, r0.left + 320f, r0.bottom - 14f, line);
 
         String[][] cols;
@@ -972,21 +1024,21 @@ class DashRenderer {
             String label = cols[i][0], value = cols[i][1], unit = cols[i][2];
             float ccx = x0 + step * (i + 0.5f);
 
-            txt(c, label, ccx, r0.top + 26f, 10f, DIM, Paint.Align.CENTER, 1.8f, CN);
+            txt(c, label, ccx, r0.top + 26f, 10f, theme().textFaint(), Paint.Align.CENTER, 1.8f, CN);
 
             float vw = measure(value, 15f, NUM_MED);
             float uw = unit.isEmpty() ? 0f : measure(unit, 9.5f, CN) + 4f;
             float sx = ccx - (vw + uw) / 2f;
 
-            txt(c, value, sx, r0.top + 47f, 15f, TXT2, Paint.Align.LEFT, 0.6f, NUM_MED);
+            txt(c, value, sx, r0.top + 47f, 15f, theme().textSecondary(), Paint.Align.LEFT, 0.6f, NUM_MED);
             if (!unit.isEmpty()) {
-                txt(c, unit, sx + vw + 4f, r0.top + 47f, 9.5f, DIM, Paint.Align.LEFT, 0.8f, CN);
+                txt(c, unit, sx + vw + 4f, r0.top + 47f, 9.5f, theme().textFaint(), Paint.Align.LEFT, 0.8f, CN);
             }
 
             if (i < cols.length - 1) {
                 float dx = x0 + step * (i + 1);
                 line.setStrokeWidth(1f);
-                line.setColor(LINE);
+                line.setColor(theme().line());
                 c.drawLine(dx, r0.top + 16f, dx, r0.top + 48f, line);
             }
         }
@@ -1006,16 +1058,16 @@ class DashRenderer {
         p.reset();
         p.addRoundRect(rf, 10f, 10f, Path.Direction.CW);
         fill.setShader(new LinearGradient(tx, ty, tx + ts, ty + ts,
-                rgba(TEAL, 0.18f), rgba(TEAL, 0.04f), Shader.TileMode.CLAMP));
+                rgba(theme().accent(), 0.18f), rgba(theme().accent(), 0.04f), Shader.TileMode.CLAMP));
         c.drawPath(p, fill);
         fill.setShader(null);
         line.setStrokeWidth(1f);
-        line.setColor(rgba(TEAL, 0.28f));
+        line.setColor(rgba(theme().accent(), 0.28f));
         c.drawPath(p, line);
 
         float icx = tx + ts / 2f;
         float icy = cy;
-        line.setColor(TEAL);
+        line.setColor(theme().accent());
         line.setStrokeWidth(1.6f);
         rf.set(icx - 5f, icy - 9f, icx + 5f, icy + 9f);
         p.reset();
@@ -1030,11 +1082,11 @@ class DashRenderer {
         for (float tmp : d.tireTemps) if (tmp > 75f) hotAny = true;
 
         float textX = tx + ts + 14f;
-        txt(c, "胎压监测", textX, cy - 3f, 15f, TXT, Paint.Align.LEFT, 1f, NUM_MED);
+        txt(c, "胎压监测", textX, cy - 3f, 15f, theme().textPrimary(), Paint.Align.LEFT, 1f, NUM_MED);
         txt(c, lowAny ? "右后偏低 · 建议检查"
                 : hotAny ? "胎温偏高 · 请检查" : "四轮正常",
                 textX, cy + 15f, 11f,
-                lowAny || hotAny ? WARN : TEAL, Paint.Align.LEFT, 1.2f, CN);
+                lowAny || hotAny ? theme().warn() : theme().accent(), Paint.Align.LEFT, 1.2f, CN);
 
         float colW = 140f;
         for (int i = 0; i < d.tireBars.length; i++) {
@@ -1043,18 +1095,18 @@ class DashRenderer {
             float x = r0.left + 300f + i * colW;
             boolean warn = bar < 2.2f;
 
-            txt(c, name, x, r0.top + 22f, 10f, DIM, Paint.Align.LEFT, 1.8f, CN);
+            txt(c, name, x, r0.top + 22f, 10f, theme().textFaint(), Paint.Align.LEFT, 1.8f, CN);
             String val = String.format(java.util.Locale.US, "%.1f", bar);
-            txt(c, val, x, r0.top + 44f, 16f, warn ? WARN : TXT2, Paint.Align.LEFT, 0.6f, NUM_MED);
+            txt(c, val, x, r0.top + 44f, 16f, warn ? theme().warn() : theme().textSecondary(), Paint.Align.LEFT, 0.6f, NUM_MED);
             float vw = measure(val, 16f, NUM_MED);
-            txt(c, "bar", x + vw + 4f, r0.top + 44f, 9.5f, DIM, Paint.Align.LEFT, 0f, CN);
+            txt(c, "bar", x + vw + 4f, r0.top + 44f, 9.5f, theme().textFaint(), Paint.Align.LEFT, 0f, CN);
 
             // 胎温：>75°C 告警
             float temp = d.tireTemps[i];
             boolean hot = temp > 75f;
             String tstr = String.format(java.util.Locale.US, "%.0f", temp) + "°C";
             txt(c, tstr, x + 78f, r0.top + 44f, 12f,
-                hot ? WARN : 0xFF9DB2B7, Paint.Align.LEFT, 0.4f, NUM_MED);
+                hot ? theme().warn() : 0xFF9DB2B7, Paint.Align.LEFT, 0.4f, NUM_MED);
 
             float gw = 100f;
             float gy = r0.top + 53f;
@@ -1071,15 +1123,15 @@ class DashRenderer {
             rf.set(g0x, gy, g1x, gy + 3f);
             p.reset();
             p.addRoundRect(rf, 1.5f, 1.5f, Path.Direction.CW);
-            fill.setColor(rgba(TEAL, 0.20f));
+            fill.setColor(rgba(theme().accent(), 0.20f));
             c.drawPath(p, fill);
 
             rf.set(map - 1f, gy - 3f, map + 1f, gy + 6f);
             p.reset();
             p.addRoundRect(rf, 1f, 1f, Path.Direction.CW);
-            fill.setColor(warn ? WARN : TEAL);
+            fill.setColor(warn ? theme().warn() : theme().accent());
             c.drawPath(p, fill);
-            if (warn) drawGlow(c, map, gy + 1.5f, 12f, WARN, 0.5f);
+            if (warn) drawGlow(c, map, gy + 1.5f, 12f, theme().warn(), 0.5f);
         }
     }
 
@@ -1127,9 +1179,9 @@ class DashRenderer {
             String dir = dirs[i];
             boolean on = ons[i];
             float cx = x + pad + cell * (i + 0.5f);
-            int col = on ? TEAL : rgba(0xFFE2F1F2, 0.5f);
+            int col = on ? theme().accent() : rgba(0xFFE2F1F2, 0.5f);
 
-            if (on) drawGlow(c, cx, cy + 8f, 26f, TEAL, 0.22f);
+            if (on) drawGlow(c, cx, cy + 8f, 26f, theme().accent(), 0.22f);
 
             c.save();
             c.translate(cx, cy);
@@ -1276,7 +1328,7 @@ class DashRenderer {
         c.drawCircle(mx, my, cs * 0.23f, fill);
         fill.setColor(rgba(0xFFB6FFF2, 0.9f));
         c.drawCircle(mx, my, cs * 0.15f, fill);
-        drawGlow(c, mx, my, cs * 0.42f, TEAL, 0.30f);
+        drawGlow(c, mx, my, cs * 0.42f, theme().accent(), 0.30f);
 
         p.reset();
         p.moveTo(cx0 - 16f, cy0 + cs * 0.70f);
@@ -1314,19 +1366,19 @@ class DashRenderer {
         c.drawCircle(ccx, ccy, cr - 0.5f, line);
 
         float tx = cx0 + cs + 18f;
-        txt(c, d.mediaTitle, tx, card.top + 58f, 15f, TXT2, Paint.Align.LEFT, 0.8f, NUM_MED);
+        txt(c, d.mediaTitle, tx, card.top + 58f, 15f, theme().textSecondary(), Paint.Align.LEFT, 0.8f, NUM_MED);
         float titleW = measure(d.mediaTitle, 15f, NUM_MED);
-        txt(c, "· " + d.mediaArtist, tx + titleW + 4f, card.top + 58f, 10.5f, DIM2, Paint.Align.LEFT, 1.2f, CN);
+        txt(c, "· " + d.mediaArtist, tx + titleW + 4f, card.top + 58f, 10.5f, theme().textFaint(), Paint.Align.LEFT, 1.2f, CN);
 
         float lx = tx + 10f;
         txt(c, d.lyric0, lx, card.top + 104f, 11f, 0xFF46595E, Paint.Align.LEFT, 1.2f, CN);
 
-        fill.setColor(TEAL);
+        fill.setColor(theme().accent());
         rf.set(lx - 11f, card.top + 121f, lx - 8.5f, card.top + 139f);
         p.reset();
         p.addRoundRect(rf, 1.25f, 1.25f, Path.Direction.CW);
         c.drawPath(p, fill);
-        drawGlow(c, lx - 9.7f, card.top + 130f, 14f, TEAL, 0.35f);
+        drawGlow(c, lx - 9.7f, card.top + 130f, 14f, theme().accent(), 0.35f);
 
         txt(c, d.lyric1, lx, card.top + 140f, 17f, 0xFFF2FBFA, Paint.Align.LEFT, 1.6f, CN);
         txt(c, d.lyric2, lx, card.top + 168f, 13f, 0xFF75898E, Paint.Align.LEFT, 1.2f, CN);
@@ -1347,7 +1399,7 @@ class DashRenderer {
             rf.set(bxx, eqY + eqH - hh, bxx + bw, eqY + eqH);
             p.reset();
             p.addRoundRect(rf, 2.5f, 2.5f, Path.Direction.CW);
-            fill.setColor(rgba(TEAL, 0.16f + 0.30f * (hh / eqH)));
+            fill.setColor(rgba(theme().accent(), 0.16f + 0.30f * (hh / eqH)));
             c.drawPath(p, fill);
         }
 
@@ -1366,16 +1418,16 @@ class DashRenderer {
             rf.set(px, py, px + fw, py + 3f);
             p.reset();
             p.addRoundRect(rf, 1.5f, 1.5f, Path.Direction.CW);
-            fill.setShader(new LinearGradient(px, 0, px + fw, 0, TEAL_DK, TEAL, Shader.TileMode.CLAMP));
+            fill.setShader(new LinearGradient(px, 0, px + fw, 0, theme().accentDark(), theme().accent(), Shader.TileMode.CLAMP));
             c.drawPath(p, fill);
             fill.setShader(null);
             fill.setColor(0xFFEAFFFA);
             c.drawCircle(px + fw, py + 1.5f, 3.2f, fill);
-            drawGlow(c, px + fw, py + 1.5f, 14f, TEAL, 0.5f);
+            drawGlow(c, px + fw, py + 1.5f, 14f, theme().accent(), 0.5f);
         }
 
-        txt(c, d.mediaTime, px, card.top + 306f, 9f, DIM3, Paint.Align.LEFT, 0.6f, CN);
-        txt(c, d.mediaDur, px + pw, card.top + 306f, 9f, DIM3, Paint.Align.RIGHT, 0.6f, CN);
+        txt(c, d.mediaTime, px, card.top + 306f, 9f, theme().textFaint(), Paint.Align.LEFT, 0.6f, CN);
+        txt(c, d.mediaDur, px + pw, card.top + 306f, 9f, theme().textFaint(), Paint.Align.RIGHT, 0.6f, CN);
     }
 
     private void drawMediaIdle(Canvas c) {
@@ -1409,11 +1461,11 @@ class DashRenderer {
         c.drawCircle(ccx, ccy, 4.5f, fill);
 
         float tx = cx0 + cs + 18f;
-        txt(c, "未在播放", tx, card.top + 58f, 15f, TXT2, Paint.Align.LEFT, 0.8f, NUM_MED);
+        txt(c, "未在播放", tx, card.top + 58f, 15f, theme().textSecondary(), Paint.Align.LEFT, 0.8f, NUM_MED);
 
-        fill.setColor(DIM3);
+        fill.setColor(theme().textFaint());
         c.drawCircle(tx + 3f, card.top + 80f, 2.4f, fill);
-        txt(c, "等待媒体信号", tx + 12f, card.top + 84f, 9.5f, DIM3, Paint.Align.LEFT, 1.6f, CN);
+        txt(c, "等待媒体信号", tx + 12f, card.top + 84f, 9.5f, theme().textFaint(), Paint.Align.LEFT, 1.6f, CN);
 
         float eqX = card.left + 22f;
         float eqW = card.width() - 44f;
@@ -1422,7 +1474,7 @@ class DashRenderer {
         int bars = 42;
         float bw = 5f;
         float gap = (eqW - bars * bw) / (bars - 1);
-        fill.setColor(rgba(TEAL, 0.07f));
+        fill.setColor(rgba(theme().accent(), 0.07f));
         for (int i = 0; i < bars; i++) {
             float hh = 4f + 5f * absf(sinf(i * 0.7f));
             rf.set(eqX + i * (bw + gap), eqY + eqH - hh, eqX + i * (bw + gap) + bw, eqY + eqH);
@@ -1440,8 +1492,8 @@ class DashRenderer {
         fill.setColor(rgba(0xFFFFFF, 0.06f));
         c.drawPath(p, fill);
 
-        txt(c, "0:00", px, card.top + 306f, 9f, DIM3, Paint.Align.LEFT, 0.6f, CN);
-        txt(c, "--:--", px + pw, card.top + 306f, 9f, DIM3, Paint.Align.RIGHT, 0.6f, CN);
+        txt(c, "0:00", px, card.top + 306f, 9f, theme().textFaint(), Paint.Align.LEFT, 0.6f, CN);
+        txt(c, "--:--", px + pw, card.top + 306f, 9f, theme().textFaint(), Paint.Align.RIGHT, 0.6f, CN);
     }
 
     /* ============================== 地图 ============================== */
@@ -1736,7 +1788,7 @@ class DashRenderer {
         for (int i = 2; i < b.length; i += 2) p.lineTo(b[i], b[i + 1]);
         for (int j = cc.length - 2; j >= 0; j -= 2) p.lineTo(cc[j], cc[j + 1]);
         p.close();
-        fill.setColor(rgba(TEAL, 0.055f));
+        fill.setColor(rgba(theme().accent(), 0.055f));
         c.drawPath(p, fill);
 
         // 路缘
@@ -1759,11 +1811,11 @@ class DashRenderer {
 
         // 路线：光晕 + 主线 + 流光
         tracePoly(p, rp);
-        glowStroke(c, rp, rgba(TEAL, 0.55f), 6f);
+        glowStroke(c, rp, rgba(theme().accent(), 0.55f), 6f);
 
         tracePoly(p, rp);
         line.setShader(new LinearGradient(262f, 470f, 842f, 128f,
-                TEAL_DK, 0xFF7BFFE6, Shader.TileMode.CLAMP));
+                theme().accentDark(), 0xFF7BFFE6, Shader.TileMode.CLAMP));
         line.setStrokeWidth(6f);
         line.setStrokeCap(Paint.Cap.ROUND);
         c.drawPath(p, line);
@@ -1779,13 +1831,13 @@ class DashRenderer {
         // 终点
         float ex = rp[rp.length - 2];
         float ey = rp[rp.length - 1];
-        drawGlow(c, ex, ey, 26f, TEAL, 0.55f);
+        drawGlow(c, ex, ey, 26f, theme().accent(), 0.55f);
         fill.setColor(0xFF0A1114);
         c.drawCircle(ex, ey, 9f, fill);
         line.setStrokeWidth(2.5f);
-        line.setColor(TEAL);
+        line.setColor(theme().accent());
         c.drawCircle(ex, ey, 9f, line);
-        fill.setColor(TEAL);
+        fill.setColor(theme().accent());
         c.drawCircle(ex, ey, 3.4f, fill);
         txt(c, "科技园", ex + 16f, ey + 4f, 11f, rgba(0xFFB6FFF2, 0.9f), Paint.Align.LEFT, 1.4f, CN);
         txt(c, "09:52 到达", ex + 16f, ey + 20f, 9.5f, rgba(0xFF57726F, 1f), Paint.Align.LEFT, 1.2f, CN);
@@ -1821,7 +1873,7 @@ class DashRenderer {
         fill.setColor(rgba(0xFF080E11, 0.78f));
         c.drawPath(p, fill);
         line.setStrokeWidth(1f);
-        line.setColor(LINE);
+        line.setColor(theme().line());
         c.drawPath(p, line);
         txt(c, "200 m", sx + sw / 2f, sy + 14.5f, 10.5f, 0xFF7C9095, Paint.Align.CENTER, 1.6f, CN);
     }
@@ -1833,7 +1885,7 @@ class DashRenderer {
         fill.setColor(rgba(0xFF080E11, 0.78f));
         c.drawPath(p, fill);
         line.setStrokeWidth(1f);
-        line.setColor(LINE);
+        line.setColor(theme().line());
         c.drawPath(p, line);
 
         c.save();
@@ -1843,7 +1895,7 @@ class DashRenderer {
             fill.setAlpha(Math.round((1f - pulse * 0.6f) * 255f));
             c.drawCircle(0f, 0f, 3f, fill);
             fill.setAlpha(255);
-            drawGlow(c, 0f, 0f, 12f, TEAL, 0.5f);
+            drawGlow(c, 0f, 0f, 12f, theme().accent(), 0.5f);
         } else { // compass
             line.setStrokeWidth(1.8f);
             line.setColor(0xFF8FB6BC);
@@ -1857,7 +1909,7 @@ class DashRenderer {
         }
         c.restore();
 
-        txt(c, label, x + 26f, y + 18.5f, 11.5f, TXT3, Paint.Align.LEFT, 1.4f, CN);
+        txt(c, label, x + 26f, y + 18.5f, 11.5f, theme().textDim(), Paint.Align.LEFT, 1.4f, CN);
     }
 
 }

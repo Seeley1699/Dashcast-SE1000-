@@ -299,3 +299,77 @@ dependencies {
 ---
 
 **核心结论**：app 模块**没有任何自动化测试**。所有质量保证依赖「编译通过 + 真机截图 + 人工确认」。落地 TDD 的第一步不是写功能，而是**先建测试骨架 + 给 `LayerConfig` 写特征测试**。
+
+---
+
+## 10. 构建环境（2026-11-12 实测补充）
+
+### 必须用 JDK 21，不能用 JDK 25
+
+```
+JAVA_HOME = E:\sdk\jbr          →  OpenJDK 25.0.3
+AGP       = 8.5.2                →  官方支持 JDK 17-21
+```
+
+症状：AGP 把 JDK 版本号 `25.0.3` 当成 `compileSdkVersion` 解析，报
+
+```
+> 25.0.3
+> compileSdkVersion is not specified. Please add it to build.gradle
+```
+
+**而 `evccapi-client/build.gradle.kts` 里明明写了 `compileSdk = 36`** —— 这个报错有极强误导性，
+会让人以为是模块配置缺失，实际是 JDK 版本不兼容。
+
+正确做法：
+
+```powershell
+$env:JAVA_HOME = 'C:\Users\94790\.jdks\jbr-21.0.11'
+```
+
+验证：`& "$env:JAVA_HOME\bin\java.exe" -version` → `openjdk 21.0.11`
+
+### 完整构建命令
+
+```powershell
+$env:JAVA_HOME='C:\Users\94790\.jdks\jbr-21.0.11'
+$gradle='C:\Users\94790\.gradle\wrapper\dists\gradle-8.7-bin\bhs2wmbdwecv87pi65oeuq5iu\gradle-8.7\bin\gradle.bat'
+Push-Location 'src\ap'
+& $gradle --offline --console=plain --no-daemon assembleDebug
+Pop-Location
+```
+
+---
+
+## 11. 仪表视觉基线工具
+
+### tools/dump-dash.ps1
+
+Dump `DashRenderer` 的**原始渲染**（示意路网）为 PNG，不经过 dcapd2/CP。
+
+```powershell
+# 注意：本机 ExecutionPolicy 禁止直接运行 .ps1，
+# 且本环境无 pwsh（Windows PowerShell only），需用 Invoke-Expression：
+$code = Get-Content tools\dump-dash.ps1 -Raw -Encoding UTF8
+$code = $code -replace '(?s)<#.*?#>', ''
+$code = $code -replace '(?s)param\s*\(.*?\)\s*\n', "`$Device='192.168.10.209:5555'; `$OutFile='out.png'; `$Pkg='com.hermes.dashcast'; `$Activity='.DashDumpActivity'; `$Tag='DashPerf'; `$WaitSec=14`n"
+Invoke-Expression $code
+```
+
+**两个必须知道的坑**：
+
+1. **必须 `logcat -d -v long`**。默认格式按 ~4KB 截断行，3000 字符的 base64 行会被切断
+   → 拼接长度不符 → PNG 无法解码（实测 363000 vs 398952）。
+
+2. **必须只取最后一份 dump 块**。缓冲区可能残留多条 `PNG_B64_BEGIN..END`，
+   全量拼接会翻倍（实测 798876 = 399952 × 2）。脚本已用
+   `PNG_B64_BEGIN(...)....PNG_B64_END` 正则切块并取最后一个。
+
+### 与 dashboard-shot.ps1 的分工
+
+| 工具 | 抓什么 | 用途 |
+|---|---|---|
+| `tools/dump-dash.ps1` | DashRenderer 原始输出（示意路网，深色） | 验证**渲染层**改动 |
+| `tools/dashboard-shot.ps1` | CP 侧仪表最终像素（含真地图，浅色） | 验证**链路层** |
+
+**两者都要**。渲染层改完先用 dump-dash 确认，再投屏用 dashboard-shot 确认端到端。
