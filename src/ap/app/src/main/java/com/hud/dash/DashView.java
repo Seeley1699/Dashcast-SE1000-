@@ -15,6 +15,25 @@ public class DashView extends View {
     public static final String BUILD_ID = "J20261110.1";
 
     public final HudData data = new HudData();
+
+    /*
+     * ── 可插拔的主题与皮肤（2026-11-12）──────────────────────────
+     *
+     * 默认值 = 改造前那套（经典皮肤 + 青绿主题），所以行为完全不变。
+     *
+     * 换配色：
+     *   view.setTheme(new ClassicTheme());      // 只换颜色/字体/圆角
+     *
+     * 换整套界面：
+     *   view.setSkin(new MySkin());             // 重画整个仪表
+     *
+     * 两者正交：一个 Skin 可以配任意 Theme。
+     * 详见 DashTheme.java / DashSkin.java 的注释。
+     */
+    private DashTheme theme = new TealTheme();
+    private DashSkin skin;
+
+    /** 老的绘制内核。只有 ClassicSkin 需要它（Skin 内部会转发过来） */
     private final DashRenderer rd = new DashRenderer();
 
     /** 演示用：跟随内置模拟车速；接真实数据前置 false */
@@ -77,8 +96,57 @@ public class DashView extends View {
 
     private void init() {
         rd.attach(this);
-        setBackgroundColor(0xFF000000);
+        /*
+         * 默认皮肤 = 经典（老的 DashRenderer 那套）。
+         *
+         * 必须在 init 里建，因为 ClassicSkin 需要绑上 this ——
+         * 它要读 this.data 和 this.autoSpeed，
+         * 并且复用 this.rd（不另 new，见 ClassicSkin 的注释）。
+         */
+        if (skin == null) skin = new ClassicSkin(this);
+        setBackgroundColor(theme.bg());
     }
+
+    /**
+     * 暴露内部渲染器（包内可见）。
+     *
+     * 只给 ClassicSkin 用来复用，别在业务代码里直接调 ——
+     * 想画画就实现 DashSkin。
+     */
+    DashRenderer renderer() { return rd; }
+
+    /* ══════════════ 主题 / 皮肤切换 ══════════════ */
+
+    /** 换配色方案（不动画法） */
+    public void setTheme(DashTheme t) {
+        if (t == null) return;
+        theme = t;
+        setBackgroundColor(theme.bg());
+        invalidate();
+    }
+
+    public DashTheme getTheme() { return theme; }
+
+    /**
+     * 换整套画面画法。
+     *
+     * 传进来的 Skin 会被当作新画法，DashRenderer 不再参与
+     * （除非你传 ClassicSkin，它内部会转发回 DashRenderer）。
+     */
+    public void setSkin(DashSkin s) {
+        if (s == null) return;
+        /*
+         * 新皮肤如果也是 ClassicSkin（或其子类），顺手把宿主绑上 ——
+         * 否则它从 view == null 直接返回，画面会空白。
+         */
+        if (s instanceof ClassicSkin) {
+            ((ClassicSkin) s).bind(this);
+        }
+        skin = s;
+        invalidate();
+    }
+
+    public DashSkin getSkin() { return skin; }
 
     private void step(float dt) {
         t += dt;
@@ -138,7 +206,21 @@ public class DashView extends View {
         canvas.translate(ox, oy);
         canvas.scale(s, s);
         canvas.clipRect(0f, 0f, HudLayout.W, HudLayout.H);
-        rd.draw(canvas, t);
+        /*
+         * **走皮肤接口**（2026-11-12）
+         *
+         * 改造前这里直接是 `rd.draw(canvas, t)`。
+         * 现在统一经 skin.draw —— 默认的 ClassicSkin 内部就是
+         * 转发给 rd.draw(canvas, t)，所以画面完全一致。
+         *
+         * 这样自定义 Skin 只要实现 DashSkin.draw 就能整套替换，
+         * 不需要碰 DashView。
+         */
+        if (skin != null) {
+            skin.draw(canvas, data, theme, t);
+        } else {
+            rd.draw(canvas, t);      /* 兜底：skin 还没建好时走老路径 */
+        }
         canvas.restore();
     }
 }
