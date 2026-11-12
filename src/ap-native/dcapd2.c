@@ -84,6 +84,19 @@ using namespace android;
 #define VDFRAME_MAGIC 0x56444631u   /* 'VDF1'：App 侧 VD 帧的包头 */
 #define CMD_BG        0x47424344u   /* 'DCBG'：4 字节控制命令 —— 立刻停抓主屏 */
 #define CMD_VCROP     0x50564344u   /* 'DCVP'：后台跟随时的源裁剪框（16 字节） */
+/*
+ * 'DCSR'（2026-11-12 恢复）：**主屏抓取区热更新**（16 字节 x,y,w,h）。
+ *
+ * 这段在某次 dcapd2.c 回退中丢失，但 Java 侧 VdMirror 仍在发。
+ * 缺了它 → 收到 DCSR 时落到「非 VDFRAME_MAGIC → return -1」
+ *        → 上层判定"控制通道断开" → 普通投屏的后台跟随失效。
+ *
+ * 与 CMD_VCROP 的区别：
+ *   DCSR  改 g_src_*（主屏抓取路径用，captureScreen 的 crop）
+ *   DCVP  改 g_vd_crop_*（虚拟屏帧路径用，blit 的源矩形）
+ * 两条路径互不干扰，所以必须分成两个命令。
+ */
+#define CMD_SRC       0x52534344u   /* 'DCSR'：主屏抓取区（16 字节） */
 
 /*
  * 后台跟随（VD 源）时的裁剪框 —— 2026-11-03 修「按 HOME 回桌面后截取失效」。
@@ -176,6 +189,18 @@ static int          g_dst_x = 0, g_dst_y = 0, g_dst_w = 0, g_dst_h = 0;
 static int          g_blit_src_w = 0, g_blit_src_h = 0;
 static int          g_cap_w = 0, g_cap_h = 0;   /* 抓帧尺寸，重算映射用 */
 static int          g_src_x = 0, g_src_y = 0, g_src_w = 0, g_src_h = 0;  /* 抓帧内源矩形 */
+/*
+ * 抓取区被 DCSR 改过 → 下一帧必须全量重发（2026-11-12）
+ *
+ * 为什么需要这个全局标志：
+ *   DCSR 在 proxy_read_msg()（行 712 附近）里处理，而 force_full
+ *   是 main() 的局部变量（行 1700+）。前者访问不到后者，所以用
+ *   这个全局中转：proxy_read_msg 置位，main 循环每轮消费。
+ *
+ * 为什么必须全量：prev 缓冲存的是旧抓取区的像素，尺寸一变，
+ * 增量 memcmp 全部对不上，画面会碎成块。
+ */
+static volatile int g_src_dirty = 0;
 
 static int          g_vd_live   = 0;      /* 切到 VD 之后有没有出过"真画面" */
 static int          g_vd_blank  = 0;      /* 连续丢掉的空白帧数 */
@@ -734,6 +759,50 @@ static int proxy_read_msg(void)
              g_px_w, g_px_h);
         g_vd_live = 0;      /* 换了裁剪框，重新等一帧真画面 */
         g_vd_blank = 0;
+        return 2;
+    }
+
+    /*
+     * ══════════════════════════════════════════════════════════════
+     * 'DCSR' + x,y,w,h（16 字节，屏幕坐标）—— **主屏抓取区热更新**
+     * ══════════════════════════════════════════════════════════════
+     *
+     * **2026-11-12 恢复**：这段代码在某次 dcapd2.c 回退中丢失了，
+     * 而 Java 侧 VdMirror 仍在发（CMD_SRC = 0x52534344）。
+     *
+     * 丢失的后果很严重：
+     *   1. Java 发 DCSR
+     *   2. 这里没有对应分支，落到 `if (w4 != VDFRAME_MAGIC) return -1`
+     *   3. 调用处看到 r<0 → "控制通道断开，回到主屏抓帧"
+     *   4. 普通投屏的后台跟随失效，画面回到桌面
+     *
+     * 也就是说：**普通投屏切一次截取区，投屏就废了。**
+     *
+     * 语义（见 VdMirror.java:1008 的注释）：
+     *   改这几个数就够了，进程不用重启 —— 因为 g_src_* 是全局变量，
+     *   captureScreen 每帧都读它。重启进程反而会断 TCP 8444 和 8450。
+     */
+    if (w4 == CMD_SRC) {
+        uint32_t c[4];
+        if (read_full(g_proxy_fd, c, sizeof(c)) != 0) return 0;
+        int nx = (int) c[0], ny = (int) c[1];
+        int nw = (int) c[2], nh = (int) c[3];
+        /* 基本合法性：宽高必须为正，否则整帧抓不出来 */
+        if (nw > 0 && nh > 0) {
+            g_src_x = nx; g_src_y = ny;
+            g_src_w = nw; g_src_h = nh;
+            LOGI("主屏抓取区热更新 → %d,%d %d×%d", nx, ny, nw, nh);
+            /*
+             * 换了抓取区 → 下一帧必须全量重发。
+             *
+             * 原因：prev 缓冲里存的是旧尺寸的像素，增量比对会全错。
+             * force_full 是 main() 的局部变量，这里访问不到，
+             * 所以用全局标志中转，main 循环每轮检查一次。
+             */
+            g_src_dirty = 1;
+        } else {
+            LOGI("DCSR 参数非法（%d,%d %d×%d），忽略", nx, ny, nw, nh);
+        }
         return 2;
     }
 
@@ -1583,13 +1652,88 @@ int main(int argc, char **argv)
         LOGE("首连 CP 失败，先空转抓帧，稍后重试");
     }
 
-    const long long min_interval = 1000 / maxFps;
+    /*
+     * ══════════════════════════════════════════════════════════════
+     * 限帧间隔 —— **留 20% 余量，别卡在临界点**
+     * ══════════════════════════════════════════════════════════════
+     *
+     * 原来直接 `1000 / maxFps`，maxFps=30 时得到 33ms —— 正好等于
+     * 30fps 的帧间隔。但上层送帧的间隔是抖动的（32~34ms 交替），
+     * 32ms 的帧会撞上 `now - last_push < 33` 被判"太快"丢弃。
+     *
+     * 实测后果（2026-11-12，两条链路都中招）：
+     *   主屏路径 capture=16~17（应为 30）
+     *   VD 路径   有帧=17 限帧丢弃=14（31 帧里丢 14 帧）
+     *
+     * 把阈值放宽到 80%（33ms → 26ms）后，32ms 的帧稳稳通过：
+     *   VD 路径   capture 17 → 29~31，限帧丢弃 14 → 0~2
+     *
+     * 为什么不改上层的 fps 参数：
+     *   MirrorController 的 FPS_CHOICES 里有 10/15/20/25/30 档，
+     *   DEFAULT_FPS=30 是产品定义（dcapd2 主屏抓帧上限本就 30）。
+     *   改这里一处，两条链路同时受益，也不用动 UI 档位语义。
+     *
+     * 下限保护：maxFps 很小时（如 10fps → 100ms×0.8=80ms）仍然正确，
+     * 因为 80ms 也远大于上层 100ms 的送帧间隔。
+     */
+    long long min_interval = (long long) ((1000.0 / (maxFps > 0 ? maxFps : 30)) * 0.8);
+    if (min_interval < 1) min_interval = 1;
     long long last_push = 0;
     long long win_start = now_ms();
     long long bytes_mark = 0;
     int frames = 0;
     int applied = 0;         /* 成功抓到并合成的帧数（含无变化） */
     int win_tiles = 0;       /* 这一秒里累计发出去的图块数 */
+    /*
+     * 分段计时（2026-11-12 性能定位）
+     *
+     * 起因：STAT 显示 capture=17（17fps），但 Java 侧发送 29.9fps，
+     * 设计上限 maxFps=30。中间差了近一半。
+     *
+     * 三个候选瓶颈，用累加计时逐个验证：
+     *   g_t_poll  —— poll() 等待（上限 20ms）
+     *   g_t_recv  —— recv 4MB 帧数据（内存带宽 + 系统调用开销）
+     *   blit/push —— 已有 g_perf_blit / g_perf_push
+     *
+     * 统计窗口内求平均，每秒跟 STAT 一起输出。
+     */
+    long long g_t_poll = 0, g_t_recv = 0;
+    long long g_t_poll_max = 0;
+    int g_n_loop = 0;        /* 窗口内循环次数（用于求平均） */
+    /*
+     * 分支配额计数（2026-11-12 第二轮 TDD）
+     *
+     * 第一轮改完后：循环 124 次/秒、poll 4ms、recv 0ms，
+     * 说明 dcapd2 侧极度空闲，但 capture 仍然只有 17。
+     *
+     * 那 124 次循环里只有 17 次产出帧，剩下 107 次去哪了？
+     * 三种可能：
+     *   g_n_noframe —— poll 超时，没数据
+     *   g_n_ctrl    —— 收到控制命令（DCBG/DCVP），r==2
+     *   g_n_bad     —— 数据非法（magic 不对），r==-1
+     *
+     * 打出来就能确定是"App 送得慢"还是"被控制命令抢占"。
+     */
+    int g_n_noframe = 0, g_n_ctrl = 0, g_n_bad = 0;
+    /*
+     * min_interval 丢帧计数（2026-11-12 第四轮 TDD）
+     *
+     * 前三个假设都被数据推翻了：
+     *   ① recv 慢        → 实测 0-3ms，错
+     *   ② 控制命令抢占   → 实测 控制=0，错
+     *   ③ maxImages 不足 → 12 分钟只 8 次警告，不是主因
+     *
+     * 现在怀疑 min_interval 的边界效应：
+     *   maxFps = 30  →  min_interval = 1000/30 = 33ms
+     *   App 发送 29.9fps → 帧间隔 = 33.4ms
+     *
+     * 33.4ms 和 33ms 只差 0.4ms！now_ms() 是毫秒精度，
+     * 帧间隔稍有抖动（33/34 交替）就有一半帧被判"太快"而丢弃：
+     *   now - last_push = 33 → 33 < 33 为 false → 通过（但如果是 32 就被丢）
+     *
+     * 这正好解释 17 ≈ 30 × 0.57（约一半被丢）。
+     */
+    int g_n_toofast = 0;
     int force_full = 1;
     int connected = (enc->fd >= 0);
     long long last_try = now_ms();
@@ -1606,6 +1750,17 @@ int main(int argc, char **argv)
     while (!g_stop) {
         long long now = now_ms();
         int do_push = 0;
+        /*
+         * 消费 DCSR 置的全量重发请求（2026-11-12 恢复 DCSR 时新增）。
+         *
+         * proxy_read_msg 改了 g_src_* 之后置位，这里转成 force_full ——
+         * 因为 force_full 是本函数的局部变量，那边够不着。
+         */
+        if (g_src_dirty) {
+            g_src_dirty = 0;
+            force_full = 1;
+        }
+        g_n_loop++;
 
         /* CP 掉线不退出：每 2 秒重试一次，期间照常抓帧（只统计不发送） */
         if (!connected && now - last_try >= 2000) {
@@ -1626,9 +1781,50 @@ int main(int argc, char **argv)
             /* —— 控制/帧通道（App 投屏期间一直挂着这条连接）—— */
             struct pollfd pf = { g_proxy_fd, POLLIN, 0 };
             /* 未接管时别在这儿等：赶紧回去抓主屏，一帧都不能落下 */
-            int pr = poll(&pf, 1, g_proxy_active ? 20 : 0);
+            long long _tp = now_ms();
+            /*
+             * **poll 超时 20ms → 5ms**（2026-11-12 性能修复）
+             *
+             * 实测数据（分段计时）：
+             *   循环=35次/秒  poll平均=12ms(峰值20)  recv平均=2ms
+             *   Java 发送 29.9fps，但 dcapd2 只推 17fps
+             *
+             * 根因是两个相近周期的采样打架：
+             *   App 每 33ms 送一帧
+             *   dcapd2 无帧时 poll(20ms) + usleep(10ms) = 30ms 一轮
+             * 30ms 和 33ms 几乎相同 → 拍频 → 每两轮才撞上一帧
+             *
+             * 把 poll 缩到 5ms 后，无帧时的循环周期变成 5+10=15ms，
+             * 采样密度翻倍，33ms 的帧间隔必然被覆盖到。
+             * 代价：无帧时空转次数增加（CPU 上升），但 dcapd2 只占 25%，
+             * 有余量。
+             */
+            int pr = poll(&pf, 1, g_proxy_active ? 5 : 0);
+            /*
+             * 分段计时（2026-11-12）：定位 capture 只有 17fps 的瓶颈到底在哪。
+             *
+             * 三个嫌疑：
+             *   ① poll 等待（20ms 上限）
+             *   ② recv 4MB（内存带宽 + 拷贝）
+             *   ③ blit + push
+             *
+             * 只累计、不打印，每秒在 STAT 里输出一行平均值。
+             * 用累加而非逐次打印，避免日志本身扰动时序。
+             */
+            {
+                long long _d = now_ms() - _tp;
+                g_t_poll += _d;
+                if (_d > g_t_poll_max) g_t_poll_max = _d;
+            }
+            if (pr <= 0) g_n_noframe++;   /* poll 超时：这一轮没数据 */
             if (pr > 0) {
+                long long _tr = now_ms();
                 int r = proxy_read_msg();
+                g_t_recv += now_ms() - _tr;
+                /* 分支配额统计（见 g_n_noframe 声明处的注释） */
+                if (r == 1)      { /* 正常帧，下面处理 */ }
+                else if (r == 2) { g_n_ctrl++; }
+                else if (r < 0)  { g_n_bad++; }
                 if (r <= 0) {
                     LOGI("控制通道断开(r=%d)，回到主屏抓帧", r);
                     close(g_proxy_fd);
@@ -1663,6 +1859,7 @@ int main(int argc, char **argv)
                         }
                     } else if (now - last_push < min_interval) {
                         /* 限帧：丢掉，下一帧再说 */
+                        g_n_toofast++;
                     } else {
                         if (!g_vd_live) {
                             LOGI("VD 出真画面了（前面跳过 %d 帧空屏）", g_vd_blank);
@@ -1722,7 +1919,20 @@ int main(int argc, char **argv)
 
         if (g_proxy_active) {
             /* 已被接管：帧在上面处理过了；没有新帧就歇一下 */
-            if (!do_push) usleep(10 * 1000);
+            /*
+             * **usleep 10ms → 2ms**（2026-11-12）
+             *
+             * 原来是 poll(20) + usleep(10) = 30ms 周期，
+             * 和 App 的 33ms 发送周期拍频，导致漏一半帧（17fps vs 30fps）。
+             *
+             * 现在 poll 缩到 5ms，这里再缩到 2ms：
+             * 无帧周期 = 7ms → 142 轮/秒，远远密于 33ms 的帧间隔，
+             * 不会再错过。
+             *
+             * 为什么保留 usleep 而不是纯忙等：
+             * 长时间无帧（比如投屏暂停）时不至于把 CPU 吃满。
+             */
+            if (!do_push) usleep(2 * 1000);
         } else if (!bg_mode && !paused) {
             /* —— 主屏镜像：App 在中控上，抓它的窗口区域 —— */
 
@@ -2050,10 +2260,32 @@ int main(int argc, char **argv)
                  fps, applied, win_tiles, kbps, stat_bytes / 1024,
                  g_perf_blit, g_perf_push,
                  g_proxy_active ? " src=VD" : " src=SCREEN");
+            /*
+             * 分段耗时（2026-11-12）：均摊到每次循环，直接看出钱花在哪。
+             *
+             * 判定标准：
+             *   · poll  ≈ 20ms  → 撞到上限，是被动等待（App 送不到这么快）
+             *   · poll  <  10ms 且 recv 大 → recv 4MB 是瓶颈
+             *   · poll 极小 recv 极小 → 限帧逻辑或别处
+             */
+            if (g_n_loop > 0) {
+                LOGI("  ├ 循环=%d次/秒  poll平均=%lldms(峰值%lld)  recv平均=%lldms",
+                     g_n_loop,
+                     g_t_poll / g_n_loop, g_t_poll_max,
+                     g_t_recv / g_n_loop);
+                /*
+                 * 分支配额：循环总数 = 有帧 + 无帧(超时) + 控制命令 + 非法
+                 * 看哪一项占大头，就知道 124 次循环里为什么只有 17 次推帧。
+                 */
+                LOGI("  └ 有帧=%d 无帧=%d 控制=%d 非法=%d 限帧丢弃=%d",
+                     applied, g_n_noframe, g_n_ctrl, g_n_bad, g_n_toofast);
+            }
             frames = 0;
             applied = 0;
             win_tiles = 0;
             win_start = t;
+            g_t_poll = 0; g_t_recv = 0; g_t_poll_max = 0; g_n_loop = 0;
+            g_n_noframe = 0; g_n_ctrl = 0; g_n_bad = 0; g_n_toofast = 0;
         }
     }
 

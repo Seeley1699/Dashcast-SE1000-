@@ -367,6 +367,79 @@ public final class LayerConfig {
             c.w = c.canvasW;
             c.h = c.canvasH;
         }
+
+        /*
+         * ★ **默认投屏区域改成 1280×532 居中**（2026-11-12 用户要求）
+         *
+         * 起因：用户反馈「字体太小，看不见」。
+         *
+         * 根因不是字号小，是**显示区域太小**：
+         *   设计稿    1920 × 532
+         *   原遮罩    528 × 416   ← 只有设计稿的 27.5%
+         *   结果：11px 的字缩完只剩 3px，肉眼根本看不清
+         *
+         * 用户选了「1280×532」：
+         *   缩放比 1280/1920 = 0.667（原来 0.275，改善 142%）
+         *   11px → 7.4px，15px → 10px，22px → 14.7px
+         *   高度用满 532，纵向不再缩
+         *
+         * 为什么用「居中」而不是贴左：
+         *   仪表面板视觉重心在中间，贴左会让右边空出一大块。
+         *   1280 宽的居中位置 = (1920-1280)/2 = 320。
+         *
+         * **只在用户没手动调过遮罩时生效**：
+         *   layer_w 存在 → 尊重用户设置，不覆盖
+         *   layer_w 不存在（首次安装/清过数据）→ 用新默认值
+         *
+         * 注意：这不改变"铺满"语义 —— canvasFill 分支在上面已经
+         * 把 w/h 设成整块画布了，这里只处理非铺满的默认情形。
+         */
+        if (!p.contains("layer_w") && !c.canvasFill) {
+            c.w = Math.min(1280, c.canvasW);
+            c.x = Math.max(0, (c.canvasW - c.w) / 2);
+            c.h = c.canvasH;
+            c.y = 0;
+        }
+
+        /*
+         * ★ **一次性迁移：把历史的小尺寸升级成 1280×532**（2026-11-12）
+         *
+         * 上面那个 if 只在「从没存过 layer_w」时生效，但用户设备上
+         * 早就存过了（528×416，大概是早期手动调的）。不做迁移的话，
+         * 改了代码他也看不到变化 —— prefs 里的值会一直压着。
+         *
+         * 判定条件用「精确等于那几个历史小尺寸」，而不是「小于 1280」：
+         *   · 528×416   ← 之前一直用的默认
+         *   · 592×368   ← 更早的版本
+         * 只有命中这两组才升级，用户自己调过的其它尺寸（比如 800×400）
+         * 一律不动 —— 不能因为改默认值就把用户的手动设置覆盖掉。
+         *
+         * 迁移后写回 prefs 并打标记，保证只跑一次。
+         */
+        boolean migrated = p.getBoolean("layer_migrated_1280", false);
+        if (!migrated && !c.canvasFill && p.contains("layer_w")) {
+            boolean isOld528 = (c.w == 528 && c.h == 416);
+            boolean isOld592 = (c.w == 592 && c.h == 368);
+            if (isOld528 || isOld592) {
+                c.w = Math.min(1280, c.canvasW);
+                c.x = Math.max(0, (c.canvasW - c.w) / 2);
+                c.h = c.canvasH;
+                c.y = 0;
+                /* 立刻落盘，否则每次启动都要重新判一次 */
+                p.edit()
+                        .putInt("layer_x", c.x)
+                        .putInt("layer_y", c.y)
+                        .putInt("layer_w", c.w)
+                        .putInt("layer_h", c.h)
+                        .putBoolean("layer_migrated_1280", true)
+                        .apply();
+                DashLog.i("DashcastLayer",
+                        "遮罩尺寸已升级 " + (isOld528 ? "528x416" : "592x368")
+                                + " → " + c.w + "x" + c.h
+                                + "（字号实际显示大 2.4 倍）");
+            }
+        }
+
         c.grid       = p.getInt("layer_grid", 32);
         c.shape      = p.getInt("layer_shape", SHAPE_ROUND);
         c.border     = p.getInt("layer_border", 0);

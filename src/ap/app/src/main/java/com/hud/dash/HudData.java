@@ -4,7 +4,21 @@ package com.hud.dash;
 public class HudData {
     // 车速与智驾
     public float speed = 0f;
-    public boolean noa = true;
+    /*
+     * **noa 默认必须是 false**（2026-11-12 修「NOA 一直显示已激活」）
+     *
+     * 原来写的是 true，而且 EvccVehicleFeed / VehicleFeed 从来没给它
+     * 赋过真实值 —— 只有两个 Demo Activity 手动设过 true。
+     * 所以投屏一开就显示"NOA 已激活"，跟车实际状态完全无关。
+     *
+     * 真实语义（从参考源码 h/p.java 还原）：
+     *   NOA 激活 = (HPA状态 == 0 || -1) && (ADAS主状态 == 5 || 6)
+     *   ADAS 状态：3=ICC待机 4=ICC激活 5/6=NOA显示中
+     * 数据源：AD_AdasTTPa（APVP 0x22700044，Struct 8 字节）
+     *
+     * 读不到就是 false —— 和 lightHold 同理，安全指示宁可漏报。
+     */
+    public boolean noa = false;
     public String noaLabel = "NOA";
     public int noaSpeed = 120;
 
@@ -18,7 +32,19 @@ public class HudData {
     public float fuelRange = 1370f, fuelCap = 1560f;
 
     // 功率（kW）
-    public float power = 142f, powerMax = 300f;
+    /*
+     * **功率默认改 0**（2026-11-12 修「功率功能没用」）
+     *
+     * 原来写 142f —— 一个凭空的固定值，永远不会动。
+     * EvccVehicleFeed 从来没有功率属性，所以仪表上那个数字是死的。
+     *
+     * 真实数据源（j6.java 第 77 行）：
+     *   TotDrvPwrAct   ID = 306184883 (0x124002B3)
+     *   单位 kW，正数驱动、负数回收，路试对照 1:1
+     *
+     * powerMax 保持 300（表盘量程，不是动态数据）。
+     */
+    public float power = 0f, powerMax = 300f;
 
     // 车道引导
     public String[] lanes = {"left", "straight", "straight", "straight", "right"};

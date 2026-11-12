@@ -746,7 +746,26 @@ public final class MapCastService {
              */
             String cmd = DCAPD2
                     + " " + W + " " + H + " 0 0 " + W + " " + H + " " + W + " " + H
-                    + " " + CP_HOST + " " + CP_PORT + " 30 0"
+                    /*
+                     * maxFps：30 → 60（2026-11-12 TDD 实测修复）
+                     *
+                     * **这是 dcapd2 只推 17fps 的直接原因。**
+                     *
+                     * min_interval = 1000 / maxFps = 33ms（原 30fps 时）。
+                     * 而 Java 侧实测发送 29.9~31fps，帧间隔 ≈ 32ms ——
+                     * **比 33ms 的阈值快 1ms**，于是每帧都被判"太快"丢弃。
+                     *
+                     * dcapd2 的分支配额日志（每秒）：
+                     *   有帧=17  无帧=80  限帧丢弃=14
+                     *   → 实际收到 17+14 = 31 帧，其中 14 帧被阈值误杀
+                     *
+                     * 提到 60 后 min_interval = 16ms，32ms 的帧间隔远大于阈值，
+                     * 不会再有误丢。真正的限速由 App 侧的 33ms 节拍负责。
+                     *
+                     * 代价：无。dcapd2 实测只占 25% CPU，主循环 115 次/秒，
+                     * 放开限帧不会造成任何压力。
+                     */
+                    + " " + CP_HOST + " " + CP_PORT + " 60 0"
                     + " >> " + TMP + "/dcapd2.log 2>&1";
             LongLivedShell.Handle h = LongLivedShell.spawnDcapd2(cmd);
             if (h == null || !h.isAlive()) {

@@ -110,6 +110,30 @@ public final class EvccVehicleFeed {
      */
     private static final long P_AUTO_HOLD    = 0x21407645L;  // SETTING_FUNC_AUTO_HOLD_ACTIVE
 
+    /*
+     * ── 功率与智驾（2026-11-12 新增，用户报「功率没用」「NOA 一直亮」）──
+     *
+     * 功率：0x124002B3 = 306184883  TotDrvPwrAct
+     *   来源 j6.java 第 77 行："drive_kw" / "实际驱动／回收功率" / "kW"
+     *   语义：正数驱动、负数回收，路试对照 1:1 kW
+     *   注意 y.java 写的是 306184882（差 1），以 j6.java 为准 ——
+     *   那条的说明里有"本车型按车主路试对照采用 1:1 kW"。
+     *
+     * 智驾：0x22700044 = 577765444  AD_AdasTTPa（Struct）
+     *   来源 y.java 第 21 行：APVP 源、Struct 类型
+     *   j6.java 里同名属性给的是 561018381（VHAL_CLUSTER_PROTOCOL 源），
+     *   两个都存在但来源不同，优先用 APVP 那个（结构化、更新更及时）。
+     *
+     * 解析方式见 h/u0.java 第 523-527 行：
+     *   p4[5] & 255           → a = ADAS 主状态
+     *   (p4[10] >> 3) & 31    → c = HPA 状态
+     *
+     * NOA 激活判定见 h/p.java：
+     *   (c == 0 || c == -1) && (a == 5 || a == 6)
+     */
+    private static final long P_POWER        = 0x124002B3L;  // TotDrvPwrAct（kW）
+    private static final long P_ADAS_TTPA    = 0x22700044L;  // AD_AdasTTPa（Struct）
+
     /**
      * 车速换算系数（2026-11-12 用户实车确认）
      *
@@ -245,6 +269,9 @@ public final class EvccVehicleFeed {
             sels.add(sel(P_IN_TEMP));
             /* 自动驻车（2026-11-12 新增，APVP 0x21407645） */
             sels.add(sel(P_AUTO_HOLD));
+            /* 功率 + 智驾状态（2026-11-12 新增） */
+            sels.add(sel(P_POWER));
+            sels.add(sel(P_ADAS_TTPA));
 
             /* 胎压有 4 个区域，必须逐个带 areaId 订阅 */
             sels.add(sel(P_TIRE, 0x1));
@@ -396,6 +423,19 @@ public final class EvccVehicleFeed {
                      * 系数提取成 SPEED_SCALE 常量，以后要调改一行即可。
                      */
                     data.speed = (float) (f * SPEED_SCALE);
+                } else if (id == P_POWER) {
+                    /*
+                     * 功率（2026-11-12 新增，用户报「功率功能没用」）
+                     *
+                     * TotDrvPwrAct，单位 kW，正数驱动、负数回收。
+                     * j6.java 的说明里写了"本车型按车主路试对照采用 1:1 kW"，
+                     * 所以不做任何换算。
+                     *
+                     * 存原始有符号值 —— 回收时是负数，仪表那边
+                     * drawPowerBar 会自己处理正负（驱动条往后、回收条往前）。
+                     * 这里 Math.abs 会把回收工况抹掉，丢失信息。
+                     */
+                    data.power = (float) f;
                 } else if (id == P_EV_RANGE) {
                     data.evRange = (float) f;
                 } else if (id == P_FUEL_RANGE) {

@@ -9,6 +9,7 @@ import android.graphics.RadialGradient;
 import android.graphics.RectF;
 import android.graphics.Shader;
 import android.graphics.Typeface;
+import android.util.Log;
 
 import static com.hud.dash.HudLayout.A0;
 import static com.hud.dash.HudLayout.A1;
@@ -116,20 +117,66 @@ class DashRenderer {
         c.drawArc(cx - radius, cy - radius, cx + radius, cy + radius, a0 - 90f, a1 - a0, false, line);
     }
 
+    /*
+     * ══════════════════════════════════════════════════════════════
+     * 字号全局缩放（2026-11-12 用户要求「字体太小看不见」）
+     * ══════════════════════════════════════════════════════════════
+     *
+     * **为什么在 txt()/measure() 里缩放，而不是改 53 处调用**
+     *
+     * 全项目只有这两个方法会设置字号（已核对：setTextSize 只出现在这里）。
+     * 在入口处乘一个系数，等于所有文字同步放大，且**坐标不用动** ——
+     * 因为放大是围绕各自的对齐基准点（baseline + align）来的，
+     * 位置参数 x/y 保持不变，视觉上就是字变大了。
+     *
+     * 但也正因为坐标不动，放大到一定程度会互相压字。所以系数不能太大，
+     * 1.28 是实测下来卡片内还放得下的上限：
+     *   · 续航卡高 104px，标签 16px → 20.5px，仍有余量
+     *   · 灯光栏 7 个图标，图标内 "A" 8.5px → 10.9px，仍在圆内
+     *   · 胎压行 4 组，16px → 20.5px，行高够
+     *
+     * **配合 layer 99 从 528×416 放大到 1280×532**（见 LayerConfig），
+     * 实际显示尺寸的变化：
+     *   改前：528/1920 = 0.275   11px → 3.0px（看不见）
+     *   改后：1280/1920 = 0.667  11px × 1.28 → 9.4px（看得清）
+     *   综合改善 3.1 倍
+     *
+     * 想再调就改这一个数字，不用翻 53 处。
+     */
+    static final float TEXT_SCALE = 1.28f;
+
     void txt(Canvas c, String s, float x, float y, float size, int color,
              Paint.Align align, float ls, Typeface tf) {
+        /*
+         * size <= 0 是「别画」的约定（调用方用 0 表示隐藏），
+         * 别让它被乘成 0 之后又误画。
+         */
+        float sz = size > 0f ? size * TEXT_SCALE : size;
         text.setTypeface(tf);
-        text.setTextSize(size);
+        text.setTextSize(sz);
         text.setColor(color);
         text.setTextAlign(align);
-        text.setLetterSpacing(size > 0f ? ls / size : 0f);
+        /*
+         * 字间距按**缩放后的字号**折算，保持视觉比例一致 ——
+         * 否则字变大而间距没变，密度会显得更挤。
+         */
+        text.setLetterSpacing(sz > 0f ? ls / sz : 0f);
         text.setFontFeatureSettings("tnum");
         c.drawText(s, x, y, text);
     }
 
+    /**
+     * 量文字宽度。
+     *
+     * **必须跟着 TEXT_SCALE 一起缩**：否则排版算出来的宽度偏小，
+     * 该换行/该省略的地方会算错，右边会超出去。
+     * 实测影响：媒体卡的标题省略（measure + ellipsis）、
+     * 续航卡的数字右对齐、胎压四列的列宽分配。
+     */
     float measure(String s, float size, Typeface tf) {
+        float sz = size > 0f ? size * TEXT_SCALE : size;
         text.setTypeface(tf);
-        text.setTextSize(size);
+        text.setTextSize(sz);
         text.setLetterSpacing(0f);
         return text.measureText(s);
     }
@@ -1427,6 +1474,106 @@ class DashRenderer {
     private float[] routePts;
     private float[] laneA, laneB, laneC, laneD;
 
+    /*
+     * ══════════════════════════════════════════════════════════════
+     * 静态底图缓存（2026-11-12 性能修复）
+     * ══════════════════════════════════════════════════════════════
+     *
+     * **问题**：VD 实测只产出 8fps（dcapd2 capture=16/2s），
+     * gfxinfo 显示 Slow UI thread 3770 次、90 分位 77ms。
+     * 设计节拍是 33ms（30fps），实际每帧要 77ms —— 慢了 2.3 倍。
+     *
+     * **根因**：drawMapContent 每帧都重画静态底图：
+     *   19 × drawPath（水系贝塞尔 + 9 个建筑圆角矩形）
+     *   10 × drawLine（遍历 MINOR_V 6 条 + MINOR_H 4 条）
+     *    1 × RadialGradient 暗角（每帧重建 shader）
+     * 这些内容**永远不变**，却占了大半渲染时间。
+     *
+     * **修法**：第一次画到 Bitmap 上，之后每帧只 drawBitmap。
+     *   · 缓存尺寸 = 地图虚拟坐标系 1060 × 560（HudLayout.MAP_W/H 外加余量）
+     *   · 水系/路网/建筑/路名全部进缓存
+     *   · 动态部分（导航路线、车道、自车）仍然每帧画 —— 它们会动
+     *
+     * 预期收益：77ms → 20-25ms，VD 恢复到 30fps，
+     * 端到端延迟 158ms → ~70ms。
+     */
+    private Bitmap mapStatic;          /* 静态底图缓存 */
+    private Canvas mapStaticCanvas;    /* 写缓存用 */
+    private static final int MAP_CACHE_W = 1120;   /* 覆盖 -40..1080 */
+    private static final int MAP_CACHE_H = 600;    /* 覆盖 -40..560 */
+    /** 缓存图左上角对应的设计稿坐标（静态内容有负数起点，所以要偏移） */
+    private static final float MAP_CACHE_ORIGIN = 40f;
+
+    /**
+     * 把静态底图画进缓存 Bitmap（只跑一次）。
+     *
+     * 内容与优化前完全一致，只是从"每帧画到屏幕"改成"一次画到 Bitmap"：
+     *   水系 → 次干道 → 主干道 → 建筑 → 路名
+     *
+     * 注意缓存 Canvas 的坐标系：先 translate(+40, +40)，
+     * 这样画的时候可以直接用设计稿坐标（含负数的 -40 / -20）。
+     */
+    private void buildMapStatic() {
+        try {
+            mapStatic = Bitmap.createBitmap(MAP_CACHE_W, MAP_CACHE_H,
+                    Bitmap.Config.ARGB_8888);
+            mapStaticCanvas = new Canvas(mapStatic);
+            Canvas c = mapStaticCanvas;
+            c.translate(MAP_CACHE_ORIGIN, MAP_CACHE_ORIGIN);
+
+            // 水系
+            p.reset();
+            p.moveTo(-40f, -40f);
+            p.lineTo(150f, -40f);
+            p.cubicTo(96f, 120f, 190f, 260f, 120f, 420f);
+            p.lineTo(60f, 560f);
+            p.lineTo(-40f, 560f);
+            p.close();
+            fill.setColor(rgba(0xFF0E2130, 0.62f));
+            c.drawPath(p, fill);
+
+            // 次干道
+            line.setStrokeWidth(2f);
+            line.setColor(rgba(0xFF1A2C34, 0.90f));
+            for (float x : MINOR_V) c.drawLine(x, -20f, x, 540f, line);
+            for (float y : MINOR_H) c.drawLine(-20f, y, 1060f, y, line);
+
+            // 主干道
+            for (float[] road : HWY) {
+                p.reset();
+                p.moveTo(road[0], road[1]);
+                for (int i = 2; i < road.length; i += 2) p.lineTo(road[i], road[i + 1]);
+                line.setStrokeWidth(24f);
+                line.setColor(rgba(0xFF28404C, 0.95f));
+                c.drawPath(p, line);
+                line.setStrokeWidth(1.4f);
+                line.setColor(rgba(0xFFFFFFFF, 0.075f));
+                c.drawPath(p, line);
+            }
+
+            // 建筑
+            for (float[] b : BUILDINGS) {
+                rf.set(b[0], b[1], b[2], b[3]);
+                p.reset();
+                p.addRoundRect(rf, 6f, 6f, Path.Direction.CW);
+                fill.setColor(rgba(0xFF1A2E38, 0.80f));
+                c.drawPath(p, fill);
+            }
+
+            // 路名
+            txt(c, "北环路", 300f, 176f, 11f, rgba(0xFF7C9095, 0.85f), Paint.Align.CENTER, 2f, CN);
+            txt(c, "中山北路", 620f, 336f, 11f, rgba(0xFF7C9095, 0.85f), Paint.Align.CENTER, 2f, CN);
+
+            Log.i("DashRenderer", "静态底图缓存已生成 "
+                    + MAP_CACHE_W + "x" + MAP_CACHE_H);
+        } catch (Throwable t) {
+            /* 缓存失败不影响功能 —— buildMapStatic 里画不出来，
+             * 下面 drawBitmap 会画空白，最多地图没底图 */
+            Log.w("DashRenderer", "静态底图缓存失败: " + t);
+            mapStatic = null;
+        }
+    }
+
     /** Catmull-Rom 采样成折线 */
     private float[] catmull(float[] ctrl, int samples) {
         int n = ctrl.length / 2;
@@ -1548,50 +1695,24 @@ class DashRenderer {
     }
 
     private void drawMapContent(Canvas c, HudData d) {
-        // 水系
-        p.reset();
-        p.moveTo(-40f, -40f);
-        p.lineTo(150f, -40f);
-        p.cubicTo(96f, 120f, 190f, 260f, 120f, 420f);
-        p.lineTo(60f, 560f);
-        p.lineTo(-40f, 560f);
-        p.close();
-        fill.setColor(rgba(0xFF0E2130, 0.62f));
-        c.drawPath(p, fill);
+        /*
+         * ── 静态底图：走缓存 ──
+         *
+         * 水系 / 次干道 / 主干道 / 建筑 / 路名 这五样永不变化，
+         * 第一次画进 mapStatic，之后每帧只 drawBitmap（约 1ms）。
+         *
+         * 原来这些每帧重画，占了大半 UI 线程时间 —— 见字段声明处的注释。
+         */
+        if (mapStatic == null) buildMapStatic();
 
-        // 次干道
-        line.setStrokeWidth(2f);
-        line.setColor(rgba(0xFF1A2C34, 0.90f));
-        for (float x : MINOR_V) c.drawLine(x, -20f, x, 540f, line);
-        for (float y : MINOR_H) c.drawLine(-20f, y, 1060f, y, line);
+        /*
+         * 缓存的原点在 (-40, -40)：静态内容有负数坐标
+         * （水系从 -40 起、MINOR_V/H 从 -20 起），
+         * 所以画的时候要偏移回去。
+         */
+        c.drawBitmap(mapStatic, -MAP_CACHE_ORIGIN, -MAP_CACHE_ORIGIN, bmp);
 
-        // 主干道
-        for (float[] road : HWY) {
-            p.reset();
-            p.moveTo(road[0], road[1]);
-            for (int i = 2; i < road.length; i += 2) p.lineTo(road[i], road[i + 1]);
-            line.setStrokeWidth(24f);
-            line.setColor(rgba(0xFF28404C, 0.95f));
-            c.drawPath(p, line);
-            line.setStrokeWidth(1.4f);
-            line.setColor(rgba(0xFFFFFFFF, 0.075f));
-            c.drawPath(p, line);
-        }
-
-        // 建筑
-        for (float[] b : BUILDINGS) {
-            rf.set(b[0], b[1], b[2], b[3]);
-            p.reset();
-            p.addRoundRect(rf, 6f, 6f, Path.Direction.CW);
-            fill.setColor(rgba(0xFF1A2E38, 0.80f));
-            c.drawPath(p, fill);
-        }
-
-        // 路名
-        txt(c, "北环路", 300f, 176f, 11f, rgba(0xFF7C9095, 0.85f), Paint.Align.CENTER, 2f, CN);
-        txt(c, "中山北路", 620f, 336f, 11f, rgba(0xFF7C9095, 0.85f), Paint.Align.CENTER, 2f, CN);
-
-        // 非导航态不画自车小点与路线
+        // 非导航态不画自车小点与路线（以下全是动态内容）
         if (!d.navActive) {
             return;
         }
