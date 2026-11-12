@@ -55,17 +55,41 @@ public class DashView extends View {
      * 否则只重新注册回调。动画平滑靠 step(dt) 按真实间隔积分。
      */
     /*
-     * 渲染节拍（2026-11-11）
+     * 渲染节拍（历史：60fps → 33ms → 16ms → 20ms → 24ms）
      *
-     * 原是 60fps（跑满 vsync），但 dcapd2 出口只有 15fps，
-     * 渲染 60 帧扔掉 45 帧，白烧一个多核 → dashcast CPU 152%。
+     * ══════════════════════════════════════════════════════════════
+     * 四档实测（2026-11-12，地图投屏，dcapd2 推送帧率 / CPU / Janky）
+     * ══════════════════════════════════════════════════════════════
      *
-     * 现在按出口实际能力定节拍：
-     *   33ms = 30fps，略高于出口（19~25fps），留点余量但不浪费。
-     * 之前试过 40ms（25fps）——但那样 VD 出帧节奏变成 40ms，
-     * 反而把出口压在 19.8fps（采集端等不到新帧）。
+     *   33ms   推送 30fps    CPU 53%    Janky 1.9%
+     *   24ms   推送 30fps    CPU 52%    Janky 0.5%   ← 选定
+     *   20ms   推送 17fps    CPU 97%    Janky 92.5%  ✗ 反直觉，比 24 差得多
+     *   16ms   推送 58~61fps CPU 120%   Janky 77.4%  （帧率最高，CPU 吃满）
+     *
+     * **20ms 为什么比 24ms 还差**（本次最反直觉的发现）：
+     *   gfxinfo 显示每帧实际只画 9~11ms，20ms 的节拍理论上绰绰有余。
+     *   但 Choreographer 回调是 **vsync 对齐**的（本机 120Hz → 8.3ms，
+     *   60Hz → 16.7ms 一个节拍），20ms 的判断会落在两个节拍之间：
+     *     有时隔 1 个 vsync（8.3ms）就画，有时要等 2~3 个（16.6~25ms）
+     *   于是 VD 侧看到的帧流忽快忽慢，抖动放大到 44ms（50 分位），
+     *   最终推送反而掉到 17fps。
+     *
+     *   24ms 则稳定落在 8.3 的整数倍附近（8.3×3=24.9），节拍与 vsync 对齐，
+     *   抖动降到 0.5% —— 比 33ms(1.9%) 还稳。
+     *
+     * **结论：节拍值必须尽量贴 vsync 周期的整数倍，别取中间值。**
+     *   本机 120Hz → 8.3ms 的倍数：16.7 / 25 / 33.3
+     *
+     * **只影响地图投屏**（DashView 仅被 JavaDashEngine 使用）。
+     * 普通投屏走 MirrorController + VdMirror，不碰这个值。
+     *
+     * 想改就改这一行：
+     *   16  = 60fps（CPU 120%，追平游戏手感）
+     *   24  = 30fps（当前，CPU 52%，抖动 0.5%，导航足够）
+     *   33  = 30fps（CPU 53%，抖动 1.9%，比 24 略差）
+     *   ⚠ 避开 20 / 28 这类非整数比的值
      */
-    private static final long FRAME_INTERVAL_MS = 33;   /* 30fps */
+    private static final long FRAME_INTERVAL_MS = 24;   /* 实测最优：30fps + 0.5% 抖动 */
     private long lastDrawMs = 0L;
 
     private final Choreographer.FrameCallback frame = new Choreographer.FrameCallback() {

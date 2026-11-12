@@ -1678,6 +1678,12 @@ int main(int argc, char **argv)
      */
     long long min_interval = (long long) ((1000.0 / (maxFps > 0 ? maxFps : 30)) * 0.8);
     if (min_interval < 1) min_interval = 1;
+    /*
+     * 注：min_interval 只用于**主屏路径**的限帧（见下方 g_n_toofast 附近的
+     * 判断）。VD 模式（地图投屏）不限 —— 帧是 Java 侧渲染好发来的，
+     * 节流责任在 DashView 的 FRAME_INTERVAL_MS，这里再限一次会造成
+     * 重复节流：实测 Java 发 56fps 被切到 37~43fps，且丢弃随机、画面更抖。
+     */
     long long last_push = 0;
     long long win_start = now_ms();
     long long bytes_mark = 0;
@@ -1857,8 +1863,31 @@ int main(int argc, char **argv)
                         if (g_vd_blank == 1) {
                             LOGI("VD 首帧是空屏 —— 先不推，等 App 画出来（仪表保持上一帧）");
                         }
-                    } else if (now - last_push < min_interval) {
-                        /* 限帧：丢掉，下一帧再说 */
+                    } else if (!g_proxy_active && now - last_push < min_interval) {
+                        /*
+                         * 限帧：丢掉，下一帧再说
+                         *
+                         * **只对主屏路径生效** —— 条件里的 `!g_proxy_active`
+                         * 就是"当前不是 VD 模式"。
+                         *
+                         * VD 模式为什么不限（2026-11-12 实测）：
+                         *   DashView 渲染提到 60fps 后，Java 发送 56fps，
+                         *   但这里丢弃 15~21 帧/秒 —— 因为 Java 的
+                         *   SEND_INTERVAL_MS=0（工作完即发），帧间隔本身
+                         *   不均匀（5~20ms 抖动），两帧挨得近时后一帧
+                         *   就撞 13.3ms 阈值被扔。
+                         *
+                         *   结果是两边都在节流：Java 不匀 + dcapd2 硬切
+                         *   → 实际只剩 37~43fps，而且丢弃是随机的，
+                         *     画面反而更容易抖。
+                         *
+                         *   去掉后由 Java 的 FRAME_INTERVAL_MS 单独负责节流，
+                         *   责任清晰。
+                         *
+                         * **主屏路径（普通投屏）行为完全不变** ——
+                         * dcapd2 自己 captureScreen 一帧 30~70ms，
+                         * 必须限帧否则白抓。
+                         */
                         g_n_toofast++;
                     } else {
                         if (!g_vd_live) {
