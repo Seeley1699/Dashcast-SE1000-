@@ -48,13 +48,13 @@ public interface DashTheme {
     default int bg() { return 0xFF05080A; }
 
     /** 卡片填充 */
-    default int cardBg() { return 0xFF0C1418; }
+    default int cardBg() { return 0xFF182630; }
 
     /** 卡片描边 */
-    default int cardStroke() { return 0xFF1B2A30; }
+    default int cardStroke() { return 0xFF22353D; }
 
     /** 分隔线 / 次一级描边 */
-    default int line() { return 0xFF1B2A30; }
+    default int line() { return 0xFF22353D; }
 
     /* ══════════════ 配色：强调 ══════════════ */
 
@@ -109,7 +109,7 @@ public interface DashTheme {
     default int textDim() { return 0xFFA9BEC2; }
 
     /** 更弱（分隔线旁的小字） */
-    default int textFaint() { return 0xFF6B8085; }
+    default int textFaint() { return 0xFF8A9FA3; }
 
     /* ══════════════ 字体 ══════════════ */
 

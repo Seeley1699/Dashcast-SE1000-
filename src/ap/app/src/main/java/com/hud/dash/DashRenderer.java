@@ -113,25 +113,68 @@ class DashRenderer {
     /* ------------------------------ 基础绘制 ------------------------------ */
 
     /** 面板底：圆角 + 渐变 + 描边 + 顶部高光 */
+    /*
+     * ══════════════════════════════════════════════════════════════
+     * 卡片绘制 —— **接入主题**（2026-11-13，阶段 2）
+     * ══════════════════════════════════════════════════════════════
+     *
+     * 原来这里写死渐变 {0xFF121E23, 0xFF0B1418}，**完全不经过 theme**。
+     * 这是 DashTheme.cardBg() 之前 0 处调用的原因 ——
+     * 改主题里那个值对画面毫无影响，卡片永远是这两个硬编码色。
+     *
+     * 现在：渐变两端由 cardBg() 推导
+     *   上端 = cardBg 提亮一档（lighten）
+     *   下端 = cardBg 压暗一档（darken）
+     *
+     * 为什么不直接上下都用 cardBg()：纯色会丢掉现有的纵向渐变层次，
+     * 而那个渐变是画面"卡片有厚度"的主要来源，不能丢。
+     *
+     * 提亮/压暗用固定系数而非固定色值 —— 这样换任意主题都能得到
+     * 同比例的两端，不会出现"主题换了但渐变还是原来那两个色"。
+     */
     void panel(Canvas c, RectF rect, float radius) {
         p.reset();
         p.addRoundRect(rect, radius, radius, Path.Direction.CW);
 
+        int baseTop = shade(theme().cardBg(), 1.10f);
+        int baseBot = shade(theme().cardBg(), 0.70f);
+
         fill.setShader(new LinearGradient(
                 rect.left, rect.top, rect.left, rect.bottom,
-                new int[]{0xFF121E23, 0xFF0B1418},
+                new int[]{baseTop, baseBot},
                 new float[]{0f, 1f},
                 Shader.TileMode.CLAMP));
         c.drawPath(p, fill);
         fill.setShader(null);
 
+        /*
+         * 描边：用 cardStroke() 而不是 rgba(0xFFFFFF, 0.06f)。
+         *
+         * 半透明白描边在深色卡上等效色取决于底色，无法控制绝对对比度；
+         * cardStroke() 是实色，改主题即可精确控制卡片与背景的分界强度。
+         */
         line.setShader(null);
         line.setStrokeWidth(1f);
-        line.setColor(rgba(0xFFFFFF, 0.06f));
+        line.setColor(theme().cardStroke());
         c.drawPath(p, line);
 
+        /* 顶部高光线保留半透明白 —— 它的作用是模拟受光，不是分界 */
         line.setColor(rgba(0xFFFFFF, 0.05f));
         c.drawLine(rect.left + radius, rect.top + 0.5f, rect.right - radius, rect.top + 0.5f, line);
+    }
+
+    /**
+     * 按系数提亮/压暗一个颜色（保持色相，只调明度）。
+     *
+     * k > 1 提亮、k < 1 压暗、k = 1 原色。各通道等比缩放后钳制到 0..255。
+     * 不用 HSV 转空间是因为绘制在每帧路径上，省一次转换。
+     */
+    private static int shade(int color, float k) {
+        int a = (color >>> 24) & 0xFF;
+        int r = Math.min(255, Math.round(((color >> 16) & 0xFF) * k));
+        int g = Math.min(255, Math.round(((color >> 8) & 0xFF) * k));
+        int b = Math.min(255, Math.round((color & 0xFF) * k));
+        return (a << 24) | (r << 16) | (g << 8) | b;
     }
 
     /** 圆弧：设计角度（0° = 正上方）→ Android 角度（0° = 3 点方向） */
