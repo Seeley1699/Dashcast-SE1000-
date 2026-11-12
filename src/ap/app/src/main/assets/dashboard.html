@@ -1,0 +1,131 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8">
+<meta name="viewport" content="width=1920,height=538,initial-scale=1,user-scalable=no">
+<title>Dashcast</title>
+<style>
+/* ── 布局 ────────────────────────────────────────────────────────
+ *
+ * ★ 坑（2026-11-10 实测）：不要给 html/body 设 background:transparent
+ *   也不要省略 width/height。否则 body 撑不满视口，HUD.resize() 里
+ *   那句 Math.min(innerWidth / W, innerHeight / H) 算出来的 scale
+ *   小于 1，整块画面被缩小、右下露白边 —— 截图里就是这个现象。
+ *
+ *   正确做法：
+ *     · html/body 显式给足 1920×538
+ *     · 背景写 #000（不是 transparent），真正透明的是 canvas
+ *     · canvas 强制 1920×538
+ *
+ *   地图的透明是靠 canvas 自己的 alpha 通道做的：dashboard.js 在
+ *   mapExternal 模式下不涂地图区，那块像素 alpha=0，SurfaceView
+ *   就从下面透上来。
+ */
+html, body {
+    margin: 0;
+    padding: 0;
+    width: 1920px;
+    height: 538px;
+    background: #000;
+    overflow: hidden;
+    -webkit-user-select: none;
+    user-select: none;
+    -webkit-touch-callout: none;
+}
+
+#hud {
+    position: absolute;
+    left: 0;
+    top: 0;
+    width: 1920px !important;
+    height: 538px !important;
+    display: block;
+    /* canvas 自身要能透明，才能透出下面的地图 */
+    background: transparent;
+}
+</style></head>
+<body>
+<canvas id="hud" width="1920" height="538"></canvas>
+<script src="dashboard.js"></script>
+<script>
+/* ── 启动 ────────────────────────────────────────────────────────
+ *
+ * 三个关键点：
+ *   ① mapExternal = true  →  dashboard.js 把地图区留成透明洞
+ *   ② dpr = 1            →  车机屏 1920×538 物理像素，不按 DPR 放大
+ *                            （放大只会更糊，还多耗 4 倍内存）
+ *   ③ resize/fit 置空    →  车机屏尺寸固定，自适应只会添乱
+ */
+(function () {
+  var W = 1920, H = 538;
+  var cv = document.getElementById('hud');
+
+  try {
+    /* ── WebView 83 字距补丁 ────────────────────────────────────
+     *
+     * 车机 WebView 是 Chromium 83（com.android.webview 83.0.4103.120），
+     * 而 ctx.letterSpacing 要到 Chrome 99 才有。
+     *
+     * dashboard.js 里 setLS() 自带特性检测：
+     *   if ('letterSpacing' in ctx) ctx.letterSpacing = px + 'px';
+     * 所以在 83 上它会静默跳过 —— 不报错，但字距全丢，
+     * 数字和中文标题会挤在一起，设计稿的字间距节奏就没了。
+     *
+     * 补丁思路：往 CanvasRenderingContext2D.prototype 上塞一个
+     * letterSpacing 属性。dashboard.js 每帧会写这个值，
+     * 我们把它存起来供 fillText 包装读取。
+     *
+     * 注意：这里**不重写 fillText**（逐字绘制会让帧率掉一半），
+     * 只把值存住。真正需要字距的地方（数字、标题）由
+     * dashboard.js 自己的排版兜住。等确认视觉效果后再决定
+     * 要不要上逐字绘制。
+     */
+    (function patchLetterSpacing() {
+      var proto = window.CanvasRenderingContext2D
+               && window.CanvasRenderingContext2D.prototype;
+      if (!proto) return;
+      if ('letterSpacing' in proto) {
+        console.log('[dash] 原生支持 letterSpacing，无需补丁');
+        return;
+      }
+      try {
+        Object.defineProperty(proto, 'letterSpacing', {
+          configurable: true,
+          get: function () {
+            return this.__ls === undefined ? '0px' : this.__ls;
+          },
+          set: function (v) { this.__ls = v; }
+        });
+        console.log('[dash] 已注入 letterSpacing 属性（WebView 83 兼容）');
+      } catch (e) {
+        console.warn('[dash] letterSpacing 补丁失败: ' + e);
+      }
+    })();
+
+    var hud = new HUD(cv, {
+      autoSpeed: false,
+      autoPower: false,
+      /* ★ 外部地图模式：地图区不涂，透出下层 SurfaceView */
+      mapExternal: true
+    });
+
+    hud.resize = function () {};
+    hud.fit = function () {};
+    hud.dpr = 1;
+
+    cv.width = W;
+    cv.height = H;
+    cv.style.width = W + 'px';
+    cv.style.height = H + 'px';
+
+    /* 挂到 window，供 Android 侧 evaluateJavascript 调用：
+     *   webView.evaluateJavascript("hud.setData({speed:88})", null) */
+    window.hud = hud;
+
+    hud.start();
+
+    console.log('[dash] ready mapExternal=' + hud.mapExternal);
+  } catch (e) {
+    console.error('[dash] 启动失败: ' + e);
+  }
+})();
+</script>
+</body></html>

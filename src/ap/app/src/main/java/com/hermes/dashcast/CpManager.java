@@ -654,6 +654,53 @@ public class CpManager {
     }
 
     /**
+     * 投屏运行期的健康检查（2026-11-12 新增，方案 B 看门狗用）。
+     *
+     * 与 checkDashcastd() 的分工：
+     *   checkDashcastd()  只查「文件在不在、MD5 对不对」——**部署前**用
+     *   isRunningHealthy() 查「进程活没活 + 图层在不在」——**投屏中**用
+     *
+     * 为什么必须查图层：实测遇到过「dashcastd 进程活着，但 layer 99
+     * 被原厂仪表抢走 / 未创建」的情况 —— 进程在、端口通、AP 一直发帧，
+     * 仪表上却什么都没有。只查进程会误判成「一切正常」。
+     *
+     * 顺带查文件：CP 的 /run 是 tmpfs，车机重启后二进制直接消失，
+     * 进程自然不在 —— 这一步能区分「没部署」和「部署了但挂了」。
+     */
+    public boolean isRunningHealthy() {
+        try {
+            String out = execOnSession(acquireSession(),
+                    "echo -n 'PID='; pidof dashcastd || echo NONE; "
+                    + "echo -n ' LAYER='; "
+                    + "export XDG_RUNTIME_DIR=/etc/weston/weston_xdg_runtime_dir; "
+                    + "export WAYLAND_DISPLAY=wayland-1; "
+                    + "LayerManagerControl get layer " + LAYER_ID_CAST
+                    + " 2>&1 | grep -c 'visibility: *1' || echo 0");
+            out = out == null ? "" : out.trim();
+
+            boolean pidOk = !out.contains("PID=NONE") && out.contains("PID=");
+
+            int layerOk = 0;
+            int li = out.indexOf("LAYER=");
+            if (li >= 0) {
+                String tail = out.substring(li + 6).trim();
+                StringBuilder d = new StringBuilder();
+                for (int i = 0; i < tail.length() && Character.isDigit(tail.charAt(i)); i++) {
+                    d.append(tail.charAt(i));
+                }
+                if (d.length() > 0) layerOk = Integer.parseInt(d.toString());
+            }
+
+            DashLog.i(TAG, "CP 健康检查: 进程=" + (pidOk ? "活" : "死")
+                    + " 图层" + LAYER_ID_CAST + "=" + (layerOk > 0 ? "可见" : "不可见"));
+            return pidOk && layerOk > 0;
+        } catch (Exception e) {
+            DashLog.w(TAG, "CP 健康检查失败: " + e.getMessage());
+            return false;
+        }
+    }
+
+    /**
      * 读 CP 上 dashcastd 的日志尾部 + 进程状态。
      * 推流断了的时候，AP 侧只能看到 ECONNREFUSED，真正原因在这里。
      */

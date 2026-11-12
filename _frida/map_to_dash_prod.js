@@ -84,7 +84,15 @@ var CFG = {
      * 要启用 UI 层时：把 ui_layer.js 正式加进构建链
      * （按 bridge → ui_layer → 本文件 的顺序拼接），再打开这个开关。
      */
-    UI_ENABLED: false,
+    UI_ENABLED: true,
+    /* 帧协议版本（2026-11-10）
+     *
+     * 1 = VDF1：16 字节头，无 CRC（原版，dcapd2 现在只认这个）
+     * 2 = VDF2：32 字节头 + CRC32 + seq + dropped 标志
+     *
+     * 默认 1。等 dcapd2 侧支持 VDF2 后再切 2。
+     */
+    PROTO_VER: 1,
     /* 发送节奏：50ms=20Hz。比 FPS 稍慢一点，让发送端自然丢弃重复帧，
      * 避免 JS 线程和主线程抢同一份 buffer。实测设 33ms 反而掉到 15fps。 */
     SEND_MS: 50,
@@ -100,7 +108,9 @@ function log(s) { console.log('[MAP] ' + s); }
 
 var NET = { sock: null, out: null, ok: false, err: 'none' };
 var FP  = { seq: 0, arr: null, prod: 0, sent: 0, err: 0 };
-var CTX = { stopper: false, hh: null, bmp: null, buf: null, mv: null, hc: null, listener: null };
+var CTX = { stopper: false, hh: null, bmp: null, buf: null, mv: null, hc: null, listener: null,
+            /* 必须持住这三个，否则 GC 回收 VirtualDisplay → -19 进程被杀 */
+            vd: null, surf: null, st: null };
 /* 双缓冲：两个 ByteBuffer 轮换，避免 JS 线程读到正在写的缓冲 */
 var BUF = { b0: null, b1: null, wi: 0 };
 
@@ -151,31 +161,141 @@ function d2_connect() {
 }
 
 /* ── Frida 线程发送 ──────────────────────────────────────── */
+/*
+ * 协议加固（2026-11-10，参考 GD-Bridge 的 GCP1 设计）
+ *
+ * 原始 VDF1：magic(4) + w(4) + h(4) + stride(4) = 16 字节头，无校验。
+ *
+ * 加固后（VDF2，向后兼容 VDF1）：
+ *   offset 0   4   magic   0x56444632 ("VDF2")
+ *   offset 4   4   w
+ *   offset 8   4   h
+ *   offset 12  4   stride_px
+ *   offset 16  4   seq            帧序号
+ *   offset 20  4   payloadCrc     CRC32(payload)
+ *   offset 24  4   headerCrc      CRC32(前 24 字节)
+ *   offset 28  4   flags          bit0=DROPPED（上一帧丢了）
+ *   total 32 字节头 + payload
+ *
+ * 为什么加 CRC：
+ *   车机网络不稳，一帧 4MB 传输中途出错，dcapd2 收到残缺数据会画出
+ *   花屏甚至崩。CRC 让它能丢弃坏帧、保留上一帧。
+ *
+ * 为什么加 seq：
+ *   dcapd2 可以检测丢帧（seq 不连续），配合看门狗判断链路死。
+ *
+ * 兼容性：
+ *   dcapd2 如果只认 VDF1，会因为我们发 VDF2 而报错。
+ *   所以用 CFG.PROTO_VER 控制，默认仍是 1（VDF1），
+ *   等 dcapd2 侧改好了再切到 2。
+ */
 var lastSeq = 0;
+var txSeq = 0;
+var dropCount = 0;
+
+/* CRC32 查表（懒初始化） */
+var CRC_TABLE = null;
+function crc32Init() {
+    if (CRC_TABLE !== null) return;
+    CRC_TABLE = [];
+    for (var n = 0; n < 256; n++) {
+        var c = n;
+        for (var k = 0; k < 8; k++) {
+            c = (c & 1) ? (0xEDB88320 ^ (c >>> 1)) : (c >>> 1);
+        }
+        CRC_TABLE[n] = c >>> 0;
+    }
+}
+function crc32(arr, len) {
+    crc32Init();
+    var c = 0xFFFFFFFF;
+    for (var i = 0; i < len; i++) {
+        c = CRC_TABLE[(c ^ arr[i]) & 0xFF] ^ (c >>> 8);
+    }
+    return (c ^ 0xFFFFFFFF) >>> 0;
+}
+/* 头部字节算 CRC（头部是小字节数组） */
+function crc32Bytes(bytes, len) {
+    crc32Init();
+    var c = 0xFFFFFFFF;
+    for (var i = 0; i < len; i++) {
+        c = CRC_TABLE[(c ^ (bytes[i] & 0xFF)) & 0xFF] ^ (c >>> 8);
+    }
+    return (c ^ 0xFFFFFFFF) >>> 0;
+}
+function le32(v) {
+    return [v & 0xFF, (v >>> 8) & 0xFF, (v >>> 16) & 0xFF, (v >>> 24) & 0xFF];
+}
+
 setInterval(function () {
     if (FP.seq === lastSeq || FP.arr === null) return;
     if (!NET.ok) { d2_connect(); return; }
 
     var arr = FP.arr;
+    var dropped = (FP.seq - lastSeq) > 1;   /* 中间跳过了帧 */
+    if (dropped) dropCount++;
     lastSeq = FP.seq;
+    txSeq++;
 
     try {
-        var hdr = Java.array('byte', [
-            0x31, 0x46, 0x44, 0x56,
-            (CFG.W & 0xFF), ((CFG.W >> 8) & 0xFF), 0, 0,
-            (CFG.H & 0xFF), ((CFG.H >> 8) & 0xFF), 0, 0,
-            (CFG.W & 0xFF), ((CFG.W >> 8) & 0xFF), 0, 0
-        ]);
+        var hdr;
+        if (CFG.PROTO_VER === 2) {
+            /* VDF2：32 字节头 + CRC */
+            var h = [];
+            /* magic "VDF2" */
+            h = h.concat([0x32, 0x46, 0x44, 0x56]);
+            h = h.concat(le32(CFG.W));
+            h = h.concat(le32(CFG.H));
+            h = h.concat(le32(CFG.W));            /* stride_px */
+            h = h.concat(le32(txSeq));
+            var payCrc = crc32(arr, FRAME_BYTES);
+            h = h.concat(le32(payCrc));
+            var hdrCrc = crc32Bytes(h, 24);
+            h = h.concat(le32(hdrCrc));
+            h = h.concat(le32(dropped ? 1 : 0));
+            hdr = Java.array('byte', h);
+        } else {
+            /* VDF1：16 字节头（原样，无校验） */
+            hdr = Java.array('byte', [
+                0x31, 0x46, 0x44, 0x56,
+                (CFG.W & 0xFF), ((CFG.W >> 8) & 0xFF), 0, 0,
+                (CFG.H & 0xFF), ((CFG.H >> 8) & 0xFF), 0, 0,
+                (CFG.W & 0xFF), ((CFG.W >> 8) & 0xFF), 0, 0
+            ]);
+        }
         NET.out.write.overload('[B').call(NET.out, hdr);
         NET.out.write.overload('[B').call(NET.out, arr);
         NET.out.flush();
         FP.sent++;
+        FP.lastTxAt = Date.now();
     } catch (e) {
         NET.ok = false;
         NET.err = String(e).substring(0, 70);
         log('发送失败，将重连: ' + NET.err);
     }
 }, CFG.SEND_MS);
+
+/* ── 看门狗（2026-11-10）─────────────────────────────────────
+ *
+ * 每 2 秒检查一次：
+ *   · 超过 3 秒没成功发帧 → 判定链路死，重连
+ *   · 连续重连失败 5 次 → 打日志（dcapd2 可能没启动）
+ *
+ * 为什么需要：
+ *   dcapd2 崩溃后 TCP 连接会先僵死（不发 FIN），
+ *   我们继续 write 也不会报错，但帧全丢。
+ *   靠"上次成功发送时间"能发现这种情况。
+ */
+setInterval(function () {
+    if (!NET.ok) return;
+    var now = Date.now();
+    var lastOk = FP.lastTxAt || 0;
+    if (lastOk > 0 && (now - lastOk) > 3000) {
+        log('看门狗：3 秒无成功发送，强制重连');
+        NET.ok = false;
+        d2_connect();
+    }
+}, 2000);
 
 /* ── 统计 ─────────────────────────────────────────────────── */
 var tPrev = Date.now(), pPrev = 0, sPrev = 0;
@@ -184,10 +304,47 @@ setInterval(function () {
     if (dt <= 0) return;
     var pf = (FP.prod - pPrev) / dt, sf = (FP.sent - sPrev) / dt;
     tPrev = now; pPrev = FP.prod; sPrev = FP.sent;
+
+    /* 车辆数据同步（5 秒一次，和 STAT 同频）
+     *
+     * 数据变化慢，不需要每帧读。读失败沿用上次值，不会跳 0。
+     */
+    /* 配置热重载（改 /data/local/tmp/mapcast.cfg 后 5 秒内生效） */
+    try {
+        if (typeof cfgxReloadIfChanged === 'function') cfgxReloadIfChanged();
+    } catch (e) {}
+
+    var vInfo = '';
+    try {
+        if (typeof dashSyncVehicle === 'function' && typeof DASH !== 'undefined' && DASH.hud) {
+            dashSyncVehicle();
+            vInfo = ' 车辆=' + (typeof VEH !== 'undefined' ? VEH.channel : '?')
+                  + '(' + Math.round(DASH.hud.data.speed) + 'km/h)';
+        }
+    } catch (e) {}
+
+    var mInfo = '';
+    try {
+        if (typeof dashSyncMedia === 'function' && typeof DASH !== 'undefined' && DASH.hud) {
+            dashSyncMedia();
+            mInfo = ' 媒体=' + (MEDIA.state.title ? '(' + MEDIA.state.title + ')' : '(空)');
+        }
+    } catch (e) {}
+
+    /* mock 数据：没接真实车辆时让车速自己动，验证 UI */
+    try {
+        if (typeof dashMockTick === 'function' && typeof DASH_MOCK !== 'undefined' && DASH_MOCK.on) {
+            dashMockTick();
+        }
+    } catch (e) {}
+
     log('STAT 抓=' + FP.prod + '(' + pf.toFixed(1) + 'fps)'
         + ' 发=' + FP.sent + '(' + sf.toFixed(1) + 'fps)'
         + ' 耗时=' + (FP.cost || 0) + 'ms 错=' + FP.err
+        + ' [UI=' + (FP.tUi || 0) + ' 拷贝=' + (FP.tCopy || 0) + ' 取=' + (FP.tGet || 0)
+        + ' draw=' + (typeof DASH !== 'undefined' ? (DASH.lastDrawMs || 0) : 0) + ']'
         + ' 帧率=' + DYN.fps + (DYN.fps === CFG.IDLE_FPS ? '(静止)' : '(活动)')
+        + vInfo + mInfo
         + ' 网=' + (NET.ok ? 'OK' : 'DOWN'));
 }, 5000);
 
@@ -221,6 +378,27 @@ Java.perform(function () {
     var displayId = vd.getDisplay().getDisplayId();
     log('VirtualDisplay displayId=' + displayId + ' flags=0x3');
 
+    /* ★★ 必须持住 vd / surf / st（2026-11-10，-19 崩溃的根因）
+     *
+     * 症状：
+     *   logcat 里刷满
+     *     CompositionEngine: ANativeWindow::dequeueBuffer failed
+     *     for display [DashcastMap] with error: -19
+     *   然后 Process terminated —— 地图进程被系统杀掉。
+     *
+     * 原因：
+     *   这三个对象原来只是 Java.perform 回调里的局部变量。
+     *   回调返回后没人引用，ART 的 GC 就把 VirtualDisplay 回收了。
+     *   VirtualDisplay 一死，它内部持有的 producer Surface 变成
+     *   ENODEV(-19)，SurfaceFlinger 还在往这块已释放的 buffer 里合成
+     *   → dequeueBuffer 疯狂失败 → 进程被干掉。
+     *
+     * 修：挂到 CTX 上，生命周期跟着整个注入会话。
+     */
+    CTX.vd = vd;
+    CTX.surf = surf;
+    CTX.st = st;
+
     CTX.hh = Handler.$new(Looper.getMainLooper());
     var R = Java.use('java.lang.Runnable');
     var ByteBuffer = Java.use('java.nio.ByteBuffer');
@@ -233,12 +411,65 @@ Java.perform(function () {
                     CTX.bmp = bmp;
 
                     /* UI 层：bmp 建好后初始化。它自己维护一张独立的 UI Bitmap，
-                     * 每帧合成时才贴到 bmp 上（见 uiComposite 调用处） */
+                     * 每帧合成时才贴到 bmp 上（见 uiComposite 调用处）
+                     *
+                     * 注意函数名：Android Canvas 版是 uiaInit()，
+                     * 不是旧的 uiInit()（那是 CP 侧 mcv 方案的名字）。 */
                     if (CFG.UI_ENABLED) {
+                        /* 先加载配置（可能覆盖 UIL2 的布局和颜色），
+                         * 再初始化 UI —— 顺序不能反。
+                         *
+                         * cfgxInit() 读 /data/local/tmp/mapcast.cfg，
+                         * 里面有 gauge.x / speedo.r / theme.accent 这些，
+                         * 必须在 uiaInit() 建画布之前应用。 */
                         try {
-                            uiInit();
+                            if (typeof cfgxInit === 'function') cfgxInit();
                         } catch (e) {
-                            log('UI 初始化失败 ' + String(e).substring(0, 80));
+                            log('配置加载失败 ' + String(e).substring(0, 80));
+                        }
+
+                        /* 用 dashboard.js + Canvas2D 适配器（2026-11-10 换方案）
+                         *
+                         * 不再用旧的 ui_android.js（手写简化版），
+                         * 改成跑用户的 dashboard.js —— 设计更完整，
+                         * 2171 行、14 个 draw* 模块、中文原生支持。
+                         */
+                        try {
+                            if (typeof dashInit === 'function') {
+                                dashInit();
+                                if (typeof dashCreateHud === 'function') dashCreateHud();
+                            }
+                        } catch (e) {
+                            log('仪表盘初始化失败 ' + String(e).substring(0, 80));
+                        }
+
+                        /* ★ 车辆数据：五路并联探测（vehicle.js）
+                         *
+                         * 探测一次，之后每秒同步一次（数据变化慢，不需要每帧读）。
+                         * 探测失败会降级 mock，不影响投屏。
+                         */
+                        try {
+                            if (typeof vehInit === 'function') {
+                                var ch = vehInit();
+                                log('车辆数据通道: ' + ch);
+                                if (typeof vehSyncToUi === 'function') vehSyncToUi();
+                            }
+                        } catch (e) {
+                            log('车辆数据初始化失败 ' + String(e).substring(0, 80));
+                        }
+
+                        /* ★ 媒体信息（media.js）
+                         *
+                         * 大概率拿不到（地图进程没有 MEDIA_CONTENT_CONTROL），
+                         * 失败就显示"暂无媒体"，不影响其他功能。
+                         */
+                        try {
+                            if (typeof medInit === 'function') {
+                                var mch = medInit();
+                                log('媒体通道: ' + mch);
+                            }
+                        } catch (e) {
+                            log('媒体初始化失败 ' + String(e).substring(0, 80));
                         }
                     }
                     /* ★ 红蓝互换用的目标 Bitmap + Canvas（Java 层原生速度） */
@@ -280,39 +511,76 @@ Java.perform(function () {
                             onPixelCopyFinished: function (res) {
                                 if (CTX.stopper) return;
 
-                                if (res === 0) {
-                                    try {
+                                    if (res === 0) {
+                                        try {
                                         /* 双缓冲：idx 同步切换，bb 与 arr 配对使用 */
                                         var t0 = Date.now();
+                                        var tUi = 0, tCopy = 0, tGet = 0;
                                         var idx = BUF.wi;
                                         BUF.wi ^= 1;
 
                                         var bb = (idx === 0) ? BUF.b0 : BUF.b1;
                                         var arr = (idx === 0) ? BUF.a0 : BUF.a1;
 
-                                        /* ★ UI 合成（必须在 copyPixelsToBuffer 之前）
-                                         *
-                                         * PixelCopy 每帧把地图覆盖写进 bmp，
-                                         * 所以每帧都要重新把 UI 贴上去。
-                                         * uiComposite 内部有 1 秒节流，UI 只在
-                                         * 数据变化时重绘，每帧只做一次 drawBitmap。
-                                         */
-                                        if (CFG.UI_ENABLED) uiComposite(bmp);
+                                    /* ★ UI 合成（必须在 copyPixelsToBuffer 之前）
+                                     *
+                                     * PixelCopy 每帧把地图覆盖写进 bmp，
+                                     * 所以每帧都要重新把 dashboard 画上去。
+                                     *
+                                     * dashFrame() 内部：
+                                     *   · 累加 dashboard 的动画时间
+                                     *   · 调 hud.draw(t)（14 个 draw* 模块）
+                                     *   · Canvas2D 适配器把绘制落到 DASH.bmp 上
+                                     *
+                                     * 然后把 DASH.bmp 贴到地图 bmp 上（一次 drawBitmap）。
+                                     */
+                                    if (CFG.UI_ENABLED) {
+                                        try {
+                                            var tUi0 = Date.now();
+                                            if (typeof dashFrame === 'function') {
+                                                dashFrame();
+                                                if (typeof DASH !== 'undefined' && DASH.bmp) {
+                                                    if (CTX.uiCanvas === null || CTX.uiCanvas === undefined) {
+                                                        CTX.uiCanvas = Java.use('android.graphics.Canvas').$new(bmp);
+                                                    }
+                                                    CTX.uiCanvas.drawBitmap(DASH.bmp, 0, 0, CTX.uiPaint || (CTX.uiPaint = (function(){
+                                                        var pp = Java.use('android.graphics.Paint').$new();
+                                                        pp.setAntiAlias(false);
+                                                        pp.setFilterBitmap(false);
+                                                        pp.setAlpha(255);
+                                                        return pp;
+                                                    })()));
+                                                }
+                                            }
+                                            tUi = Date.now() - tUi0;
+                                        } catch (e) {
+                                            if (!CTX.uiErrShown) {
+                                                CTX.uiErrShown = true;
+                                                log('UI 合成失败 ' + String(e).substring(0, 100));
+                                            }
+                                        }
+                                    }
 
                                         /* ★ 直接拷贝（copyPixelsToBuffer 出的就是
                                            dcapd2 要的字节序，无需 ColorMatrix 转换）
                                            实测：加了 R/B 互换反而让车标由蓝变橙 */
+                                        var tCopy0 = Date.now();
                                         bb.rewind();
                                         bmp.copyPixelsToBuffer(bb);
+                                        tCopy = Date.now() - tCopy0;
 
                                         /* ★ 复用预分配 byte[]，无 JS 数组创建 */
+                                        var tGet0 = Date.now();
                                         bb.rewind();
                                         bb.get(arr, 0, FRAME_BYTES);
+                                        tGet = Date.now() - tGet0;
 
                                         FP.arr = arr;
                                         FP.seq++;
                                         FP.prod++;
                                         FP.cost = Date.now() - t0;
+                                        /* 分段耗时：UI 渲染 / copyPixelsToBuffer / bb.get */
+                                        FP.tUi = tUi; FP.tCopy = tCopy; FP.tGet = tGet;
 
                                         /* ── 画面变化检测（动态帧率用） ──
                                          *
@@ -512,17 +780,42 @@ Java.perform(function () {
                                 tries++;
                                 try {
                                     var found = null;
+                                    var seen = [];
                                     Java.choose('com.ecarx.navi.multiscreen.hud.HudActivity', {
                                         onMatch: function (a) {
                                             try {
-                                                if (a.getDisplay().getDisplayId() === displayId
-                                                    && !a.isDestroyed() && !found) {
+                                                if (a.isDestroyed()) return;
+                                                var did = -1;
+                                                try { did = a.getDisplay().getDisplayId(); } catch (eD) {}
+                                                seen.push(did);
+                                                /* ★ 放宽匹配（2026-11-10）
+                                                 *
+                                                 * 原来要求 did === displayId（我们的 VD）。
+                                                 * 但 HudActivity 通过 `am display move-stack`
+                                                 * 搬过来之后，个别时机下 getDisplayId()
+                                                 * 还是旧值，或 Activity 尚未 finish 迁移，
+                                                 * 于是永远匹配不上 —— 日志一直
+                                                 * 「HudActivity 未就绪」，STAT 恒 0fps，
+                                                 * 而 dumpsys 里它明明已经 Resumed 在目标屏。
+                                                 *
+                                                 * 改成：优先要目标 display；没有就先收下第一个
+                                                 * 存活实例（后面 startPc 会拿 SurfaceView，
+                                                 * 真实尺寸还是由 HUDControl 决定）。
+                                                 */
+                                                if (!found) {
                                                     found = a;
+                                                } else if (did === displayId) {
+                                                    found = a;   /* 命中目标屏，覆盖 */
                                                 }
                                             } catch (e) {}
                                         },
                                         onComplete: function () {}
                                     });
+                                    if (tries <= 3) {
+                                        log('轮询 ' + tries + ' :: 找到 ' + seen.length
+                                            + ' 个实例 display=' + seen.join(',')
+                                            + ' 目标=' + displayId);
+                                    }
 
                                     if (found) {
                                         /*
@@ -553,13 +846,38 @@ Java.perform(function () {
                                             }
                                         };
 
+                                        /* ★ 字段没就绪时必须"重新调度"，不能 return
+                                         *
+                                         * bug（2026-11-10 实测）：
+                                         *   原来这里写 `if (!svc) { return; }`
+                                         *   —— return 直接退出 run()，
+                                         *   跳过了末尾的 `if (tries < want) postDelayed`，
+                                         *   于是轮询只跑 1 次就死掉。
+                                         *
+                                         * 现象：HudActivity 明明已在目标 display 上
+                                         * （dumpsys 可见 Resumed + 有 Window），
+                                         * 日志却始终打「HudActivity 未就绪」，
+                                         * STAT 恒 0fps。
+                                         *
+                                         * 修：抽成 rePoll()，字段缺失时先重排再 return。
+                                         */
+                                        var rePoll = function (why) {
+                                            if (tries <= 3) log('轮询 ' + tries + ' :: 未就绪(' + why + ')');
+                                            if (tries < want) {
+                                                hh.postDelayed(pollInst, 1500);
+                                            } else {
+                                                log('HudActivity 未就绪（轮询 ' + tries + ' 次后放弃）');
+                                            }
+                                        };
+
                                         var svc = rf(found, 'service');
-                                        if (!svc) { return; }
+                                        if (!svc) { rePoll('service'); return; }
                                         var hc = rf(svc, 'mControl');
-                                        if (!hc) { return; }
+                                        if (!hc) { rePoll('mControl'); return; }
                                         var sfc = rf(hc, 'surfaceViewControl');
-                                        if (!sfc) { return; }
+                                        if (!sfc) { rePoll('surfaceViewControl'); return; }
                                         var msv = rf(sfc, 'mSurfaceView');
+                                        if (!msv) { rePoll('mSurfaceView'); return; }
                                         if (msv) {
                                             CTX.hudAct = found;
                                             CTX.hc = hc;

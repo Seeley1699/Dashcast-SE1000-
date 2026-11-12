@@ -115,7 +115,61 @@ public class DiagReceiver extends BroadcastReceiver {
                         } else {
                             sb.append("(未知子命令: ").append(sub).append(")\n");
                         }
-                    } else if (cmd.startsWith("push:")) {
+                    } else if (cmd.startsWith("evcc:")) {
+                    /*
+                     * EVCC 探测通道（2026-11-12 新增）
+                     *
+                     *   evcc:probe   —— 连 EVCC、拉全量属性目录、写文件
+                     *   evcc:status  —— 只看能否连上，不拉目录
+                     *
+                     * 为什么要这个：EVCC 有 9 路属性源，同一个概念
+                     * （远光/双闪/歌词）在不同源里 ID 和名字完全不同，
+                     * 必须先导出真实目录才能写正式映射。
+                     */
+                    String sub2 = cmd.substring(5).trim();
+                    if ("probe".equals(sub2)) {
+                        sb.append("EVCC_PROBE_START\n");
+                        final java.util.concurrent.CountDownLatch done =
+                                new java.util.concurrent.CountDownLatch(1);
+                        final String[] res = new String[1];
+                        EvccProbe.run(context.getApplicationContext(),
+                                (ok, summary, path) -> {
+                                    res[0] = (ok ? "EVCC_PROBE_OK\n" : "EVCC_PROBE_FAIL\n")
+                                            + summary + "\n"
+                                            + (path == null ? "" : ("FILE=" + path + "\n"));
+                                    done.countDown();
+                                });
+                        try {
+                            done.await(60, java.util.concurrent.TimeUnit.SECONDS);
+                        } catch (InterruptedException ie) {
+                            Thread.currentThread().interrupt();
+                        }
+                        sb.append(res[0] == null ? "(超时)\n" : res[0]);
+                    } else if ("live".equals(sub2)) {
+                        /* evcc:live —— 导出所有关心属性的实时值 */
+                        sb.append("EVCC_LIVE_START\n");
+                        final java.util.concurrent.CountDownLatch done2 =
+                                new java.util.concurrent.CountDownLatch(1);
+                        final String[] res2 = new String[1];
+                        EvccLiveDump.run(context.getApplicationContext(),
+                                (ok2, sum2, path2) -> {
+                                    res2[0] = (ok2 ? "EVCC_LIVE_OK\n" : "EVCC_LIVE_FAIL\n")
+                                            + sum2 + "\n"
+                                            + (path2 == null ? "" : ("FILE=" + path2 + "\n"));
+                                    done2.countDown();
+                                });
+                        try {
+                            done2.await(60, java.util.concurrent.TimeUnit.SECONDS);
+                        } catch (InterruptedException ie) {
+                            Thread.currentThread().interrupt();
+                        }
+                        sb.append(res2[0] == null ? "(超时)\n" : res2[0]);
+                    } else if ("status".equals(sub2)) {
+                        sb.append("(用 evcc:probe 拉全量目录，evcc:live 导出实时值)\n");
+                    } else {
+                        sb.append("(未知 evcc 子命令: ").append(sub2).append(")\n");
+                    }
+                } else if (cmd.startsWith("push:")) {
                         // push:<AP路径>:<CP路径>[:exec]
                         String[] p = cmd.split(":");
                         if (p.length < 3) {

@@ -53,7 +53,21 @@ public class MirrorController {
     }
 
     private static final String BIN = "/data/local/tmp/dcapd2";
-    private static final String BIN_MD5 = "40ee2998a9ea0f2af678aad96b887b50";
+    /*
+     * dcapd2 二进制的 MD5 —— **运行时从 assets 算出来**，不再硬编码。
+     *
+     * ★ 2026-11-12 修（这是"普通投屏启动失败"的真因）
+     *
+     * 原来写死成 "40ee2998..."，每次重新编译 dcapd2 都要手工同步这个常量。
+     * 这次改代码时忘了改它，于是：
+     *   · 新二进制推上去了（落盘 MD5 9ceb6d2e 完全正确）
+     *   · 但校验拿旧的 40ee2998 去比对 → 永远不匹配
+     *   · 判定"部署失败" → 无限重推 → 普通投屏永远起不来
+     *   · 地图投屏不受影响（它用 MapCastService 的 ensureBinary，走 MD5 比对逻辑）
+     *
+     * 现在从 assets/dcapd2.b64 解码后现算，改二进制再也不用手工同步。
+     */
+    private static String sBinMd5 = null;
     private static final String PAUSE = "/data/local/tmp/dcapd2.pause";
     private static final String LOGF = "/data/local/tmp/dcapd2.log";
     /** 编码档位文件：App 写数字，dcapd2 每 500ms 轮询，运行时切档不重启进程 */
@@ -1354,12 +1368,43 @@ public class MirrorController {
     }
 
     // ============================== 部署与启动 ==============================
+    /**
+     * 算 assets/dcapd2.b64 解码后的 MD5（懒算 + 缓存）。
+     * assets 里没有或解码失败返回 null。
+     */
+    private String binMd5() {
+        if (sBinMd5 != null) return sBinMd5;
+        try {
+            String b64 = readAsset("dcapd2.b64");
+            if (b64 == null || b64.isEmpty()) {
+                DashLog.e(TAG, "binMd5: assets 里没有 dcapd2.b64");
+                return null;
+            }
+            byte[] raw = android.util.Base64.decode(b64.trim(),
+                    android.util.Base64.DEFAULT);
+            java.security.MessageDigest md =
+                    java.security.MessageDigest.getInstance("MD5");
+            byte[] dig = md.digest(raw);
+            StringBuilder sb = new StringBuilder(dig.length * 2);
+            for (byte x : dig) sb.append(String.format("%02x", x));
+            sBinMd5 = sb.toString();
+            DashLog.i(TAG, "assets/dcapd2 的 MD5 = " + sBinMd5
+                    + "（" + raw.length + " 字节）");
+            return sBinMd5;
+        } catch (Throwable t) {
+            DashLog.e(TAG, "binMd5: " + t);
+            return null;
+        }
+    }
+
 
     /** 确认 /data/local/tmp/dcapd2 是最新版本，不是就推一遍。 */
     private boolean ensureBinary() {
         try {
             String out = AdbShell.exec("md5sum " + BIN + " 2>/dev/null", CHUNK);
-            if (out != null && out.contains(BIN_MD5)) {
+            String want0 = binMd5();
+            if (want0 != null && out != null
+                    && out.toLowerCase().contains(want0)) {
                 DashLog.i(TAG, "dcapd2 已是最新");
                 return true;
             }
@@ -1389,7 +1434,9 @@ public class MirrorController {
                     + " && chmod 755 " + BIN + " && rm -f " + BIN + ".b64", 8000);
 
             String chk = AdbShell.exec("md5sum " + BIN, CHUNK);
-            boolean ok = chk != null && chk.contains(BIN_MD5);
+            String want2 = binMd5();
+        boolean ok = chk != null && want2 != null
+                && chk.toLowerCase().contains(want2);
             DashLog.i(TAG, ok ? "dcapd2 落盘校验通过" : "dcapd2 落盘校验失败: " + chk);
             return ok;
         } catch (Throwable t) {
@@ -2435,8 +2482,24 @@ public class MirrorController {
 
     public static void loadCodec(Context c) {
         if (c == null) return;
-        codec = prefs(c).getInt(PREF_CODEC, CODEC_BGRA) == CODEC_H264
-                ? CODEC_H264 : CODEC_BGRA;
+        int want = prefs(c).getInt(PREF_CODEC, CODEC_BGRA);
+        /*
+         * ★ 强制 BGRA+LZ4（2026-11-12 修）
+         *
+         * 当前 dcapd2 构建里 H.264 编码器是桩实现（h264stub.c），
+         * 切到 H.264 会一帧都发不出去（tiles=0）。
+         *
+         * 但 prefs 里可能残留旧值 2（用户之前点过 H.264），
+         * 于是 UI 按钮显示 H.264 选中、实际 dcapd2 跑 BGRA ——
+         * 状态不一致，用户以为"选了 H.264 却还是不行"。
+         *
+         * 这里把残留值直接纠正为 BGRA，让 UI 和实际对齐。
+         */
+        codec = CODEC_BGRA;
+        if (want == CODEC_H264) {
+            prefs(c).edit().putInt(PREF_CODEC, CODEC_BGRA).apply();
+            DashLog.w(TAG, "prefs 残留 H.264（该构建不支持），已纠正为 BGRA+LZ4");
+        }
         loadFps(c);
     }
 

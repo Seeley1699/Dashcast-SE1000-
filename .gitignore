@@ -57,3 +57,6 @@ tools/render-ui.bat
 src/cp/dashuid_probe*
 src/cp/build-dashuid-probe.sh
 src/cp/.build-probe/
+# EVCC SDK 模块的构建产物（2026-11-12）
+src/ap/evccapi-client/build/
+src/ap/evccapi-contract/build/

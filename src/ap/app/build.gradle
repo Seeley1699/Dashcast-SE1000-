@@ -6,7 +6,12 @@ android {
 
     defaultConfig {
         applicationId "com.hermes.dashcast"
-        minSdk 26
+        /*
+         * 26 → 28（2026-11-12）
+         * EVCC 开放 API 的 SDK 要求 minSdk 28；本车是 Android 11（API 30），
+         * 提到 28 不影响任何现有功能。
+         */
+        minSdk 28
         targetSdk 35
         versionCode 1
         versionName "1.0"
@@ -19,8 +24,8 @@ android {
     }
 
     compileOptions {
-        sourceCompatibility JavaVersion.VERSION_1_8
-        targetCompatibility JavaVersion.VERSION_1_8
+        sourceCompatibility JavaVersion.VERSION_11
+        targetCompatibility JavaVersion.VERSION_11
     }
 
     packagingOptions {
@@ -33,4 +38,18 @@ android {
 
 dependencies {
     implementation 'com.jcraft:jsch:0.1.55'
+
+    /*
+     * EVCC 开放 API（2026-11-12 接入）
+     *
+     * 为什么：VHAL 里 0x11400e01（远光）/ 0x11400e03（双闪）的
+     * timestamp 恒为 0 —— VHAL 层根本没接这两个信号，拿到的 [1]
+     * 只是 CarService 初始化默认值。EVCC 自己维护了 9 路属性源
+     * （VHAL/APVP/VEHICLE_AIDL/CAPI/ADAPT_API/SOA/GEELY_CAPI/GEELY_AIDL），
+     * 通过标准 AIDL 暴露，能拿到 VHAL 层拿不到的真实值。
+     *
+     * 优先用 SDK（自动重连、订阅恢复、事件序号检测都是现成的），
+     * 比手写 Binder 客户端可靠。
+     */
+    implementation project(':evccapi-client')
 }

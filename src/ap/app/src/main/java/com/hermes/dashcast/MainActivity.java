@@ -3376,6 +3376,25 @@ public class MainActivity extends Activity {
 
     /** 切换编码档（二选一）。已在目标档位就什么都不做，避免无谓重启 daemon。 */
     private void setCodecMode(int want) {
+        /*
+         * ★ Java 渲染模式只支持 BGRA+LZ4（2026-11-11 加）
+         *
+         * dcapd2 当前构建里 H.264 编码器是桩实现
+         * （h264enc.c 依赖 NDK media 头，交叉编译链没有，
+         *  改用 h264stub.c 提供空函数）。
+         *
+         * 一旦切到 H.264：
+         *   dcapd2 打 "H.264 编码器启动失败，回退到 BGRA 档"
+         *   → tiles=0、totalKB=0 → **一帧都发不出去**
+         *   而 App 侧日志还显示 29fps 在发，极具迷惑性。
+         *
+         * 实测踩过一次，排查半小时。这里直接挡住。
+         */
+        if (want == MirrorController.CODEC_H264) {
+            setStatus("状态：当前构建仅支持 BGRA+LZ4（H.264 编码器未编进来）");
+            refreshCodecButtons();
+            return;
+        }
         int cur = MirrorController.getCodec();
         if (cur == want) return;
         mirror.setCodec(want);
@@ -4280,8 +4299,34 @@ public class MainActivity extends Activity {
                             : "地图 HUD 未确认到位（继续尝试抓取）");
                 }
 
-                // 先确认 CP 上有可执行的 dashcastd（被「停止服务」删过就自动重推），再启动
-                ok = cpManager.ensureDashcastd() && cpManager.startDashcastd();
+                /*
+                 * 先确认 CP 上有可执行的 dashcastd（被「停止服务」删过就自动重推），再启动
+                 *
+                 * ★ 2026-11-12 加强：分步检查 + 明确失败原因
+                 *
+                 * 原来是 `ensureDashcastd() && startDashcastd()` 一行，
+                 * 短路求值让「哪一步失败」完全看不出来 —— 用户只看到
+                 * 「启动 dashcastd 失败（CP 侧接收端没起来）」。
+                 *
+                 * 实测踩到：/run 是 tmpfs，车机重启后二进制直接消失，
+                 * ensureDashcastd() 返回 false，startDashcastd() 根本没跑，
+                 * 而日志里没有任何线索指向「文件没了」。
+                 */
+                boolean cDeployed = cpManager.ensureDashcastd();
+                if (!cDeployed) {
+                    appendLog("CP 二进制部署失败（/run 是 tmpfs，重启会丢，需重新推送）");
+                    appendLog(cpManager.tailLog(8));
+                    ok = false;
+                } else {
+                    boolean cStarted = cpManager.startDashcastd();
+                    if (!cStarted) {
+                        appendLog("CP 侧 dashcastd 启动失败，CP 日志：");
+                        appendLog(cpManager.tailLog(8));
+                        ok = false;
+                    } else {
+                        ok = true;
+                    }
+                }
                 if (ok) {
                     size = cpManager.queryScreenSize();   // 按 CP 真实分辨率建屏
                     /*

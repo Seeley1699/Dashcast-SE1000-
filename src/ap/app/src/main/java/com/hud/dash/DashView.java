@@ -1,0 +1,144 @@
+package com.hud.dash;
+
+import android.content.Context;
+import android.graphics.Canvas;
+import android.util.AttributeSet;
+import android.view.Choreographer;
+import android.view.View;
+
+/**
+ * 仪表盘 View（Java 版）。只读，不处理任何触摸事件。
+ * 外部流程：拿到 data 改字段 → invalidate()；或调 setData(HudData) 全量写入。
+ */
+public class DashView extends View {
+
+    public static final String BUILD_ID = "J20261110.1";
+
+    public final HudData data = new HudData();
+    private final DashRenderer rd = new DashRenderer();
+
+    /** 演示用：跟随内置模拟车速；接真实数据前置 false */
+    public boolean autoSpeed = true;
+    public boolean autoPower = true;
+
+    float sim = 0f, pow = 142f, t = 0f, noaPulseAt = -1f;
+    private boolean running = false;
+    private long lastNanos = 0L;
+
+    /**
+     * 渲染节拍（2026-11-11 性能优化）
+     *
+     * 原来跑满 vsync（60fps），但 dcapd2 出口只有 12fps ——
+     * 渲染 60 帧扔掉 48 帧，白白吃掉一个多核的 CPU
+     * （实测 dashcast 进程占 152%，系统 load 23）。
+     *
+     * 现在按 FRAME_INTERVAL_MS 限帧：到点才 step+invalidate，
+     * 否则只重新注册回调。动画平滑靠 step(dt) 按真实间隔积分。
+     */
+    /*
+     * 渲染节拍（2026-11-11）
+     *
+     * 原是 60fps（跑满 vsync），但 dcapd2 出口只有 15fps，
+     * 渲染 60 帧扔掉 45 帧，白烧一个多核 → dashcast CPU 152%。
+     *
+     * 现在按出口实际能力定节拍：
+     *   33ms = 30fps，略高于出口（19~25fps），留点余量但不浪费。
+     * 之前试过 40ms（25fps）——但那样 VD 出帧节奏变成 40ms，
+     * 反而把出口压在 19.8fps（采集端等不到新帧）。
+     */
+    private static final long FRAME_INTERVAL_MS = 33;   /* 30fps */
+    private long lastDrawMs = 0L;
+
+    private final Choreographer.FrameCallback frame = new Choreographer.FrameCallback() {
+        @Override
+        public void doFrame(long nanos) {
+            if (!running) return;
+            long nowMs = nanos / 1_000_000L;
+            if (nowMs - lastDrawMs >= FRAME_INTERVAL_MS) {
+                float dt = lastNanos == 0L ? 0f : (nanos - lastNanos) / 1_000_000_000f;
+                lastNanos = nanos;
+                lastDrawMs = nowMs;
+                step(Math.min(dt, 0.1f));
+                invalidate();
+            }
+            Choreographer.getInstance().postFrameCallback(frame);
+        }
+    };
+
+    public DashView(Context context) {
+        super(context);
+        init();
+    }
+
+    public DashView(Context context, AttributeSet attrs) {
+        super(context, attrs);
+        init();
+    }
+
+    private void init() {
+        rd.attach(this);
+        setBackgroundColor(0xFF000000);
+    }
+
+    private void step(float dt) {
+        t += dt;
+        float k = 1f - HudTheme.expf(-dt * 3.4f);
+
+        float targetSpeed = autoSpeed
+                ? HudTheme.clamp(96f + 62f * HudTheme.sinf(t * 0.22f) + 18f * HudTheme.sinf(t * 0.9f), 0f, 196f)
+                : data.speed;
+        sim += (targetSpeed - sim) * k;
+
+        float targetPow = autoPower
+                ? HudTheme.clamp(56f + 120f * HudTheme.absf(HudTheme.sinf(t * 0.35f)) + 40f * HudTheme.sinf(t * 1.1f), 0f, data.powerMax)
+                : data.power;
+        pow += (targetPow - pow) * k;
+    }
+
+    public void start() {
+        if (running) return;
+        running = true;
+        lastNanos = 0L;
+        Choreographer.getInstance().postFrameCallback(frame);
+    }
+
+    public void stop() {
+        running = false;
+        Choreographer.getInstance().removeFrameCallback(frame);
+    }
+
+    /** 全量写入数据（从 CAN / WebSocket 回调里构造一个 HudData 传入） */
+    public void setData(HudData src) {
+        boolean before = data.noa;
+        data.copyFrom(src);
+        if (data.noa != before) noaPulseAt = t;
+        invalidate();
+    }
+
+    @Override
+    protected void onAttachedToWindow() {
+        super.onAttachedToWindow();
+        start();
+    }
+
+    @Override
+    protected void onDetachedFromWindow() {
+        stop();
+        super.onDetachedFromWindow();
+    }
+
+    @Override
+    protected void onDraw(Canvas canvas) {
+        // 设计稿 1920×538 等比铺满，居中留边
+        float s = Math.min(getWidth() / HudLayout.W, getHeight() / HudLayout.H);
+        float ox = (getWidth() - HudLayout.W * s) / 2f;
+        float oy = (getHeight() - HudLayout.H * s) / 2f;
+
+        canvas.save();
+        canvas.translate(ox, oy);
+        canvas.scale(s, s);
+        canvas.clipRect(0f, 0f, HudLayout.W, HudLayout.H);
+        rd.draw(canvas, t);
+        canvas.restore();
+    }
+}

@@ -1168,67 +1168,112 @@ static void setup_layer(void) {
              "LayerManagerControl destroy layer %d 2>/dev/null", LAYER_ID);
     system(cmd);
 
-    snprintf(cmd, sizeof(cmd),
-             "LayerManagerControl create layer %d %d %d 2>/dev/null",
-             LAYER_ID, frame_w, frame_h);
-    system(cmd);
-
-    snprintf(cmd, sizeof(cmd),
-             "LayerManagerControl add surface %d to layer %d 2>/dev/null",
-             SURFACE_ID, LAYER_ID);
-    system(cmd);
-
-    /* 挂到 99 之后，再把 10（以及其他任何层）上的登记摘掉 */
-    detach_surface_from_all_layers(1);
-
-    /* 立刻回读验证：如果这里还有 9001，说明是 detach 本身没生效；
-     * 如果这里干净、几秒后又有，那就是后面某个操作把它挂回去了。 */
+    /*
+     * ★ 建层全流程：执行 → 回读验证 → 失败重试 3 轮（2026-11-11 实测事故）
+     *
+     * 事故现场（CP 侧 DSI-1，1920x532）：
+     *   LayerManagerControl get layers  → 只有 Layer 10，**layer 99 不存在**
+     *   LayerManagerControl get screen 0 → render order 只有 10
+     *   仪表上看到的是原厂界面，我们的画面从未上屏
+     *
+     * 但同样这几条命令在 shell 里手敲（带 XDG_RUNTIME_DIR/WAYLAND_DISPLAY）
+     * 一次就成功。说明 system() 链路有过静默失败，而 `2>/dev/null`
+     * 把错误吞了，日志里完全看不出来。
+     *
+     * 所以现在：每条命令去掉 2>/dev/null（让错误进日志），
+     * 全部执行完回读校验 visibility 和 render order，
+     * 不达标就重试 3 轮，最终仍失败则明确报错。
+     */
     {
-        char vbuf[512];
-        snprintf(cmd, sizeof(cmd),
-                 "LayerManagerControl get layer 10 2>/dev/null "
-                 "| grep 'surface render'");
-        FILE *vf = popen(cmd, "r");
-        if (vf) {
-            if (fgets(vbuf, sizeof(vbuf), vf)) {
-                LOG("[自检 detach 后] layer10 surface: %.120s", vbuf);
-            } else {
-                LOG("[自检 detach 后] 读不到 layer10 的 surface 列表");
+        int ok = 0;
+        for (int attempt = 0; attempt < 3 && !ok; attempt++) {
+            if (attempt) {
+                LOG("建层第 %d 次重试…", attempt + 1);
+                usleep(200 * 1000);
             }
-            pclose(vf);
+
+            /* ① 建层 */
+            snprintf(cmd, sizeof(cmd),
+                     "LayerManagerControl create layer %d %d %d",
+                     LAYER_ID, frame_w, frame_h);
+            int crc = system(cmd);
+            if (crc != 0) {
+                LOG("create layer %d 返回 %d（%dx%d）",
+                    LAYER_ID, crc, frame_w, frame_h);
+            }
+
+            /* ② 设可见 —— create 出来默认 visibility=0，不设永不上屏 */
+            snprintf(cmd, sizeof(cmd),
+                     "LayerManagerControl set layer %d visibility 1", LAYER_ID);
+            int vrc = system(cmd);
+            if (vrc != 0) LOG("set visibility 返回 %d", vrc);
+
+            /* ③ 挂 surface */
+            snprintf(cmd, sizeof(cmd),
+                     "LayerManagerControl add surface %d to layer %d",
+                     SURFACE_ID, LAYER_ID);
+            int arc = system(cmd);
+            if (arc != 0) LOG("add surface 返回 %d", arc);
+
+            /* ④ 把 surface 从其他层（原厂 layer 10）摘掉 */
+            detach_surface_from_all_layers(1);
+
+            /* ⑤ 拼 render order（逗号分隔，空格会被整条拒绝） */
+            int already = 0;
+            for (int i = 0; i < n; i++) if (ids[i] == LAYER_ID) already = 1;
+            if (already) {
+                snprintf(order, sizeof(order), "%s", g_saved_order);
+            } else {
+                snprintf(order, sizeof(order), "%s,%d", g_saved_order, LAYER_ID);
+            }
+            snprintf(cmd, sizeof(cmd),
+                     "LayerManagerControl set screen 0 render order %s", order);
+            int orc = system(cmd);
+            if (orc != 0) LOG("set render order 返回 %d", orc);
+
+            /* ⑥ 回读验证：visibility 必须 1，且 99 必须在 render order 里 */
+            int vis = -1, in_order = 0;
+            snprintf(cmd, sizeof(cmd),
+                     "LayerManagerControl get layer %d 2>/dev/null "
+                     "| grep visibility", LAYER_ID);
+            FILE *vf = popen(cmd, "r");
+            if (vf) {
+                char lb[256];
+                if (fgets(lb, sizeof(lb), vf)) {
+                    char *p = strchr(lb, ':');
+                    if (p) vis = atoi(p + 1);
+                }
+                pclose(vf);
+            }
+
+            snprintf(cmd, sizeof(cmd),
+                     "LayerManagerControl get screen 0 2>/dev/null "
+                     "| grep 'render order'");
+            vf = popen(cmd, "r");
+            if (vf) {
+                char lb[512];
+                if (fgets(lb, sizeof(lb), vf)) {
+                    char key[32];
+                    snprintf(key, sizeof(key), "%d(0x%x)", LAYER_ID, LAYER_ID);
+                    if (strstr(lb, key)) in_order = 1;
+                }
+                pclose(vf);
+            }
+
+            ok = (vis == 1) && in_order;
+            LOG("图层校验 #%d: visibility=%d in_render_order=%d => %s",
+                attempt + 1, vis, in_order, ok ? "OK" : "重试");
+        }
+
+        if (!ok) {
+            LOG("★ 图层准备失败（已重试 3 次）：layer %d 不可见或不在 render order。"
+                "仪表上会看不到投屏画面 —— 在 CP 上手工执行 "
+                "`LayerManagerControl get layers` 排查", LAYER_ID);
+        } else {
+            LOG("图层就绪：layer %d（%dx%d）render order: %s",
+                LAYER_ID, frame_w, frame_h, order);
         }
     }
-
-    /* ②-b 设可见：create layer 的默认 visibility 是 0，不设这一条图层永远不会上屏。
-     *     实测踩过：surface 里明明有完整画面，仪表上却是原厂界面 —— 就是少这一步。 */
-    snprintf(cmd, sizeof(cmd),
-             "LayerManagerControl set layer %d visibility 1 2>/dev/null",
-             LAYER_ID);
-    system(cmd);
-
-    /* ③ 拼 render order。**分隔符必须是逗号**：
-     *   LayerManagerControl set screen 0 render order 10,99     ← 正确
-     *   LayerManagerControl set screen 0 render order 10 99     ← Interpreter error，整条被拒
-     * 之前用空格拼，命令静默失败，图层从来没真正上过屏。 */
-    int already = 0;
-    for (int i = 0; i < n; i++) if (ids[i] == LAYER_ID) already = 1;
-
-    if (already) {
-        snprintf(order, sizeof(order), "%s", g_saved_order);
-    } else {
-        snprintf(order, sizeof(order), "%s,%d", g_saved_order, LAYER_ID);
-    }
-
-    snprintf(cmd, sizeof(cmd),
-             "LayerManagerControl set screen 0 render order %s 2>/dev/null", order);
-    int rc = system(cmd);
-
-    /*
-     * 这里不判"生效没生效"：图层此刻还没有提交过任何 buffer，
-     * get screen 0 的 listing 里本来就不会有它。真正的复核放到首帧提交之后。
-     */
-    LOG("图层就绪：layer %d（%dx%d）render order: %s  set_rc=%d（首帧后再复核）",
-        LAYER_ID, frame_w, frame_h, order, rc);
 
     /* 会话建立完毕，可以开始图层巡检（独立线程每秒查一次双挂载） */
     g_session_active = 1;
@@ -1252,13 +1297,44 @@ static void verify_layer_once(void) {
         LOG("首帧后复核：render order 里已包含 layer %d", LAYER_ID);
     } else {
         /*
-         * 这台 CP 的 get screen 0 只列 Weston 启动时就存在的层，
-         * 我们动态建的 99 不会出现在 listing 里 —— 这不代表画面没上屏
-         * （前几版就是这么跑的，仪表上是有的）。所以这里只陈述事实，不报错。
+         * ★ 首帧后仍然不在 render order → **立即修复**（2026-11-11 实测）
+         *
+         * 旧版本的注释在这里写着"该 ROM 只列启动时已存在的层，看不到也正常"，
+         * 这个假设是**错的**。实测（DSI-1 1920x532）：
+         *   手工 set screen 0 render order 10,99 之后，get screen 0 立刻列出 99；
+         *   而投屏跑了一整晚、dashcastd 日志一直在刷"巡检摘掉双挂载"，
+         *   仪表上却始终只有原厂画面 —— 因为 99 从未进过 render order。
+         *
+         * 所以这里必须重设一次，而不是"只陈述事实"。
          */
-        LOG("首帧后复核：图层 %d 已有内容；listing 里%s看到它"
-            "（该 ROM 只列启动时已存在的层，是否可见以实际画面为准）",
-            LAYER_ID, chk == 0 ? "没" : "读不到而无法确认");
+        LOG("首帧后复核：layer %d 不在 render order，立即补救", LAYER_ID);
+        char cmd[512];
+        char order[256];
+        order[0] = '\0';
+        /* 用 read_render_order 读当前实际 order，再追加 99 */
+        {
+            int cur[32];
+            int cn = read_render_order(cur, 32);
+            for (int i = 0; i < cn; i++) {
+                char t[24];
+                snprintf(t, sizeof(t), "%s%d", i ? "," : "", cur[i]);
+                strncat(order, t, sizeof(order) - strlen(order) - 1);
+            }
+        }
+        if (order[0] == '\0') {
+            snprintf(order, sizeof(order), "10,%d", LAYER_ID);
+        } else {
+            char t[300];
+            snprintf(t, sizeof(t), "%s,%d", order, LAYER_ID);
+            snprintf(order, sizeof(order), "%s", t);
+        }
+        snprintf(cmd, sizeof(cmd),
+                 "LayerManagerControl set screen 0 render order %s", order);
+        system(cmd);
+        snprintf(cmd, sizeof(cmd),
+                 "LayerManagerControl set layer %d visibility 1", LAYER_ID);
+        system(cmd);
+        LOG("已补救：render order=%s, visibility=1", order);
     }
 }
 

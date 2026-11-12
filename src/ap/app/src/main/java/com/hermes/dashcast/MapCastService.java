@@ -36,6 +36,16 @@ public final class MapCastService {
 
     private static final String TAG = "DashcastMapCast";
 
+    /*
+     * CP 侧看门狗（2026-11-12 新增，方案 B）
+     *
+     * CP 的 /run 是 tmpfs，车机重启后 dashcastd 二进制直接消失
+     * → 进程没了 → layer 99 不存在 → AP 一直发帧但仪表全黑，
+     * 而 App 界面还显示"已启动"。
+     */
+    private int cpCheckTick = 0;
+    private CpManager cpManager;
+
     /* 设备端路径 */
     private static final String TMP = "/data/local/tmp";
     private static final String INJECTOR = TMP + "/hudcast-inject";
@@ -54,8 +64,10 @@ public final class MapCastService {
     private static final String AS_DCAPD2 = "dcapd2";
 
     /* 显示参数 —— 与 CP 屏一致 */
-    private static final int W = 1920;
-    private static final int H = 532;
+    /* 出口画布：运行时从 MirrorController 读（CP 真实分辨率）。
+     * 硬编码 1920x532 在 CP 屏不同时会拉伸/裁切。 */
+    private static int W = MirrorController.getOutputW();
+    private static int H = MirrorController.getOutputH();
 
     /*
      * 地图构图偏移（2026-11-08）
@@ -76,7 +88,18 @@ public final class MapCastService {
      * 上限由 dcapd2 自己夹住（|dy| <= 帧高/4），这里填超了也不会崩。
      */
     private static final String MAPCFG = TMP + "/dcapd2.map";
-    private static final int MAP_COVER_DY = -133;
+    /*
+     * 地图构图纵向偏移。
+     *
+     * ★ 2026-11-11 改成 0：原来是 -133，把**取景窗口从 532 缩到 399**，
+     *   底部 133px（胎压条 + 档位/模式卡片那一行）被整个裁掉，
+     *   仪表上只看到上半部分画面。实测确认这就是"胎压不显示"的根因。
+     *
+     * dcapd2 的 dy 实现是「窗口缩小 |dy| 再平移」，不是纯平移 ——
+     * 所以任何非 0 值都必然牺牲画面高度。Java 渲染链路是全屏设计稿
+     * （1920x532 一比一），不需要构图补偿，这里必须保持 0。
+     */
+    private static final int MAP_COVER_DY = 0;
 
     /* 地图包名 */
     private static final String MAP_PKG = "com.geely.map";
@@ -96,6 +119,50 @@ public final class MapCastService {
     private HandlerThread worker;
     private Handler wh;
     private Context appCtx;
+
+    /* ══════════════════════════════════════════════════════════
+     * Java 渲染链路（JavaDashEngine，2026-11-11）
+     *
+     * 与上面 Frida 链路**平行**、互不干扰：
+     *   · startJavaDash()  建 DashView VD + 地图 VD + VDF1 发送
+     *   · stopJavaDash()   全量释放
+     * 实测：渲染 59fps / 采集 44fps（DashPerfActivity），
+     * 替代 WebView(14.8fps) 与 Frida(1.6fps) 的终局方案。
+     * 不碰旧链路任何字段，回滚 = 不调这两个方法。
+     * ══════════════════════════════════════════════════════════ */
+    private JavaDashEngine javaDash;
+
+    /* Java 渲染链路开关（终局方案）：true = DashView+VDF1，
+     * false = 旧注入链路（mapcast.js）。两条链路互斥（8450 只认一条连接）。 */
+    private static final boolean JAVA_DASH_MODE = true;
+
+    /** 启动 Java 渲染投屏（worker 线程调） */
+    private void startJavaDash() {
+        try {
+            notify2("Java 渲染链路启动…");
+            javaDash = new JavaDashEngine(appCtx);
+            javaDash.start();
+            notify2("Java 渲染链路已启动");
+            Log.i(TAG, "JavaDash started, mapVD=" + javaDash.getMapVdId());
+        } catch (Throwable t) {
+            Log.e(TAG, "startJavaDash 失败", t);
+            notify2("Java 渲染链路失败: " + brief(t));
+            javaDash = null;
+        }
+    }
+
+    /** 停止 Java 渲染投屏 */
+    private void stopJavaDash() {
+        if (javaDash != null) {
+            try { javaDash.stop(); } catch (Throwable ignored) {}
+            javaDash = null;
+            Log.i(TAG, "JavaDash stopped");
+        }
+    }
+
+    public int javaMapVdId() {
+        return javaDash != null ? javaDash.getMapVdId() : -1;
+    }
 
     public interface Callback {
         void onState(String msg);
@@ -168,6 +235,8 @@ public final class MapCastService {
     /** 停止流程本体（跑在 worker 线程） */
     private void stopSequence() {
         {
+            /* Java 渲染链路先停（它持有 VD/ImageReader/socket） */
+            stopJavaDash();
             try {
                 LongLivedShell.releaseAll();
             } catch (Throwable t) {
@@ -271,10 +340,22 @@ public final class MapCastService {
             startDcapd2();
             Log.i(TAG, "← dcapd2 启动完成");
 
-            /* ⑥ 注入地图 */
-            Log.i(TAG, "→ injectMap");
-            injectMap();
-            Log.i(TAG, "← injectMap 完成");
+            /* ⑥ 注入地图
+             *
+             * ★ JAVA_DASH_MODE 下**必须跳过**（2026-11-11 01:43 实测抓到的死锁）：
+             * 注入的 mapcast.js 自带 d2_connect 自动重连，永远抢在
+             * JavaDashEngine 之前占住 dcapd2 的 8450 帧源槽
+             * （try_accept_proxy 只收第一条连接）。两条链路互斥，
+             * Java 模式里帧源槽必须留给 JavaDashEngine。
+             * HudActivity 的搬运在 ⑦ 里用 shell 直接做，不依赖注入。
+             */
+            if (!JAVA_DASH_MODE) {
+                Log.i(TAG, "→ injectMap");
+                injectMap();
+                Log.i(TAG, "← injectMap 完成");
+            } else {
+                Log.i(TAG, "JAVA_DASH_MODE：跳过注入（8450 让给 JavaDashEngine）");
+            }
 
             /*
              * ⑥.5 用 shell 身份把 HudActivity 拉到我们的 VirtualDisplay
@@ -295,7 +376,16 @@ public final class MapCastService {
              * 「路线 / 红绿灯 / 车道」创建 native 图层（RoutePathLayer 等）。
              * 手动 HUDControl.initSurfaceView 拿到的只有底图。
              */
-            int vdId = readVdid(10000);
+            int vdId;
+            if (JAVA_DASH_MODE) {
+                /* Java 模式：地图 VD 由 JavaDashEngine 建，直接拿 id。
+                 * 但 startJavaDash 在 ⑦ 才调 —— 这里先起引擎拿 VD，
+                 * HudActivity 搬到 mapVD 上（真地图喂进 DashView 的洞）。 */
+                startJavaDash();
+                vdId = javaDash != null ? javaDash.getMapVdId() : -1;
+            } else {
+                vdId = readVdid(10000);
+            }
             if (vdId >= 0) {
                 /*
                  * **launchMode=singleTask 会阻止 activity 换 display**（2026-11-08）
@@ -326,7 +416,17 @@ public final class MapCastService {
                 Log.w(TAG, "拿不到 VDID，HudActivity 未拉起");
             }
 
-            /* ⑦ 巡检 */
+            /* ⑦ Java 渲染链路（平行于注入链路）
+             *
+             * 放在 startDcapd2() 之后：dcapd2 已在 8450 监听，
+             * JavaDashEngine 的 VDF1 发送线程 connect 即插即用。
+             * 注入链路（injectMap + HudActivity）原样保留——
+             * 地图 VD 的帧继续从注入侧来，JavaDashEngine 的
+             * mapReader 只是**第二采集口**，两个 VD 互不干扰。
+             */
+            if (!JAVA_DASH_MODE) startJavaDash();   /* Java 模式已在 ⑥.5 提前启动 */
+
+            /* ⑧ 巡检 */
             startWatchdog();
             Log.i(TAG, "bootSequence 完成");
 
@@ -364,6 +464,45 @@ public final class MapCastService {
     }
 
     /** 把 assets 里的资源解压/复制到设备路径 */
+    /**
+     * 算 assets 里某文件【部署到设备后】的 MD5 —— 与设备上的副本比对用。
+     *
+     * .b64 资产是 base64 文本，部署时会被解码成二进制（见 ensureBinary）。
+     * 所以这里必须先解码再算 MD5，否则算的是 base64 文本的 MD5，
+     * 和设备上的二进制永远对不上。
+     *
+     * 2026-11-11 踩过：一开始直接对 base64 文本算 MD5，
+     * 结果 dcapd2 新版永远部署不下去，白查一个多小时。
+     */
+    private String md5OfAsset(String assetName) {
+        java.io.InputStream is = null;
+        try {
+            is = appCtx.getAssets().open(assetName);
+            java.security.MessageDigest md =
+                    java.security.MessageDigest.getInstance("MD5");
+            byte[] buf = new byte[65536];
+            int n;
+            if (assetName.endsWith(".b64")) {
+                java.io.ByteArrayOutputStream bo = new java.io.ByteArrayOutputStream();
+                while ((n = is.read(buf)) > 0) bo.write(buf, 0, n);
+                byte[] dec = android.util.Base64.decode(
+                        bo.toByteArray(), android.util.Base64.DEFAULT);
+                md.update(dec);
+            } else {
+                while ((n = is.read(buf)) > 0) md.update(buf, 0, n);
+            }
+            byte[] d = md.digest();
+            StringBuilder sb = new StringBuilder(32);
+            for (byte b : d) sb.append(String.format("%02x", b));
+            return sb.toString();
+        } catch (Throwable t) {
+            Log.w(TAG, "md5OfAsset(" + assetName + ") 失败: " + t);
+            return null;
+        } finally {
+            try { if (is != null) is.close(); } catch (Throwable ignored) {}
+        }
+    }
+
     private boolean ensureBinary(String assetName, String devPath, boolean exec) {
         try {
             /* 期望大小：assets 里的原始大小
@@ -404,21 +543,45 @@ public final class MapCastService {
              * 现在：dev 文件必须 >= assets 原始大小（.gz/.bin 用其压缩后大小
              * 做下限是安全的，因为解压只会更大），否则重新解压覆盖。
              */
-            boolean ok = f.exists() && (assetSize < 0
-                    ? f.length() > 1024
-                    : f.length() >= assetSize);
+            /*
+             * ★ 改用「内容 MD5 比对」而非「大小比对」（2026-11-11 修）
+             *
+             * 事故：dcapd2 优化后从 100912B 变成 86264B（体积反而小了），
+             * 而这里的判据是 f.length() >= assetSize —— 设备上的旧版
+             * 100912B 大于新版 86264B，于是永远判定"已就绪"跳过部署。
+             * 结果：改了源码、编了二进制、装了新 APK，设备上跑的还是
+             * 旧进程，白排查一个多小时。
+             *
+             * 现在：算设备文件 MD5 与 assets MD5，不一致就重新部署。
+             */
+            String assetMd5 = md5OfAsset(assetName);
+            String devMd5 = null;
+            if (f.exists()) {
+                String out = AdbShell.exec("md5sum " + devPath + " 2>/dev/null", 5000);
+                if (out != null) {
+                    String t = out.trim();
+                    int sp = t.indexOf(' ');
+                    devMd5 = sp > 0 ? t.substring(0, sp) : t;
+                    if (devMd5 != null && devMd5.length() > 32) {
+                        devMd5 = devMd5.substring(0, 32);
+                    }
+                }
+            }
+            boolean ok = assetMd5 != null && devMd5 != null
+                    && assetMd5.equalsIgnoreCase(devMd5);
             if (ok) {
-                Log.i(TAG, devPath + " 已存在 (" + f.length() + "B, asset="
-                        + assetSize + "B)，跳过");
+                Log.i(TAG, devPath + " MD5 一致 (" + devMd5.substring(0, 8)
+                        + ")，跳过");
                 if (exec) {
                     AdbShell.exec("chmod 755 " + devPath, 3000);
                 }
                 return true;
             }
-            if (f.exists()) {
-                Log.w(TAG, devPath + " 大小不符（dev " + f.length()
-                        + "B < asset " + assetSize + "B），重新部署");
-            }
+            Log.w(TAG, devPath + " 需要部署（dev="
+                    + (devMd5 == null ? "缺失" : devMd5.substring(0, Math.min(8, devMd5.length())))
+                    + " asset="
+                    + (assetMd5 == null ? "读取失败" : assetMd5.substring(0, Math.min(8, assetMd5.length())))
+                    + "）");
             notify2("解压 " + assetName + " …");
             InputStream raw = appCtx.getAssets().open(assetName);
             /* 按魔数判断是否 gzip（1f 8b）—— assets 里叫 .bin，aapt 不会自动解压 */
@@ -549,11 +712,17 @@ public final class MapCastService {
              * 用 base64 写，避免 shell 引号问题（和 LayerConfig.push 一个套路）。
              */
             try {
-                String body = "cover_dy=" + MAP_COVER_DY + "\n";
-                String b64 = android.util.Base64.encodeToString(
-                        body.getBytes("UTF-8"), android.util.Base64.NO_WRAP);
-                AdbShell.exec("echo " + b64 + " | base64 -d > " + MAPCFG, 4000);
-                Log.i(TAG, "地图构图偏移已下发 cover_dy=" + MAP_COVER_DY);
+                if (MAP_COVER_DY == 0) {
+                    /* dy=0：删掉配置文件，dcapd2 读不到就按 0 处理 */
+                    AdbShell.exec("rm -f " + MAPCFG, 4000);
+                    Log.i(TAG, "地图构图偏移 = 0（不写配置，保持全幅画面）");
+                } else {
+                    String body = "cover_dy=" + MAP_COVER_DY + "\n";
+                    String b64 = android.util.Base64.encodeToString(
+                            body.getBytes("UTF-8"), android.util.Base64.NO_WRAP);
+                    AdbShell.exec("echo " + b64 + " | base64 -d > " + MAPCFG, 4000);
+                    Log.i(TAG, "地图构图偏移已下发 cover_dy=" + MAP_COVER_DY);
+                }
             } catch (Throwable t) {
                 Log.w(TAG, "写地图构图配置失败（不影响投屏）: " + t);
             }
@@ -702,9 +871,54 @@ public final class MapCastService {
 
     /** 巡检：地图进程变了就重注入 */
     private void startWatchdog() {
+        if (cpManager == null && appCtx != null) cpManager = new CpManager(appCtx);
         final Runnable[] task = new Runnable[1];
         task[0] = () -> {
             if (!running) return;
+            /* ★ JAVA_DASH_MODE：没有注入这回事，巡检只看引擎活性。
+             *  原逻辑 pid != injectedPid（恒 -1）→ 每 5 秒重注入一次，
+             *  注入的 mapcast.js d2_connect 抢走 8450 帧源槽，
+             *  JavaDashEngine 的 VDF1 全部进黑洞（02:08 实测抓到）。 */
+            if (JAVA_DASH_MODE) {
+                if (javaDash == null) {
+                    Log.w(TAG, "巡检：JavaDashEngine 丢失，重启");
+                    startJavaDash();
+                }
+
+                /*
+                 * ★ CP 侧看门狗（2026-11-12 新增，方案 B）
+                 *
+                 * 实测故障：CP 的 /run 是 tmpfs，车机重启后 dashcastd
+                 * 二进制直接消失 → 进程没了 → layer 99 不存在 →
+                 * AP 一直发帧但仪表全黑，而 App 界面还显示"已启动"。
+                 *
+                 * 每 30 秒（6 × 5s）查一次：进程在不在 + 图层可见不可见。
+                 * 任一不满足就重推二进制 + 重启服务。
+                 *
+                 * 为什么查图层而不只查进程：遇到过「进程活着，但
+                 * layer 99 被原厂仪表抢走」的情况，只查进程会误判正常。
+                 */
+                if (++cpCheckTick >= 6) {
+                    cpCheckTick = 0;
+                    try {
+                        if (cpManager != null && !cpManager.isRunningHealthy()) {
+                            Log.w(TAG, "巡检：CP 侧不健康，重推并重启 dashcastd");
+                            notify2("仪表端掉线，正在恢复…");
+                            if (cpManager.ensureDashcastd()) {
+                                cpManager.startDashcastd();
+                                Log.i(TAG, "巡检：dashcastd 已重启");
+                            } else {
+                                Log.e(TAG, "巡检：dashcastd 重推失败（/run 可能被清空）");
+                            }
+                        }
+                    } catch (Throwable t) {
+                        Log.w(TAG, "巡检 CP 健康检查异常: " + t);
+                    }
+                }
+
+                if (running) wh.postDelayed(task[0], 5000);
+                return;
+            }
             try {
                 /* 和 injectMap 用同一套挑 pid 的规则：只看 u11 那个进程，
                  * 否则 u0 的辅助进程会让这里一直误判"进程变了"→ 反复重注入 */
@@ -798,24 +1012,50 @@ public final class MapCastService {
      * 所以真正该看的是 "VD 帧N: ... " 这行 —— 它由帧源收到的每一帧触发，
      * 不受"有没有差量"影响。
      */
+    /**
+     * 等首帧真画面。
+     *
+     * ★ 判据改造（2026-11-12 修）
+     *
+     * 原判据：grep 'VD 帧[0-9]' 里必须出现「空屏=0」。
+     *
+     * 但 dcapd2 的 `VD 帧%d` 日志**只打前 3 帧**（g_vd_dump < 3），
+     * 而投屏刚拉起时那 3 帧往往还是黑屏（App 还没画出来）：
+     *   VD 帧1: ... 空屏=1
+     *   VD 帧2: ... 空屏=1
+     *   VD 帧3: ... 空屏=1     ← 之后再也不打
+     * → grep 永远只看到「空屏=1」→ 判定失败
+     * → UI 一直显示"已启动，但暂未出帧"，实际画面早已正常。
+     *
+     * 实测：dcapd2 的 STAT 已经是 fps=14 tiles=30 kbps=313 在稳定推流，
+     * UI 却报未出帧 —— 纯粹判据选错了信号。
+     *
+     * 新判据（两个同时满足）：
+     *   ① STAT 行里 src=VD（帧源已切到我们的虚拟屏）
+     *   ② STAT 行里 tiles > 0（真的推出了图块，不是空转）
+     * 这两项从 dcapd2 启动起持续输出，不依赖前 3 帧的调试日志。
+     */
     private boolean waitFirstFrame(long timeoutMs) {
         long deadline = System.currentTimeMillis() + timeoutMs;
         while (System.currentTimeMillis() < deadline) {
             try {
-                String r = AdbShell.exec(
-                        "grep -c 'VD 帧[0-9]' " + TMP + "/dcapd2.log 2>/dev/null || echo 0",
+                String stat = AdbShell.exec(
+                        "grep 'STAT fps=' " + TMP + "/dcapd2.log 2>/dev/null | tail -1",
                         5000);
-                if (r != null && r.trim().matches("\\d+") && Integer.parseInt(r.trim()) > 0) {
-                    /* 再确认不是空屏：取最后一帧的 live/空屏 字段 */
-                    String detail = AdbShell.exec(
-                            "grep 'VD 帧[0-9]' " + TMP + "/dcapd2.log 2>/dev/null | tail -1",
-                            5000);
-                    String d = detail == null ? "" : detail.trim();
-                    if (d.contains("空屏=0")) {
-                        Log.i(TAG, "首帧已出（" + d + "）");
-                        return true;
+                String d = stat == null ? "" : stat.trim();
+                if (d.contains("src=VD")) {
+                    int ti = d.indexOf("tiles=");
+                    if (ti >= 0) {
+                        int v = 0, j = ti + 6;
+                        while (j < d.length() && Character.isDigit(d.charAt(j))) {
+                            v = v * 10 + (d.charAt(j) - '0');
+                            j++;
+                        }
+                        if (v > 0) {
+                            Log.i(TAG, "首帧已出（" + d + "）");
+                            return true;
+                        }
                     }
-                    Log.i(TAG, "VD 帧已到但仍是空屏：" + d);
                 }
             } catch (Throwable ignored) {
             }

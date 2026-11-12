@@ -21,7 +21,7 @@ call "%CLANG%" -x c++ -target aarch64-linux-android30 -O2 -std=c++17 -Wall -fPIE
   -I "%SC%\libutils\include" -I "%SC%\libcutils\include" -I "%SC%\liblog\include" ^
   -I "%SC%\libsystem\include" -I "%SC%\include" -I "%SC%\base\include" ^
   -I "%HERE%\..\dashcast_proto" ^
-  "%HERE%\dcapd2.c" -o "%HERE%\dcapd2" ^
+  "%HERE%\dcapd2.c" "%HERE%\layer_mask.c" "%HERE%\h264stub.c" -o "%HERE%\dcapd2" ^
   -L "%HERE%\carlibs" -lgui -lbinder -lui -lutils -lcutils -lnativewindow -llog -landroid -lc++ ^
   -Wl,--allow-shlib-undefined -Wl,-rpath,/system/lib64
 

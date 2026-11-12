@@ -53,6 +53,25 @@
     -->
     <uses-permission android:name="ecarx.oem.permission.OPENAPI_NAVI_PERMISSION" />
 
+    <!--
+        ══════════════════════════════════════════════════════════════
+        EVCC 开放 API（2026-11-12 接入）
+
+        为什么加：VHAL 里 0x11400e01（远光）/ 0x11400e03（双闪）
+        这两个属性的 timestamp 恒为 0 —— VHAL 层根本没接入这两个信号，
+        拿到的 [1] 只是 CarService 的初始化默认值，与实车完全无关。
+
+        EVCC 自己维护了 5+ 路属性源（VHAL / APVP / Vehicle AIDL /
+        CAPI / AdaptAPI / SOA），并通过标准 AIDL 暴露出来。
+        走这条通道可以拿到 VHAL 层拿不到的真实值。
+
+        权限是 normal 级（声明即得），但**仍需用户在 EVCC 里手动授权**：
+        EVCC → 服务 → 实验功能 → EVCC 开放 API → 开放 API 控制台
+              → 开放权限的应用 → 勾选 Dashcast → 选「只读」或「标准联动」
+        ══════════════════════════════════════════════════════════════
+    -->
+    <uses-permission android:name="com.kooo.evcc.permission.ACCESS_EVCC_API" />
+
     <queries>
         <intent>
             <action android:name="android.intent.action.MAIN" />
@@ -60,7 +79,25 @@
         </intent>
         <!-- Android 11+ 包可见性：要 bind ecarx.naviservice 必须能看见它 -->
         <package android:name="ecarx.naviservice" />
+        <!-- EVCC 开放 API：Android 11+ 包可见性，bind 前必须能看见 -->
+        <package android:name="com.kooo.evcc" />
     </queries>
+
+    <!-- ══════════════════════════════════════════════════════════
+         WebView 声明为「可选」
+
+         车机上实测（2026-11-10，SE1000 / Android 11）：
+           com.android.webview 83.0.4103.120 —— 在，但版本老（Chromium 83）
+         别的车机 ROM 有可能整个裁掉 WebView（省内存）。
+
+         如果不加 required="false"，而目标机确实没有 WebView，
+         APK 会直接装不上（INSTALL_FAILED_MISSING_SHARED_LIBRARY）。
+         加上之后装得上，运行时由 MapDashView.isWebViewAvailable()
+         判断，没有就降级 / 提示，不会白屏崩掉。
+         ══════════════════════════════════════════════════════════ -->
+    <uses-feature
+        android:name="android.software.webview"
+        android:required="false" />
 
     <application
         android:label="Dashcast"
@@ -90,6 +127,28 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+
+        <!-- WebView 性能自检：跑 assets/perf-test.html，结果打到 logcat。
+             启动：adb shell am start -n com.hermes.dashcast/.WebViewPerfActivity
+             看结果：adb logcat -s DashcastPerf -->
+        <activity
+            android:name=".WebViewPerfActivity"
+            android:exported="true"
+            android:configChanges="orientation|screenSize|screenLayout|keyboardHidden|density" />
+
+        <!-- Java 渲染自检：DashView(Choreographer) → VD → ImageReader。
+             启动：adb shell am start -n com.hermes.dashcast/.DashPerfActivity
+             看结果：adb logcat -s DashPerf -->
+        <activity
+            android:name=".DashPerfActivity"
+            android:exported="true"
+            android:configChanges="orientation|screenSize|screenLayout|keyboardHidden|density" />
+
+        <!-- Java 渲染 VD 内容 dump：验证画面正确性，dump 一张即退 -->
+        <activity
+            android:name=".DashDumpActivity"
+            android:exported="true"
+            android:configChanges="orientation|screenSize|screenLayout|keyboardHidden|density" />
 
 
         <!-- 镜像模式：只用来把进程钉在前台，逻辑在 Activity 进程里 -->

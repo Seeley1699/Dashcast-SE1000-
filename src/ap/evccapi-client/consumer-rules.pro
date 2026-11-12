@@ -1,0 +1,1 @@
+-keep class com.kooo.evcc.evccapi.client.** { public *; }

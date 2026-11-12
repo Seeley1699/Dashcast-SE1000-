@@ -1,0 +1,177 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8">
+<meta name="viewport" content="width=1920,height=538,initial-scale=1,user-scalable=no">
+<title>WebView 性能自检 v6 - 面积缩放判定</title>
+<style>
+html, body {
+  margin: 0; padding: 0;
+  width: 1920px; height: 538px;
+  background: #000; overflow: hidden;
+}
+#c { position: absolute; left: 0; top: 0; width: 1920px; height: 538px; display: block; }
+#out {
+  position: absolute; left: 0; top: 0;
+  width: 1920px; height: 538px;
+  background: rgba(0,0,0,0.94);
+  color: #0f0;
+  font: 20px/1.4 monospace;
+  padding: 18px;
+  box-sizing: border-box;
+  white-space: pre;
+  display: none;
+  z-index: 99;
+}
+#big { font-size: 60px; font-weight: bold; color: #43E8C8; display: block; margin: 0 0 8px 0; }
+</style></head>
+<body>
+<canvas id="c" width="1920" height="538"></canvas>
+<div id="out"></div>
+<script src="dashboard.js"></script>
+<script>
+/* ==============================================================
+ * v6：面积缩放判定实验
+ *
+ * v5-gfxinfo 证据链：
+ *   · HWUI 在统计（App 是硬件加速），但 100% janky
+ *   · Slow issue draw commands 8254/8257，GPU 50th = 14ms
+ *   · JS draw 提交只有 7ms，帧实际 66.7ms（= 4 个 vsync）
+ *   · 中间的 ~60ms 是 Chromium 合成器对 canvas 的重光栅化
+ *
+ * 判定实验：把同一场景画在 1/4 面积的 canvas 上（CSS 放大显示），
+ * 比较帧间隔：
+ *   · 缩到 ~33ms 以下 → 耗时随面积线性 → 软件光栅
+ *     → 解法：背景移出 canvas（DOM 静态层）+ canvas 只画动态
+ *   · 仍 ~66ms        → 固定开销（合成器/上传）
+ *     → 解法：换承载方式（SurfaceView 嵌入 / TextureView）
+ * ============================================================== */
+(function () {
+  var W = 1920, H = 538;
+  var cv = document.getElementById('c');
+  var out = document.getElementById('out');
+  var lines = [];
+
+  function say(s) { lines.push(s); console.log('[perf] ' + s); }
+  function show(head, extra) {
+    out.innerHTML = '<span id="big">' + head + '</span>' + extra;
+    out.style.display = 'block';
+    document.title = head;
+  }
+
+  var proto = CanvasRenderingContext2D && CanvasRenderingContext2D.prototype;
+  if (proto && !('letterSpacing' in proto)) {
+    try {
+      Object.defineProperty(proto, 'letterSpacing', {
+        configurable: true,
+        get: function () { return this.__ls === undefined ? '0px' : this.__ls; },
+        set: function (v) { this.__ls = v; }
+      });
+    } catch (e) {}
+  }
+
+  var hud = new HUD(cv, { autoSpeed: false, autoPower: false, mapExternal: true });
+  hud.resize = function () {}; hud.fit = function () {}; hud.dpr = 1;
+  cv.width = W; cv.height = H;
+  cv.style.width = W + 'px'; cv.style.height = H + 'px';
+  hud.data.speed = 88; hud.data.noa = true; hud.data.noaSpeed = 120;
+  hud.data.evRange = 130; hud.data.evCap = 180;
+  hud.data.fuelRange = 1370; hud.data.fuelCap = 1560;
+  hud.data.gear = 'D'; hud.data.power = 142;
+  hud.data.navActive = true; hud.data.mediaPlaying = true;
+
+  var tPhase = 0;
+  function fullFrame() { tPhase += 0.016; try { hud.draw(tPhase); } catch (e) {} }
+
+  function measureRaf(ms, body) {
+    return new Promise(function (resolve) {
+      var n = 0, t0 = 0, gaps = [], last = 0, running = true;
+      function tick(ts) {
+        if (!running) return;
+        if (t0 === 0) { t0 = ts; last = ts; }
+        else { gaps.push(ts - last); last = ts; }
+        n++;
+        if (body) body(ts);
+        requestAnimationFrame(tick);
+      }
+      requestAnimationFrame(tick);
+      setTimeout(function () {
+        running = false;
+        var dt = (performance.now() - t0) / 1000;
+        gaps.sort(function (a, b) { return a - b; });
+        var med = gaps.length ? gaps[Math.floor(gaps.length / 2)] : 0;
+        resolve({ fps: n / dt, gapMedian: med, frames: n });
+      }, ms);
+    });
+  }
+
+  /* 用 1/2 线性尺寸（1/4 面积）的 canvas 画同一场景：
+   * 通过 hud.ctx 重定向实现 —— 直接换掉 hud.ctx 和 canvas 尺寸 */
+  function setHalfRes(on) {
+    if (on) {
+      cv.width = W / 2; cv.height = H / 2;
+      /* CSS 仍占满 1920x538（浏览器拉伸显示，仅本次测试用） */
+      hud.ctx = cv.getContext('2d');
+      hud.ctx.setTransform && hud.ctx.setTransform(0.5, 0, 0, 0.5, 0, 0);
+      /* 缓存 key 变了会自动重建，且以半尺寸光栅 */
+      hud._bgCache = null;
+      /* 让 dashboard 用半分辨率绘制：draw() 里 setTransform(dpr) 会覆盖，
+       * 这里把 hud.dpr 调成 0.5 实现整体缩放 */
+      hud.dpr = 0.5;
+    } else {
+      cv.width = W; cv.height = H;
+      hud.ctx = cv.getContext('2d');
+      hud.dpr = 1;
+      hud._bgCache = null;
+    }
+  }
+
+  var R = {};
+  setTimeout(function () {
+    /* 全尺寸基线 */
+    return measureRaf(2000, fullFrame).then(function (r0) {
+      say('预热完成');
+      return measureRaf(3000, fullFrame);
+    }).then(function (r) {
+      R.full = r;
+      say('A 全尺寸 1920x538: ' + r.fps.toFixed(1) + ' fps (中位 ' + r.gapMedian.toFixed(1) + 'ms)');
+
+      setHalfRes(true);
+      return measureRaf(1000, fullFrame);   /* 换尺寸后预热 */
+    }).then(function (r) {
+      return measureRaf(3000, fullFrame);
+    }).then(function (r) {
+      R.half = r;
+      say('B 半尺寸 960x269:  ' + r.fps.toFixed(1) + ' fps (中位 ' + r.gapMedian.toFixed(1) + 'ms)');
+      setHalfRes(false);
+
+      var ratio = R.full.gapMedian / Math.max(R.half.gapMedian, 1);
+      var v, adv;
+      if (ratio >= 1.8) {
+        v = 'X 软件光栅（随面积线性）';
+        adv = '全尺寸 ' + R.full.gapMedian.toFixed(1) + 'ms vs 半尺寸 ' + R.half.gapMedian.toFixed(1) + 'ms\n'
+            + '→ 耗时 ∝ 面积\n'
+            + '→ 解法：背景/静态内容移出 canvas（DOM 层），canvas 只画动态\n'
+            + '   或降低渲染分辨率';
+      } else {
+        v = '! 固定开销（与面积无关）';
+        adv = '全尺寸 ' + R.full.gapMedian.toFixed(1) + 'ms vs 半尺寸 ' + R.half.gapMedian.toFixed(1) + 'ms\n'
+            + '→ 合成器/纹理上传的固定成本\n'
+            + '→ 解法：换承载（SurfaceView 嵌入 WebView）或接受现状';
+      }
+
+      show(
+        '全 ' + R.full.gapMedian.toFixed(0) + 'ms | 1/4面 ' + R.half.gapMedian.toFixed(0) + 'ms',
+        '\n判定：' + v + ' (比率 ' + ratio.toFixed(2) + ')\n' + adv
+        + '\n───────────────────────────────\n'
+        + lines.join('\n')
+      );
+    });
+  }, 500);
+
+  setTimeout(function () {
+    if (out.style.display !== 'block') {
+      show('超时', '25 秒未完成\n' + lines.join('\n'));
+    }
+  }, 25000);
+})();
+</script>
+</body></html>
